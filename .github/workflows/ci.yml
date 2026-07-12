@@ -79,8 +79,8 @@ jobs:
           sudo apt-get install -y build-essential meson ninja-build pkg-config libcap-dev libselinux1-dev
           git clone --depth 1 --branch v0.11.2 https://github.com/containers/bubblewrap.git /tmp/bubblewrap
           test "$(git -C /tmp/bubblewrap rev-parse HEAD)" = "1b80120ef26a28e065e67f89bfef873f13bdd317"
-          meson setup /tmp/bubblewrap/build /tmp/bubblewrap --prefix=/usr/local
+          meson setup /tmp/bubblewrap/build /tmp/bubblewrap --prefix=/usr
           meson compile -C /tmp/bubblewrap/build
           sudo meson install -C /tmp/bubblewrap/build
-          /usr/local/bin/bwrap --version
+          /usr/bin/bwrap --version
       - run: cargo test --locked -p grokforge-sandbox

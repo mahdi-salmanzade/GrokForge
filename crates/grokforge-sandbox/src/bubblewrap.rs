@@ -1267,12 +1267,13 @@ mod tests {
 
     #[test]
     fn parent_privacy_mask_removes_redundant_descendant_mounts() {
-        let dir = tempfile::tempdir().expect("home");
-        let secret_dir = dir.path().join(".aws");
+        // Keep the candidates inside the restored workspace. On Linux, unrelated paths below
+        // `/tmp` are already hidden by the private tmpfs and are intentionally omitted.
+        let workspace = tempfile::tempdir().expect("workspace");
+        let secret_dir = workspace.path().join(".aws");
         let secret_file = secret_dir.join("credentials");
         std::fs::create_dir(&secret_dir).expect("secret dir");
         std::fs::write(&secret_file, "secret").expect("secret file");
-        let workspace = tempfile::tempdir().expect("workspace");
         let policy = SandboxPolicy::workspace_write(workspace.path());
         let command = spec(workspace.path().to_path_buf());
         let mounts = prepare_mask_mounts(&policy, &command, vec![secret_file, secret_dir.clone()])
