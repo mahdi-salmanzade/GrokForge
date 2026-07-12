@@ -27,6 +27,7 @@ regex = { workspace = true }
 ignore = { workspace = true }
 globset = { workspace = true }
 time = { workspace = true }
+directories = { workspace = true }
 
 [dev-dependencies]
 grokforge-test-support = { workspace = true }

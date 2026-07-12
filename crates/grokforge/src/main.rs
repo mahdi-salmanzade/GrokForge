@@ -5,6 +5,7 @@
 
 mod debug;
 mod headless;
+mod sessions;
 mod tui;
 
 use std::path::PathBuf;
@@ -140,9 +141,9 @@ async fn main() -> std::process::ExitCode {
             println!("minimum toolchain: {}", env!("CARGO_PKG_RUST_VERSION"));
             std::process::ExitCode::SUCCESS
         }
-        Some(Command::Resume { .. } | Command::Sessions | Command::Login) => {
-            milestone("session management", "M8")
-        }
+        Some(Command::Resume { id }) => sessions::resume(id).await,
+        Some(Command::Sessions) => sessions::list().await,
+        Some(Command::Login) => milestone("keyring login", "M8+"),
         Some(Command::Completions { .. }) => milestone("completions", "M11"),
         Some(Command::Debug {
             cmd: DebugCommand::Api { prompt, model },

@@ -21,6 +21,6 @@ pub mod turn;
 pub use approvals::{AllowRule, ApprovalNeed, Approver, AutoApprover, Gate, gate};
 pub use redaction::{Redacted, Redactor};
 pub use session::{DEFAULT_SYSTEM_PROMPT, Session, SessionConfig};
-pub use store::{LogRotation, RolloutWriter};
+pub use store::{LogRotation, RolloutWriter, SessionMeta, rollout_path, sessions_dir};
 pub use tools::{Tool, ToolInvocation, ToolOutput, ToolRegistry, ToolSpec, TurnContext};
 pub use turn::Agent;

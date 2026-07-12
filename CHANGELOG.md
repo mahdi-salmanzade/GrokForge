@@ -53,3 +53,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tip, else `revert`) and stops at foreign commits. Worktree add/remove primitives for M10.
   New `Committed` event surfaced in both frontends. Verified end-to-end: a write in a git repo
   produces a trailered `grokforge: update greet.py` commit.
+- M8 (core) sessions & resume: rollouts + `SessionMeta` sidecars are now persisted under the
+  XDG data dir by both frontends (full-UUID filenames). `grokforge sessions` lists saved
+  sessions (id, model, workspace, first prompt); `grokforge resume [id]` reloads a transcript
+  (`Session::with_history`) and reopens it in the TUI, continuing from prior history. Rollouts
+  thread through interactive turns so ongoing sessions keep persisting. Verified end-to-end: a
+  headless run is listed by `grokforge sessions`.

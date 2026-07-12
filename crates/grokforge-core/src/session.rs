@@ -67,4 +67,14 @@ impl Session {
             history: Vec::new(),
         }
     }
+
+    /// Rebuild a session from a persisted transcript (resume).
+    #[must_use]
+    pub fn with_history(config: SessionConfig, history: Vec<ResponseItem>) -> Self {
+        Self {
+            id: SessionId::new(),
+            config,
+            history,
+        }
+    }
 }

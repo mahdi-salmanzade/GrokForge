@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use grokforge_core::{Agent, AllowRule, AutoApprover, Session, SessionConfig, ToolRegistry};
+use grokforge_core::{
+    Agent, AllowRule, AutoApprover, RolloutWriter, Session, SessionConfig, SessionMeta,
+    ToolRegistry, sessions_dir,
+};
 use grokforge_protocol::{ApprovalPolicy, EventMsg, SandboxMode, StopReason};
 use grokforge_sandbox::default_runner;
 use grokforge_xai::{Effort, XaiClient};
@@ -111,10 +114,21 @@ pub async fn run(args: ExecArgs) -> ExitCode {
     config.effort = args.effort.as_deref().and_then(parse_effort);
     let mut session = Session::new(config);
 
+    // Persist this run so it is listable/resumable via `grokforge sessions`/`resume`.
+    let dir = sessions_dir();
+    let rollout = RolloutWriter::create(&dir, session.id).await.ok();
+    let meta = SessionMeta::new(
+        session.id,
+        session.config.workspace_root.clone(),
+        session.config.model.clone(),
+        &args.prompt,
+    );
+    let _ = meta.write(&dir, session.id).await;
+
     let prompt = args.prompt;
     let json = args.json;
     let handle = tokio::spawn(async move {
-        let mut rollout = None;
+        let mut rollout = rollout;
         agent.run_turn(&mut session, &prompt, &mut rollout).await
     });
 

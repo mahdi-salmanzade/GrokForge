@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
-use grokforge_core::{Agent, Session};
+use grokforge_core::{Agent, RolloutWriter, Session};
 use grokforge_protocol::{Decision, EventMsg};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
@@ -39,6 +39,7 @@ enum Entry {
 pub struct App {
     agent: Arc<Agent>,
     session: Option<Session>,
+    rollout: Option<RolloutWriter>,
     transcript: Vec<Entry>,
     streaming: Option<String>,
     composer: String,
@@ -53,7 +54,7 @@ pub struct App {
     // The channel stays open for the app's lifetime because `agent` (Arc) holds the sender.
     events_rx: mpsc::UnboundedReceiver<EventMsg>,
     approvals_rx: mpsc::UnboundedReceiver<PendingApproval>,
-    turn_handle: Option<JoinHandle<Session>>,
+    turn_handle: Option<JoinHandle<(Session, Option<RolloutWriter>)>>,
 }
 
 impl std::fmt::Debug for App {
@@ -71,17 +72,26 @@ impl App {
     pub fn new(
         agent: Arc<Agent>,
         session: Session,
+        rollout: Option<RolloutWriter>,
         events_rx: mpsc::UnboundedReceiver<EventMsg>,
         approvals_rx: mpsc::UnboundedReceiver<PendingApproval>,
         status_model: String,
         status_preset: String,
     ) -> Self {
+        let resumed = session.history.len();
+        let mut transcript = vec![Entry::Info(
+            "GrokForge — type a message and press Enter. Ctrl+C to quit.".to_string(),
+        )];
+        if resumed > 0 {
+            transcript.push(Entry::Info(format!(
+                "resumed session with {resumed} prior transcript item(s)"
+            )));
+        }
         Self {
             agent,
             session: Some(session),
-            transcript: vec![Entry::Info(
-                "GrokForge — type a message and press Enter. Ctrl+C to quit.".to_string(),
-            )],
+            rollout,
+            transcript,
             streaming: None,
             composer: String::new(),
             scroll: 0,
@@ -190,16 +200,16 @@ impl App {
         self.transcript.push(Entry::User(text.clone()));
         self.follow = true;
 
-        // Move the session into a turn task; reclaim it on completion.
+        // Move the session (and rollout) into a turn task; reclaim on completion.
         let Some(mut session) = self.session.take() else {
             return;
         };
+        let mut rollout = self.rollout.take();
         self.running = true;
         let agent = Arc::clone(&self.agent);
         self.turn_handle = Some(tokio::spawn(async move {
-            let mut rollout = None;
             agent.run_turn(&mut session, &text, &mut rollout).await;
-            session
+            (session, rollout)
         }));
     }
 
@@ -234,8 +244,9 @@ impl App {
             }
             EventMsg::TurnComplete { .. } => {
                 if let Some(handle) = self.turn_handle.take() {
-                    if let Ok(session) = handle.await {
+                    if let Ok((session, rollout)) = handle.await {
                         self.session = Some(session);
+                        self.rollout = rollout;
                     }
                 }
                 self.running = false;
@@ -484,6 +495,7 @@ mod tests {
         App::new(
             agent,
             session,
+            None,
             events_rx,
             approvals_rx,
             "grok-build-0.1".to_string(),

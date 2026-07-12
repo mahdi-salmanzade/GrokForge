@@ -13,7 +13,9 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use grokforge_core::{Agent, Session, SessionConfig, ToolRegistry};
+use grokforge_core::{
+    Agent, RolloutWriter, Session, SessionConfig, SessionMeta, ToolRegistry, sessions_dir,
+};
 use grokforge_sandbox::default_runner;
 use grokforge_xai::XaiClient;
 use ratatui::Terminal;
@@ -23,16 +25,23 @@ use tokio::sync::mpsc;
 pub use app::App;
 pub use approver::{ChannelApprover, PendingApproval};
 
-/// Launch the interactive TUI for a session. Returns when the user quits.
-pub async fn run(
+/// Launch the interactive TUI for a fresh session.
+pub async fn run(client: XaiClient, config: SessionConfig, status_preset: String) -> io::Result<()> {
+    run_session(client, Session::new(config), status_preset).await
+}
+
+/// Launch the interactive TUI for a (possibly resumed) session. Creates a rollout writer and
+/// records session metadata so the session appears in `grokforge sessions`.
+pub async fn run_session(
     client: XaiClient,
-    config: SessionConfig,
+    session: Session,
     status_preset: String,
 ) -> io::Result<()> {
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (approver, approvals_rx) = ChannelApprover::new();
 
-    let model = config.model.clone();
+    let model = session.config.model.clone();
+    let workspace = session.config.workspace_root.clone();
     let agent = Arc::new(
         Agent::new(
             client,
@@ -43,11 +52,16 @@ pub async fn run(
         )
         .interactive(),
     );
-    let session = Session::new(config);
+
+    let dir = sessions_dir();
+    let rollout = RolloutWriter::create(&dir, session.id).await.ok();
+    let meta = SessionMeta::new(session.id, workspace, model.clone(), "");
+    let _ = meta.write(&dir, session.id).await;
 
     let mut app = App::new(
         agent,
         session,
+        rollout,
         events_rx,
         approvals_rx,
         model,
