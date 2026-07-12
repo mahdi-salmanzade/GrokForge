@@ -1,14 +1,14 @@
-//! `grokforge-test-support` — Mock xAI SSE server, fixture repositories, and a PTY test harness.
+//! `grokforge-test-support` — shared test infrastructure.
 //!
-//! Stub: implemented in M1. See docs/design/03-roadmap.md.
+//! - [`mock`]: a byte-controllable HTTP/1.1 mock of the xAI API for exercising the SSE
+//!   client and reconciling request byte counts against the context ledger.
+//!
+//! Fixture repositories and a PTY harness are added alongside the milestones that need them.
 
-/// Crate version, surfaced in `grokforge doctor`.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+// This crate is test-only scaffolding: panicking on a poisoned lock or malformed fixture is
+// the desired behavior, so the workspace-wide no-unwrap/expect rule does not apply here.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_has_version() {
-        assert!(!super::VERSION.is_empty());
-    }
-}
+pub mod mock;
+
+pub use mock::{MockXai, MockXaiBuilder, Received, Reply};

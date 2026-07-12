@@ -10,3 +10,19 @@ description = "In-house xAI Grok client: /v1/responses, SSE streaming, model val
 
 [lints]
 workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+grokforge-test-support = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

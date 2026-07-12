@@ -3,6 +3,8 @@
 //! Default invocation launches the interactive TUI (M3). `exec` runs headless (M2).
 //! The other subcommands are scaffolded here and implemented at their milestones.
 
+mod debug;
+
 use clap::{Parser, Subcommand};
 
 /// Open-source terminal coding agent for Grok.
@@ -41,36 +43,52 @@ enum Command {
         /// Target shell (bash, zsh, fish, powershell).
         shell: String,
     },
+    /// Developer diagnostics (hidden).
+    #[command(hide = true)]
+    Debug {
+        #[command(subcommand)]
+        cmd: DebugCommand,
+    },
 }
 
-fn main() -> std::process::ExitCode {
+#[derive(Debug, Subcommand)]
+enum DebugCommand {
+    /// Stream a one-shot prompt straight from the xAI API (live smoke test).
+    ///
+    /// Uses `XAI_API_KEY` and `XAI_BASE_URL` (default `https://api.x.ai`).
+    Api {
+        /// Prompt to send.
+        prompt: String,
+        /// Model slug.
+        #[arg(long, default_value = "grok-build-0.1")]
+        model: String,
+    },
+}
+
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        None if cli.prompt.is_some() => {
-            eprintln!("headless exec lands in M2 (see docs/design/03-roadmap.md)");
-            std::process::ExitCode::from(2)
-        }
-        None => {
-            eprintln!("the interactive TUI lands in M3 (see docs/design/03-roadmap.md)");
-            std::process::ExitCode::from(2)
-        }
-        Some(Command::Exec { .. }) => {
-            eprintln!("headless exec lands in M2");
-            std::process::ExitCode::from(2)
-        }
+        None if cli.prompt.is_some() => milestone("headless exec", "M2"),
+        None => milestone("the interactive TUI", "M3"),
+        Some(Command::Exec { .. }) => milestone("headless exec", "M2"),
         Some(Command::Doctor) => {
             println!("grokforge {}", env!("CARGO_PKG_VERSION"));
-            println!("toolchain: {}", env!("CARGO_PKG_RUST_VERSION"));
+            println!("minimum toolchain: {}", env!("CARGO_PKG_RUST_VERSION"));
             std::process::ExitCode::SUCCESS
         }
         Some(Command::Resume { .. } | Command::Sessions | Command::Login) => {
-            eprintln!("session management lands in M8");
-            std::process::ExitCode::from(2)
+            milestone("session management", "M8")
         }
-        Some(Command::Completions { .. }) => {
-            eprintln!("completions land with the release milestone (M11)");
-            std::process::ExitCode::from(2)
-        }
+        Some(Command::Completions { .. }) => milestone("completions", "M11"),
+        Some(Command::Debug {
+            cmd: DebugCommand::Api { prompt, model },
+        }) => debug::run_api(&prompt, &model).await,
     }
+}
+
+fn milestone(feature: &str, ms: &str) -> std::process::ExitCode {
+    eprintln!("{feature} lands in {ms} (see docs/design/03-roadmap.md)");
+    std::process::ExitCode::from(2)
 }

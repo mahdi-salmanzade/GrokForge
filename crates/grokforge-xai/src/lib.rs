@@ -1,14 +1,29 @@
-//! `grokforge-xai` — In-house xAI Grok client: /v1/responses, SSE streaming, model validation, request byte-accounting.
+//! `grokforge-xai` — GrokForge's in-house client for the xAI Grok API.
 //!
-//! Stub: implemented in M1. See docs/design/03-roadmap.md.
+//! Grok-only by design (there is no provider trait in v1); this crate is the isolated seam
+//! where a multi-provider abstraction could later be introduced. It targets the Responses
+//! API (`POST /v1/responses`) and streams typed events over SSE.
+//!
+//! Design rules enforced here:
+//! - **Base URL and model IDs are data, never constants** (the xAI→SpaceXAI reorg will move
+//!   the domain; retired slugs silently redirect).
+//! - **The initial request is retried with backoff; mid-stream failures are surfaced**, since
+//!   the Responses API has no resume token — the agent loop owns whole-request replay.
+//! - **Every request's serialized size is exposed** ([`ResponseStream::request_bytes`]) so the
+//!   context ledger can reconcile byte-for-byte with what actually left the machine.
 
-/// Crate version, surfaced in `grokforge doctor`.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+mod client;
+mod error;
+mod event;
+mod model;
+mod request;
+mod stream;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_has_version() {
-        assert!(!super::VERSION.is_empty());
-    }
-}
+pub use client::{RetryConfig, XaiClient};
+pub use error::XaiError;
+pub use event::{StopReason, StreamEvent, ToolCall, Usage};
+pub use model::ModelInfo;
+pub use request::{
+    ContentPart, Effort, FunctionTool, InputItem, Reasoning, ResponsesRequest, Role, ToolDef,
+};
+pub use stream::ResponseStream;

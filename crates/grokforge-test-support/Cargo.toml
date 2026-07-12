@@ -10,3 +10,8 @@ description = "Mock xAI SSE server, fixture repositories, and a PTY test harness
 
 [lints]
 workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde_json = { workspace = true }
