@@ -49,6 +49,9 @@ enum Command {
         /// Reasoning effort: low, medium, or high.
         #[arg(long)]
         effort: Option<String>,
+        /// Plan mode: read-only tools + sandbox, produce a plan without changing anything.
+        #[arg(long)]
+        plan: bool,
         /// Maximum tool-call iterations within the turn.
         #[arg(long, default_value_t = 32)]
         max_iterations: u32,
@@ -105,6 +108,7 @@ async fn main() -> std::process::ExitCode {
                 cd: None,
                 allow: Vec::new(),
                 effort: None,
+                plan: false,
                 max_iterations: 32,
             })
             .await
@@ -118,6 +122,7 @@ async fn main() -> std::process::ExitCode {
             cd,
             allow,
             effort,
+            plan,
             max_iterations,
         }) => {
             let Some(prompt) = prompt.or(cli.prompt) else {
@@ -132,6 +137,7 @@ async fn main() -> std::process::ExitCode {
                 cd,
                 allow,
                 effort,
+                plan,
                 max_iterations,
             })
             .await

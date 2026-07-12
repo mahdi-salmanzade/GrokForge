@@ -302,6 +302,77 @@ async fn long_history_is_compacted_at_turn_end() {
 }
 
 #[tokio::test]
+async fn write_file_outside_workspace_is_refused_in_workspace_write() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = std::env::temp_dir().join("grokforge_wf_escape_probe.txt");
+    let _ = std::fs::remove_file(&outside);
+
+    let mock = MockXai::builder()
+        .route(
+            "/v1/responses",
+            tool_call_then_done(
+                "write_file",
+                json!({ "path": outside.to_string_lossy(), "content": "escaped" }),
+            ),
+        )
+        .route("/v1/responses", final_text("blocked"))
+        .start()
+        .await;
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let agent = agent_for(&mock, tx);
+    // workspace-write (not yolo): the file tool must refuse an out-of-workspace path.
+    let mut session = Session::new(
+        SessionConfig::new(workspace.path().to_path_buf(), "grok-build-0.1").with_policy(
+            grokforge_protocol::ApprovalPolicy::Never,
+            SandboxMode::WorkspaceWrite,
+        ),
+    );
+    agent
+        .run_turn(&mut session, "write outside", &mut None)
+        .await;
+
+    assert!(
+        !outside.exists(),
+        "write_file must not escape the workspace"
+    );
+}
+
+#[tokio::test]
+async fn plan_mode_refuses_writes() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mock = MockXai::builder()
+        .route(
+            "/v1/responses",
+            tool_call_then_done(
+                "write_file",
+                json!({ "path": "in_plan.txt", "content": "no" }),
+            ),
+        )
+        .route("/v1/responses", final_text("here is the plan"))
+        .start()
+        .await;
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let agent = agent_for(&mock, tx);
+    // Even yolo config: plan mode forces read-only, so the write is refused.
+    let mut session = Session::new(
+        SessionConfig::new(workspace.path().to_path_buf(), "grok-build-0.1").with_policy(
+            grokforge_protocol::ApprovalPolicy::Never,
+            SandboxMode::DangerFullAccess,
+        ),
+    );
+    agent
+        .run_plan_turn(&mut session, "plan a change", &mut None)
+        .await;
+
+    assert!(
+        !workspace.path().join("in_plan.txt").exists(),
+        "plan mode must not write files"
+    );
+}
+
+#[tokio::test]
 async fn headless_denies_and_continues_without_yolo() {
     // With the strict-ish default (OnRequest + read-only) and the default AutoApprover (no
     // allow rules), a write is auto-denied and the model is told — the turn still completes.

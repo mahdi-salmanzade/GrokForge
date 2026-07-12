@@ -197,10 +197,17 @@ impl App {
             return;
         }
         self.composer.clear();
+        if let Some(cmd) = text.strip_prefix('/') {
+            self.handle_slash(cmd);
+            return;
+        }
         self.transcript.push(Entry::User(text.clone()));
         self.follow = true;
+        self.start_turn(text, false);
+    }
 
-        // Move the session (and rollout) into a turn task; reclaim on completion.
+    /// Spawn a turn (execute or plan mode), moving the session + rollout into the task.
+    fn start_turn(&mut self, text: String, plan: bool) {
         let Some(mut session) = self.session.take() else {
             return;
         };
@@ -208,9 +215,68 @@ impl App {
         self.running = true;
         let agent = Arc::clone(&self.agent);
         self.turn_handle = Some(tokio::spawn(async move {
-            agent.run_turn(&mut session, &text, &mut rollout).await;
+            if plan {
+                agent.run_plan_turn(&mut session, &text, &mut rollout).await;
+            } else {
+                agent.run_turn(&mut session, &text, &mut rollout).await;
+            }
             (session, rollout)
         }));
+    }
+
+    fn handle_slash(&mut self, cmd: &str) {
+        let (name, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
+        match name {
+            "help" | "?" => {
+                self.transcript.push(Entry::Info(
+                    "commands: /plan <task>  ·  /undo  ·  /clear  ·  /help  ·  /quit".to_string(),
+                ));
+            }
+            "quit" | "exit" | "q" => self.should_quit = true,
+            "clear" => {
+                self.transcript.clear();
+            }
+            "undo" => self.undo(),
+            "plan" => {
+                let task = rest.trim();
+                if task.is_empty() {
+                    self.transcript
+                        .push(Entry::Info("usage: /plan <task>".to_string()));
+                } else {
+                    self.transcript.push(Entry::User(format!("/plan {task}")));
+                    self.follow = true;
+                    self.start_turn(task.to_string(), true);
+                }
+            }
+            other => {
+                self.transcript.push(Entry::Info(format!(
+                    "unknown command: /{other} (try /help)"
+                )));
+            }
+        }
+    }
+
+    /// Undo the last agent commit for this session (git, from the host process).
+    fn undo(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let root = session.config.workspace_root.clone();
+        let id = session.id;
+        match grokforge_git::Git::discover(&root) {
+            Some(git) => match git.undo_last(id) {
+                Ok(Some(msg)) => self.transcript.push(Entry::Git(format!("undo: {msg}"))),
+                Ok(None) => self
+                    .transcript
+                    .push(Entry::Info("nothing to undo for this session".to_string())),
+                Err(e) => self
+                    .transcript
+                    .push(Entry::Error(format!("undo failed: {e}"))),
+            },
+            None => self
+                .transcript
+                .push(Entry::Info("not a git repository".to_string())),
+        }
     }
 
     async fn on_agent_event(&mut self, msg: EventMsg) {

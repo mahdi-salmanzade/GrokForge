@@ -89,22 +89,74 @@ impl Agent {
         }
     }
 
-    /// Run one turn to completion, mutating the session history and appending to `rollout`.
+    /// Like [`Self::turn_context`] but forces a read-only sandbox policy (plan mode).
+    fn turn_context_readonly(&self, session: &Session) -> TurnContext {
+        let root = session.config.workspace_root.clone();
+        TurnContext {
+            policy: SandboxPolicy::read_only(&root),
+            workspace_root: root,
+            sandbox: Arc::clone(&self.sandbox),
+            touched: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Run one turn to completion (execute mode).
     pub async fn run_turn(
         &self,
         session: &mut Session,
         user_text: &str,
         rollout: &mut Option<RolloutWriter>,
     ) -> StopReason {
+        self.run_inner(session, user_text, false, rollout).await
+    }
+
+    /// Run a plan-mode turn: read-only tools + read-only sandbox + a planning preamble, so the
+    /// agent produces a plan without changing anything.
+    pub async fn run_plan_turn(
+        &self,
+        session: &mut Session,
+        user_text: &str,
+        rollout: &mut Option<RolloutWriter>,
+    ) -> StopReason {
+        self.run_inner(session, user_text, true, rollout).await
+    }
+
+    async fn run_inner(
+        &self,
+        session: &mut Session,
+        user_text: &str,
+        plan: bool,
+        rollout: &mut Option<RolloutWriter>,
+    ) -> StopReason {
         let turn_id = grokforge_protocol::TurnId::new();
         self.emit(EventMsg::TurnStarted { turn_id });
 
+        // In plan mode, instruct the model not to change anything.
+        let effective_text = if plan {
+            format!(
+                "[PLAN MODE — do not modify files or run mutating commands; produce a concise, \
+                 numbered plan for the following task]\n\n{user_text}"
+            )
+        } else {
+            user_text.to_string()
+        };
+
         // User input is redacted at ingress (a pasted secret must not enter the transcript).
-        let user_red = Redactor::apply(user_text);
+        let user_red = Redactor::apply(&effective_text);
         self.record(session, rollout, ResponseItem::user(user_red.text))
             .await;
 
-        let ctx = self.turn_context(session);
+        // Plan mode enforces read-only tools and a read-only sandbox regardless of preset.
+        let tool_defs = if plan {
+            self.registry.readonly_tool_defs()
+        } else {
+            self.registry.tool_defs()
+        };
+        let ctx = if plan {
+            self.turn_context_readonly(session)
+        } else {
+            self.turn_context(session)
+        };
         let agents = agents_md::discover(&session.config.workspace_root);
 
         let mut iteration = 0u32;
@@ -116,7 +168,7 @@ impl Agent {
 
             let Assembled {
                 request, ledger, ..
-            } = match context::assemble(session, &agents, self.registry.tool_defs()) {
+            } = match context::assemble(session, &agents, tool_defs.clone()) {
                 Ok(a) => a,
                 Err(e) => {
                     self.emit(EventMsg::Error {

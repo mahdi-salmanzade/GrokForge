@@ -179,8 +179,19 @@ impl ToolRegistry {
     /// Convert the registered tools to xAI function-tool definitions (capped at [`MAX_TOOLS`]).
     #[must_use]
     pub fn tool_defs(&self) -> Vec<ToolDef> {
+        self.defs_where(|_| true)
+    }
+
+    /// Only the non-mutating (read-only) tools — used in plan mode.
+    #[must_use]
+    pub fn readonly_tool_defs(&self) -> Vec<ToolDef> {
+        self.defs_where(|s| !s.mutating)
+    }
+
+    fn defs_where(&self, keep: impl Fn(&ToolSpec) -> bool) -> Vec<ToolDef> {
         self.specs()
             .into_iter()
+            .filter(keep)
             .take(MAX_TOOLS)
             .map(|s| ToolDef::function(s.name, s.description, s.parameters))
             .collect()

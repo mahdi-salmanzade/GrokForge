@@ -66,3 +66,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rollout; only the model-visible window shrinks. Pure functions unit-tested; the model-backed
   loop verified with a mock. (Repo map and the ledger TUI panel from M7 are deferred to a later
   pass.)
+- M5.5 plan mode: `Agent::run_plan_turn` (headless `--plan`, TUI `/plan <task>`) runs a turn with
+  read-only tools + a read-only sandbox + a planning preamble, so the agent produces a plan
+  without changing anything. Enforced, not honor-system.
+- **Security fix:** file-writing tools (`write_file`/`edit`) now enforce the sandbox policy's
+  writable boundary in the host process. Previously they used `fs::write` directly, bypassing the
+  OS sandbox (which only confines shelled-out commands) — so a write outside the workspace, or any
+  write in plan/read-only mode, could slip through. Now refused with a `FsWrite` denial. New tests
+  cover both cases.
+- TUI slash commands: `/help`, `/plan <task>`, `/undo` (host-side git undo of the session's agent
+  commits), `/clear`, `/quit`.

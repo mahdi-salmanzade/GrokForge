@@ -127,6 +127,14 @@ impl Tool for WriteFile {
             Err(e) => return e,
         };
         let resolved = inv.ctx.resolve(path);
+        // File tools run in the host process, so they must honor the sandbox policy themselves
+        // (the OS sandbox only confines shelled-out commands).
+        if !inv.ctx.policy.allows_write(&resolved) {
+            return ToolOutput::Failure {
+                error: format!("`{path}` is outside the writable sandbox; refusing to write"),
+                denial: Some(grokforge_protocol::DenialClass::FsWrite),
+            };
+        }
         if let Some(parent) = resolved.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return ToolOutput::failure(format!("cannot create parent of `{path}`: {e}"));
@@ -193,6 +201,12 @@ impl Tool for EditFile {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let resolved = inv.ctx.resolve(path);
+        if !inv.ctx.policy.allows_write(&resolved) {
+            return ToolOutput::Failure {
+                error: format!("`{path}` is outside the writable sandbox; refusing to edit"),
+                denial: Some(grokforge_protocol::DenialClass::FsWrite),
+            };
+        }
         let original = match tokio::fs::read_to_string(&resolved).await {
             Ok(s) => s,
             Err(e) => return ToolOutput::failure(format!("cannot read `{path}`: {e}")),

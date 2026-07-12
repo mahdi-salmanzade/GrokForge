@@ -660,6 +660,7 @@ dependencies = [
  "crossterm",
  "futures",
  "grokforge-core",
+ "grokforge-git",
  "grokforge-protocol",
  "grokforge-sandbox",
  "grokforge-xai",

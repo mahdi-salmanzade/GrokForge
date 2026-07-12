@@ -25,6 +25,7 @@ pub struct ExecArgs {
     pub cd: Option<PathBuf>,
     pub allow: Vec<String>,
     pub effort: Option<String>,
+    pub plan: bool,
     pub max_iterations: u32,
 }
 
@@ -127,9 +128,16 @@ pub async fn run(args: ExecArgs) -> ExitCode {
 
     let prompt = args.prompt;
     let json = args.json;
+    let plan = args.plan;
     let handle = tokio::spawn(async move {
         let mut rollout = rollout;
-        agent.run_turn(&mut session, &prompt, &mut rollout).await
+        if plan {
+            agent
+                .run_plan_turn(&mut session, &prompt, &mut rollout)
+                .await
+        } else {
+            agent.run_turn(&mut session, &prompt, &mut rollout).await
+        }
     });
 
     let mut had_error = false;
