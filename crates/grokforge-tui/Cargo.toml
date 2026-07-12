@@ -10,3 +10,15 @@ description = "ratatui terminal frontend."
 
 [lints]
 workspace = true
+
+[dependencies]
+grokforge-protocol = { workspace = true }
+grokforge-core = { workspace = true }
+grokforge-sandbox = { workspace = true }
+grokforge-xai = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }

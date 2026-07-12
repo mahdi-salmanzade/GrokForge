@@ -5,6 +5,7 @@
 
 mod debug;
 mod headless;
+mod tui;
 
 use std::path::PathBuf;
 
@@ -107,7 +108,7 @@ async fn main() -> std::process::ExitCode {
             })
             .await
         }
-        None => milestone("the interactive TUI", "M3"),
+        None => tui::launch().await,
         Some(Command::Exec {
             prompt,
             preset,

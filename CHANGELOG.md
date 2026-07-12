@@ -28,3 +28,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   JSONL rollout persistence with size-capped debug-log rotation math. Working
   `grokforge exec -p` headless command (`--preset`, `--allow`, `--json`, `--model`,
   `--effort`, `--cd`) with CI-friendly exit codes.
+- M3 (first cut) interactive TUI (`grokforge-tui`): a working ratatui frontend driving the
+  agent over the same event/approval channels as headless. Async event loop (crossterm
+  `EventStream` + agent events + approval requests in `tokio::select!`), scrolling transcript
+  with role-styled entries and live streaming, composer, status line, and an interactive
+  approval modal (`y`/`a`/`d`). `TestBackend` render tests. Launched by the default,
+  no-subcommand `grokforge` invocation. (Uses the alternate screen; the inline-viewport +
+  native-scrollback render pipeline from the design docs is the planned upgrade.)

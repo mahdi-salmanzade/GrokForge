@@ -22,6 +22,7 @@ clap = { workspace = true }
 grokforge-protocol = { workspace = true }
 grokforge-core = { workspace = true }
 grokforge-sandbox = { workspace = true }
+grokforge-tui = { workspace = true }
 grokforge-xai = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
