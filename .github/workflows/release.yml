@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross linker (aarch64 linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --bin grokforge --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          tar -C target/${{ matrix.target }}/release -czf grokforge-${{ matrix.target }}.tar.gz grokforge
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/release/grokforge.exe -DestinationPath grokforge-${{ matrix.target }}.zip
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            grokforge-${{ matrix.target }}.tar.gz
+            grokforge-${{ matrix.target }}.zip
+          fail_on_unmatched_files: false
+
+  # macOS signing/notarization (rcodesign) and a Homebrew tap are wired here once the project has
+  # signing credentials — see docs/design/03-roadmap.md (M11). Until then, macOS artifacts are
+  # unsigned and users clear Gatekeeper manually.

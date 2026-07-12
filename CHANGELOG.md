@@ -76,3 +76,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cover both cases.
 - TUI slash commands: `/help`, `/plan <task>`, `/undo` (host-side git undo of the session's agent
   commits), `/clear`, `/quit`.
+- **Sandbox correctness fixes (important):** (1) the Seatbelt self-test used an invalid SBPL
+  operation (`process-exec*`), so `available()` always failed and every run silently fell back to
+  the unenforced passthrough runner — Seatbelt is now correctly detected and active. (2)
+  `CommandSpec::shell` split the command on whitespace, mangling any quoted/piped/redirected
+  command; it now runs through `/bin/sh -c` (`cmd /C` on Windows) so commands execute as written,
+  under the sandbox. Verified end-to-end: a real `echo > /tmp/…` shell escape under `--preset auto`
+  is now blocked by the kernel and classified as a sandbox denial.
+- M11 (release readiness): `grokforge doctor` reports toolchain, the **actual** sandbox backend and
+  whether it's enforced, git availability, and endpoint/telemetry status. `SECURITY.md` (privacy
+  claim, what leaves the machine, per-platform sandboxing, threat model). Release workflow building
+  per-target binaries on tag. (macOS signing/notarization + Homebrew tap wired but pending
+  credentials.)

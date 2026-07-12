@@ -25,15 +25,24 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
-    /// Parse a shell-style command line into program + args (whitespace split; good enough
-    /// for the common case — a real shell-lex lands with the shell tool hardening).
+    /// Run a command line through the system shell (`/bin/sh -c` on Unix, `cmd /C` on Windows),
+    /// so quotes, pipes, redirects, and globs work as written. The shell itself runs under the
+    /// sandbox, so its child processes are confined too.
     #[must_use]
     pub fn shell(command_line: &str, cwd: PathBuf) -> Self {
-        let mut parts = command_line.split_whitespace().map(String::from);
-        let program = parts.next().unwrap_or_default();
+        #[cfg(windows)]
+        let (program, args) = (
+            "cmd".to_string(),
+            vec!["/C".to_string(), command_line.to_string()],
+        );
+        #[cfg(not(windows))]
+        let (program, args) = (
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), command_line.to_string()],
+        );
         Self {
             program,
-            args: parts.collect(),
+            args,
             cwd,
             timeout: Duration::from_secs(120),
         }

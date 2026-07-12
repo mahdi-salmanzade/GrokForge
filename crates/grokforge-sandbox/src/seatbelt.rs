@@ -57,15 +57,11 @@ fn canonical(path: &Path) -> String {
 pub struct SeatbeltRunner;
 
 impl SeatbeltRunner {
-    /// Whether Seatbelt is usable on this machine (a quick deny-default self-test).
+    /// Whether Seatbelt is usable on this machine (runs `/usr/bin/true` under a valid profile).
     #[must_use]
     pub fn available() -> bool {
         std::process::Command::new(SANDBOX_EXEC)
-            .args([
-                "-p",
-                "(version 1)(deny default)(allow process-exec*)",
-                "/usr/bin/true",
-            ])
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
             .output()
             .is_ok_and(|o| o.status.success())
     }

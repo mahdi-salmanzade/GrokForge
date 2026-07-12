@@ -4,6 +4,7 @@
 //! The other subcommands are scaffolded here and implemented at their milestones.
 
 mod debug;
+mod doctor;
 mod headless;
 mod sessions;
 mod tui;
@@ -142,11 +143,7 @@ async fn main() -> std::process::ExitCode {
             })
             .await
         }
-        Some(Command::Doctor) => {
-            println!("grokforge {}", env!("CARGO_PKG_VERSION"));
-            println!("minimum toolchain: {}", env!("CARGO_PKG_RUST_VERSION"));
-            std::process::ExitCode::SUCCESS
-        }
+        Some(Command::Doctor) => doctor::run(),
         Some(Command::Resume { id }) => sessions::resume(id).await,
         Some(Command::Sessions) => sessions::list().await,
         Some(Command::Login) => milestone("keyring login", "M8+"),
