@@ -13,6 +13,7 @@ pub mod agents_md;
 pub mod approvals;
 pub mod compaction;
 pub mod context;
+pub mod mcp_config;
 pub mod redaction;
 pub mod session;
 pub mod store;

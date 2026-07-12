@@ -16,6 +16,7 @@ grokforge-protocol = { workspace = true }
 grokforge-xai = { workspace = true }
 grokforge-sandbox = { workspace = true }
 grokforge-git = { workspace = true }
+grokforge-mcp = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }

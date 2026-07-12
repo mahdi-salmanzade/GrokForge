@@ -101,14 +101,16 @@ pub async fn run(args: ExecArgs) -> ExitCode {
         Arc::new(AutoApprover::new(parse_allow(&args.allow)))
     };
 
+    // Build the tool registry and register any MCP servers declared in .grokforge/mcp.json.
+    let mut registry = ToolRegistry::with_builtins();
+    let connected =
+        grokforge_core::mcp_config::connect_and_register(&workspace, &mut registry).await;
+    if !connected.is_empty() {
+        eprintln!("mcp: connected {}", connected.join(", "));
+    }
+
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let agent = Agent::new(
-        client,
-        ToolRegistry::with_builtins(),
-        default_runner(),
-        approver,
-        tx,
-    );
+    let agent = Agent::new(client, registry, default_runner(), approver, tx);
 
     let mut config = SessionConfig::new(workspace, model).with_policy(policy, mode);
     config.max_iterations = args.max_iterations;

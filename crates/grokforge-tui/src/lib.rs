@@ -46,10 +46,14 @@ pub async fn run_session(
 
     let model = session.config.model.clone();
     let workspace = session.config.workspace_root.clone();
+
+    let mut registry = ToolRegistry::with_builtins();
+    grokforge_core::mcp_config::connect_and_register(&workspace, &mut registry).await;
+
     let agent = Arc::new(
         Agent::new(
             client,
-            ToolRegistry::with_builtins(),
+            registry,
             default_runner(),
             Arc::new(approver),
             events_tx,

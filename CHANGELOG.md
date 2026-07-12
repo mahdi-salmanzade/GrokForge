@@ -88,3 +88,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   claim, what leaves the machine, per-platform sandboxing, threat model). Release workflow building
   per-target binaries on tag. (macOS signing/notarization + Homebrew tap wired but pending
   credentials.)
+- M9 MCP (Model Context Protocol): `grokforge-mcp` is a minimal, hand-rolled JSON-RPC 2.0 stdio
+  client behind an internal `McpConnection` trait (chosen over pinning an unverified `rmcp`
+  version). `initialize` handshake, `tools/list`, `tools/call`. Core `McpToolAdapter` exposes each
+  server tool as a `mcp__<server>__<tool>` GrokForge tool that is **always approval-gated** (its
+  side effects are outside our sandbox). A `.grokforge/mcp.json` loader connects declared servers
+  at session start and registers their tools; wired into both frontends. Verified end-to-end: a
+  configured mock MCP server's tool is called through the full agent loop.

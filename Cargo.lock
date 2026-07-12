@@ -588,6 +588,7 @@ dependencies = [
  "futures",
  "globset",
  "grokforge-git",
+ "grokforge-mcp",
  "grokforge-protocol",
  "grokforge-sandbox",
  "grokforge-test-support",
@@ -616,6 +617,14 @@ dependencies = [
 [[package]]
 name = "grokforge-mcp"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "grokforge-protocol"

@@ -2,6 +2,7 @@
 //! so the agent loop treats them identically and the approval engine gates them uniformly.
 
 pub mod builtins;
+pub mod mcp;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -169,6 +170,11 @@ impl ToolRegistry {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
+    }
+
+    /// Register an additional tool (e.g. an MCP adapter).
+    pub fn register(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.insert(tool.spec().name, tool);
     }
 
     #[must_use]
