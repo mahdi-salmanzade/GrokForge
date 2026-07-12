@@ -1,0 +1,12 @@
+[package]
+name = "grokforge-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Mock xAI SSE server, fixture repositories, and a PTY test harness."
+
+[lints]
+workspace = true

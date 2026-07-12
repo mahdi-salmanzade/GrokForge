@@ -1,0 +1,12 @@
+[package]
+name = "grokforge-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Config layering (figment), provider config, price table, and keyring access."
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pending-snap
+.env
+.env.*
+!.env.example
+/dist
+.DS_Store
+
+# GrokForge local state written into a working repo during dogfooding
+/.grokforge/

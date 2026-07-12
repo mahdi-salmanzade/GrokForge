@@ -1,0 +1,111 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["GrokForge contributors"]
+repository = "https://github.com/grokforge/grokforge"
+homepage = "https://github.com/grokforge/grokforge"
+description = "Open-source terminal coding agent for Grok — local-first, sandboxed, git-native."
+keywords = ["grok", "xai", "agent", "tui", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+# Pinned intent per docs/design/01-tech-brief.md (verified July 2026). Minor-version
+# requirements let patch updates flow while holding the researched major.minor.
+[workspace.dependencies]
+# --- internal crates ---
+grokforge-protocol = { path = "crates/grokforge-protocol", version = "0.1.0" }
+grokforge-config = { path = "crates/grokforge-config", version = "0.1.0" }
+grokforge-xai = { path = "crates/grokforge-xai", version = "0.1.0" }
+grokforge-core = { path = "crates/grokforge-core", version = "0.1.0" }
+grokforge-sandbox = { path = "crates/grokforge-sandbox", version = "0.1.0" }
+grokforge-git = { path = "crates/grokforge-git", version = "0.1.0" }
+grokforge-context = { path = "crates/grokforge-context", version = "0.1.0" }
+grokforge-mcp = { path = "crates/grokforge-mcp", version = "0.1.0" }
+grokforge-render = { path = "crates/grokforge-render", version = "0.1.0" }
+grokforge-tui = { path = "crates/grokforge-tui", version = "0.1.0" }
+grokforge-test-support = { path = "crates/grokforge-test-support", version = "0.1.0" }
+
+# --- async / runtime ---
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# --- http / sse ---
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+eventsource-stream = "0.2"
+bytes = "1"
+url = { version = "2", features = ["serde"] }
+
+# --- serde / data ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# --- errors / logging ---
+thiserror = "2"
+anyhow = "1"
+color-eyre = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- cli / config ---
+clap = { version = "4", features = ["derive", "env"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+directories = "5"
+keyring = "3"
+
+# --- ids / time ---
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["formatting", "macros"] }
+
+# --- storage ---
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# --- git / search / code ---
+gix = "0.66"
+ignore = "0.4"
+globset = "0.4"
+nucleo = "0.5"
+
+# --- tui / render ---
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
+unicode-segmentation = "1"
+unicode-width = "0.2"
+pulldown-cmark = "0.12"
+syntect = "5"
+similar = "2"
+textwrap = "0.16"
+
+# Platform sandbox crates (landlock, seccompiler on Linux; libc everywhere)
+# are declared directly in grokforge-sandbox with cfg-gated target tables.
+libc = "0.2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
+
+[profile.dev]
+# faster incremental compiles for a large workspace
+debug = 1

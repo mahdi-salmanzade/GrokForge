@@ -1,0 +1,12 @@
+[package]
+name = "grokforge-xai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "In-house xAI Grok client: /v1/responses, SSE streaming, model validation, request byte-accounting."
+
+[lints]
+workspace = true

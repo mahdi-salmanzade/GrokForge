@@ -1,0 +1,4 @@
+# unwrap/expect are denied in library/binary code (workspace lints) but fine in tests.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

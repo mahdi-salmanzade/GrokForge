@@ -1,0 +1,21 @@
+[package]
+name = "grokforge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Open-source terminal coding agent for Grok — local-first, sandboxed, git-native."
+default-run = "grokforge"
+
+[[bin]]
+name = "grokforge"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { workspace = true }

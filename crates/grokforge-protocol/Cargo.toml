@@ -1,0 +1,18 @@
+[package]
+name = "grokforge-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Shared serde vocabulary (Op/Event/approvals/SandboxPolicy/ledger) spoken by every GrokForge frontend."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
