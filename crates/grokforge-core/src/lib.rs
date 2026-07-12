@@ -11,6 +11,7 @@
 
 pub mod agents_md;
 pub mod approvals;
+pub mod compaction;
 pub mod context;
 pub mod redaction;
 pub mod session;

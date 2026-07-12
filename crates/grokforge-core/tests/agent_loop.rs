@@ -255,6 +255,53 @@ async fn rollout_persists_the_transcript() {
 }
 
 #[tokio::test]
+async fn long_history_is_compacted_at_turn_end() {
+    use grokforge_protocol::ResponseItem;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let mock = MockXai::builder()
+        // Turn response, then the compaction summary request.
+        .route("/v1/responses", final_text("done"))
+        .route(
+            "/v1/responses",
+            final_text("Earlier: set up the project and fixed two tests."),
+        )
+        .start()
+        .await;
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let agent = agent_for(&mock, tx);
+
+    let mut config = SessionConfig::new(workspace.path().to_path_buf(), "grok-build-0.1");
+    config.auto_commit = false;
+    config.compaction_trigger_bytes = 100; // force compaction
+    config.compaction_keep_tail = 2;
+    let mut session = Session::new(config);
+    // Seed a long prior history.
+    for i in 0..10 {
+        session.history.push(ResponseItem::assistant(
+            format!("old message {i} ").repeat(10),
+        ));
+    }
+    let before = session.history.len();
+
+    agent.run_turn(&mut session, "continue", &mut None).await;
+
+    // History was compacted: it now starts with a summary and is much shorter.
+    assert!(session.history.len() < before, "history should shrink");
+    assert!(
+        matches!(
+            session.history.first(),
+            Some(ResponseItem::CompactionSummary { .. })
+        ),
+        "first item should be the compaction summary"
+    );
+    if let Some(ResponseItem::CompactionSummary { text }) = session.history.first() {
+        assert!(text.contains("Earlier: set up the project"));
+    }
+}
+
+#[tokio::test]
 async fn headless_denies_and_continues_without_yolo() {
     // With the strict-ish default (OnRequest + read-only) and the default AutoApprover (no
     // allow rules), a write is auto-denied and the model is told — the turn still completes.

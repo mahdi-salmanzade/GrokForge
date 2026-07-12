@@ -15,7 +15,10 @@ pub async fn list() -> ExitCode {
         println!("no saved sessions (looked in {})", dir.display());
         return ExitCode::SUCCESS;
     }
-    println!("{:<10}  {:<20}  {:<16}  {}", "ID", "MODEL", "WORKSPACE", "FIRST PROMPT");
+    println!(
+        "{:<10}  {:<20}  {:<16}  {}",
+        "ID", "MODEL", "WORKSPACE", "FIRST PROMPT"
+    );
     for m in metas {
         let short_id: String = m.session_id.chars().take(8).collect();
         let workspace = m.workspace.file_name().map_or_else(
@@ -27,7 +30,10 @@ pub async fn list() -> ExitCode {
         } else {
             m.first_prompt.clone()
         };
-        println!("{short_id:<10}  {:<20}  {:<16}  {prompt}", m.model, workspace);
+        println!(
+            "{short_id:<10}  {:<20}  {:<16}  {prompt}",
+            m.model, workspace
+        );
     }
     ExitCode::SUCCESS
 }

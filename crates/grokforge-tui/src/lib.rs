@@ -26,7 +26,11 @@ pub use app::App;
 pub use approver::{ChannelApprover, PendingApproval};
 
 /// Launch the interactive TUI for a fresh session.
-pub async fn run(client: XaiClient, config: SessionConfig, status_preset: String) -> io::Result<()> {
+pub async fn run(
+    client: XaiClient,
+    config: SessionConfig,
+    status_preset: String,
+) -> io::Result<()> {
     run_session(client, Session::new(config), status_preset).await
 }
 

@@ -11,11 +11,12 @@ use grokforge_protocol::{
     ToolCallId, TurnId, Usage,
 };
 use grokforge_sandbox::SandboxRunner;
-use grokforge_xai::{StreamEvent, XaiClient};
+use grokforge_xai::{InputItem, ResponsesRequest, Role, StreamEvent, XaiClient};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agents_md;
 use crate::approvals::{Approver, Gate, gate};
+use crate::compaction;
 use crate::context::{self, Assembled};
 use crate::redaction::Redactor;
 use crate::session::Session;
@@ -129,7 +130,7 @@ impl Agent {
                 self.emit(EventMsg::LedgerAppended(entry));
             }
 
-            let mut stream = match self.client.stream(&request).await {
+            let stream = match self.client.stream(&request).await {
                 Ok(s) => s,
                 Err(e) => {
                     self.emit(EventMsg::Error {
@@ -140,42 +141,7 @@ impl Agent {
                 }
             };
 
-            let mut assistant_text = String::new();
-            let mut tool_calls: Vec<(ToolCallId, String, String)> = Vec::new();
-            let mut usage = Usage::default();
-
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(StreamEvent::TextDelta(d)) => {
-                        assistant_text.push_str(&d);
-                        self.emit(EventMsg::AgentMessageDelta { delta: d });
-                    }
-                    Ok(StreamEvent::ReasoningDelta(d)) => {
-                        self.emit(EventMsg::ReasoningDelta { delta: d });
-                    }
-                    Ok(StreamEvent::ToolCall(call)) => {
-                        let id = ToolCallId::new();
-                        tool_calls.push((id, call.name, call.arguments));
-                    }
-                    Ok(StreamEvent::Usage(u)) => {
-                        usage = Usage {
-                            input_tokens: u.input_tokens,
-                            cached_tokens: u.cached_tokens,
-                            output_tokens: u.output_tokens,
-                            reasoning_tokens: u.reasoning_tokens,
-                        };
-                    }
-                    Ok(StreamEvent::Completed { .. } | StreamEvent::Created { .. }) => {}
-                    Err(e) => {
-                        self.emit(EventMsg::Error {
-                            message: format!("stream error: {e}"),
-                            recoverable: e.is_retriable(),
-                        });
-                        break;
-                    }
-                }
-            }
-
+            let (assistant_text, tool_calls, usage) = self.consume_response(stream).await;
             self.emit(EventMsg::TokenUsage { usage });
 
             if !assistant_text.is_empty() {
@@ -201,6 +167,11 @@ impl Agent {
             self.auto_commit(session, turn_id, &ctx).await;
         }
 
+        // Keep the model-visible window bounded on long sessions.
+        if session.config.auto_compact {
+            self.compact(session).await;
+        }
+
         self.emit(EventMsg::TurnComplete {
             turn_id,
             stop: stop.clone(),
@@ -208,10 +179,108 @@ impl Agent {
         stop
     }
 
+    /// Drain a model response stream: emit text/reasoning deltas and collect the final text,
+    /// the requested tool calls, and usage.
+    #[allow(clippy::type_complexity)]
+    async fn consume_response(
+        &self,
+        mut stream: grokforge_xai::ResponseStream,
+    ) -> (String, Vec<(ToolCallId, String, String)>, Usage) {
+        let mut assistant_text = String::new();
+        let mut tool_calls: Vec<(ToolCallId, String, String)> = Vec::new();
+        let mut usage = Usage::default();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::TextDelta(d)) => {
+                    assistant_text.push_str(&d);
+                    self.emit(EventMsg::AgentMessageDelta { delta: d });
+                }
+                Ok(StreamEvent::ReasoningDelta(d)) => {
+                    self.emit(EventMsg::ReasoningDelta { delta: d });
+                }
+                Ok(StreamEvent::ToolCall(call)) => {
+                    tool_calls.push((ToolCallId::new(), call.name, call.arguments));
+                }
+                Ok(StreamEvent::Usage(u)) => {
+                    usage = Usage {
+                        input_tokens: u.input_tokens,
+                        cached_tokens: u.cached_tokens,
+                        output_tokens: u.output_tokens,
+                        reasoning_tokens: u.reasoning_tokens,
+                    };
+                }
+                Ok(StreamEvent::Completed { .. } | StreamEvent::Created { .. }) => {}
+                Err(e) => {
+                    self.emit(EventMsg::Error {
+                        message: format!("stream error: {e}"),
+                        recoverable: e.is_retriable(),
+                    });
+                    break;
+                }
+            }
+        }
+        (assistant_text, tool_calls, usage)
+    }
+
+    /// Compact history if it has grown past the threshold, replacing older items with a
+    /// model-written summary plus mechanically-extracted verbatim paths/errors. Returns whether
+    /// compaction happened. Public so a `/compact` command can force it.
+    pub async fn compact(&self, session: &mut Session) -> bool {
+        let trigger = session.config.compaction_trigger_bytes;
+        let keep = session.config.compaction_keep_tail;
+        if !compaction::should_compact(&session.history, trigger, keep) {
+            return false;
+        }
+        let split = session.history.len().saturating_sub(keep);
+        let older = &session.history[..split];
+        let (files, errors) = compaction::extract_verbatim(older);
+        let transcript = compaction::transcript_text(older);
+
+        let req = ResponsesRequest::new(
+            session.config.model.clone(),
+            vec![
+                InputItem::text(
+                    Role::Developer,
+                    "Summarize the following conversation so the assistant can continue the task. \
+                     Capture decisions, current state, and open work. Be concise.",
+                ),
+                InputItem::text(Role::User, transcript),
+            ],
+        );
+        let summary = self.collect_text(&req).await;
+        let summary_item = compaction::build_summary_item(&summary, &files, &errors);
+
+        let tail = session.history.split_off(split);
+        session.history.clear();
+        session.history.push(summary_item);
+        session.history.extend(tail);
+        tracing::info!("compacted {} items into a summary", split);
+        true
+    }
+
+    /// Stream a request and collect its assistant text (used for summaries/commit messages).
+    async fn collect_text(&self, req: &ResponsesRequest) -> String {
+        let mut text = String::new();
+        match self.client.stream(req).await {
+            Ok(mut stream) => {
+                while let Some(ev) = stream.next().await {
+                    if let Ok(StreamEvent::TextDelta(d)) = ev {
+                        text.push_str(&d);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("summary request failed: {e}"),
+        }
+        text
+    }
+
     /// Commit files the agent wrote this turn, staging only those paths, from the host process.
     async fn auto_commit(&self, session: &Session, turn_id: TurnId, ctx: &TurnContext) {
-        let touched: Vec<std::path::PathBuf> =
-            ctx.touched_paths().into_iter().filter(|p| p.exists()).collect();
+        let touched: Vec<std::path::PathBuf> = ctx
+            .touched_paths()
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect();
         if touched.is_empty() {
             return;
         }
@@ -387,7 +456,11 @@ fn commit_message(touched: &[std::path::PathBuf]) -> String {
             } else {
                 String::new()
             };
-            format!("grokforge: update {} files ({}{more})", many.len(), shown.join(", "))
+            format!(
+                "grokforge: update {} files ({}{more})",
+                many.len(),
+                shown.join(", ")
+            )
         }
     }
 }

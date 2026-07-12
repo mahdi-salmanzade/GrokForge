@@ -24,6 +24,12 @@ pub struct SessionConfig {
     pub max_iterations: u32,
     /// Auto-commit the agent's edits at the end of a mutating turn (when in a git repo).
     pub auto_commit: bool,
+    /// Compact history at turn end once it exceeds this estimated byte size.
+    pub compaction_trigger_bytes: usize,
+    /// How many recent items to keep verbatim when compacting.
+    pub compaction_keep_tail: usize,
+    /// Whether to auto-compact at turn end.
+    pub auto_compact: bool,
 }
 
 impl SessionConfig {
@@ -39,6 +45,10 @@ impl SessionConfig {
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             max_iterations: 32,
             auto_commit: true,
+            // ~100k tokens at 4 bytes/token; well below the smallest model context.
+            compaction_trigger_bytes: 400_000,
+            compaction_keep_tail: 8,
+            auto_compact: true,
         }
     }
 

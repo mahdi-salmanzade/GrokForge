@@ -32,10 +32,14 @@ fn build_profile(num_writable: usize, num_protected: usize, deny_network: bool) 
     p.push_str("(allow file-write-data (literal \"/dev/null\"))\n");
     p.push_str("(allow file-write-data (literal \"/dev/dtracehelper\"))\n");
     for i in 0..num_writable {
-        p.push_str(&format!("(allow file-write* (subpath (param \"WS{i}\")))\n"));
+        p.push_str(&format!(
+            "(allow file-write* (subpath (param \"WS{i}\")))\n"
+        ));
     }
     for i in 0..num_protected {
-        p.push_str(&format!("(deny file-write* (subpath (param \"GIT{i}\")))\n"));
+        p.push_str(&format!(
+            "(deny file-write* (subpath (param \"GIT{i}\")))\n"
+        ));
     }
     p
 }
@@ -57,7 +61,11 @@ impl SeatbeltRunner {
     #[must_use]
     pub fn available() -> bool {
         std::process::Command::new(SANDBOX_EXEC)
-            .args(["-p", "(version 1)(deny default)(allow process-exec*)", "/usr/bin/true"])
+            .args([
+                "-p",
+                "(version 1)(deny default)(allow process-exec*)",
+                "/usr/bin/true",
+            ])
             .output()
             .is_ok_and(|o| o.status.success())
     }
@@ -78,7 +86,10 @@ impl SeatbeltRunner {
         }
         let tmp_index = policy.writable_roots.len();
         args.push("-D".to_string());
-        args.push(format!("WS{tmp_index}={}", canonical(&std::env::temp_dir())));
+        args.push(format!(
+            "WS{tmp_index}={}",
+            canonical(&std::env::temp_dir())
+        ));
         for (i, prot) in policy.protected_paths.iter().enumerate() {
             args.push("-D".to_string());
             args.push(format!("GIT{i}={}", canonical(prot)));
@@ -112,7 +123,9 @@ impl SandboxRunner for SeatbeltRunner {
             SandboxCapability {
                 backend: "seatbelt (unavailable)".to_string(),
                 enforced: false,
-                notes: vec!["sandbox-exec self-test failed; falling back to approval-only".to_string()],
+                notes: vec![
+                    "sandbox-exec self-test failed; falling back to approval-only".to_string(),
+                ],
             }
         }
     }
@@ -184,7 +197,10 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let policy = SandboxPolicy::danger_full_access(ws.path());
         let out = SeatbeltRunner
-            .run(&policy, &spec("/bin/echo", &["hi"], ws.path().to_path_buf()))
+            .run(
+                &policy,
+                &spec("/bin/echo", &["hi"], ws.path().to_path_buf()),
+            )
             .await
             .unwrap();
         assert!(out.succeeded());

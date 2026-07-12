@@ -68,7 +68,10 @@ mod tests {
     fn classifies_network_denial() {
         let policy = SandboxPolicy::workspace_write(&PathBuf::from("/w"));
         assert_eq!(
-            classify(&policy, &failed("curl: (6) Could not resolve host: example.com")),
+            classify(
+                &policy,
+                &failed("curl: (6) Could not resolve host: example.com")
+            ),
             Some(DenialClass::Network)
         );
     }

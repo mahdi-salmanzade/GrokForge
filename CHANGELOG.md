@@ -59,3 +59,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`Session::with_history`) and reopens it in the TUI, continuing from prior history. Rollouts
   thread through interactive turns so ongoing sessions keep persisting. Verified end-to-end: a
   headless run is listed by `grokforge sessions`.
+- M7 (compaction) context management: history is compacted at turn end once it exceeds a
+  configurable byte threshold. The model writes a narrative summary while file paths (from
+  write/edit tool calls) and error text (from failed tool results) are extracted
+  **mechanically** and preserved verbatim — never paraphrased. The full transcript stays in the
+  rollout; only the model-visible window shrinks. Pure functions unit-tested; the model-backed
+  loop verified with a mock. (Repo map and the ledger TUI panel from M7 are deferred to a later
+  pass.)
