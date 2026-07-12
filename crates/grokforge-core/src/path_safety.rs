@@ -26,6 +26,7 @@ pub(crate) enum PathSafetyError {
     InvalidTarget,
     #[error("refusing to follow a symbolic link in a host-process write")]
     Symlink,
+    #[cfg(unix)]
     #[error("refusing to access a multiply-linked file in the host process")]
     HardLink,
     #[error("target changed concurrently; refusing to overwrite a newer file")]
@@ -267,6 +268,7 @@ fn read_text_file(
     if !file.metadata()?.is_file() {
         return Err(PathSafetyError::NotText);
     }
+    #[cfg(unix)]
     reject_hard_link(&file)?;
     let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
     (&mut file)
@@ -293,11 +295,11 @@ pub(crate) fn list_workspace_dir(
     if cfg!(not(unix)) {
         return Err(PathSafetyError::Denied);
     }
-    let directory = open_workspace_target(workspace, target, true)?;
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
 
+        let directory = open_workspace_target(workspace, target, true)?;
         let mut reader = rustix::fs::Dir::read_from(&directory).map_err(std::io::Error::from)?;
         let mut entries = Vec::new();
         let mut truncated = false;
@@ -613,7 +615,6 @@ pub(crate) fn write_file_bound(
         if !file.metadata()?.is_file() {
             return Err(PathSafetyError::InvalidTarget);
         }
-        reject_hard_link(&file)?;
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(content)?;
@@ -645,6 +646,7 @@ pub(crate) fn edit_file_bound(
         }
         open_confined(policy, target, false, true)?
     };
+    #[cfg(unix)]
     reject_hard_link(&file)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -711,16 +713,13 @@ pub(crate) fn edit_file_bound(
     Ok(occurrences)
 }
 
+#[cfg(unix)]
 fn reject_hard_link(file: &std::fs::File) -> Result<(), PathSafetyError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if file.metadata()?.nlink() > 1 {
-            return Err(PathSafetyError::HardLink);
-        }
+    use std::os::unix::fs::MetadataExt;
+
+    if file.metadata()?.nlink() > 1 {
+        return Err(PathSafetyError::HardLink);
     }
-    #[cfg(not(unix))]
-    let _ = file;
     Ok(())
 }
 

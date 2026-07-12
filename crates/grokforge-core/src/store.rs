@@ -189,6 +189,7 @@ impl SessionMeta {
         let (tmp, mut file) = create_private_temp(dir, "metadata")?;
         let write_result = async {
             file.write_all(json.as_bytes()).await?;
+            #[cfg(unix)]
             set_private_open_file_permissions(&file).await?;
             file.sync_all().await
         }
@@ -202,7 +203,9 @@ impl SessionMeta {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(error);
         }
-        sync_directory(dir).await
+        #[cfg(unix)]
+        sync_directory(dir).await?;
+        Ok(())
     }
 
     /// List all session metadata in `dir`, newest first.
@@ -405,9 +408,11 @@ impl RolloutWriter {
         };
         let repairs = interrupted_tool_results(&history);
         let file = open_rollout_append(&path)?;
+        #[cfg(unix)]
         set_private_open_file_permissions(&file).await?;
         // Syncing unconditionally also covers a concurrently-created-but-safe entry without a
         // path-based existence probe that could itself race.
+        #[cfg(unix)]
         sync_directory(dir).await?;
         let mut writer = Self {
             path,
@@ -689,18 +694,12 @@ fn ensure_private_dir_blocking(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 async fn set_private_open_file_permissions(file: &tokio::fs::File) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .await
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-        Ok(())
-    }
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .await
 }
 
 async fn repair_truncated_tail(path: &Path) -> std::io::Result<()> {
@@ -753,21 +752,12 @@ async fn repair_truncated_tail(path: &Path) -> std::io::Result<()> {
     file.sync_data().await
 }
 
+#[cfg(unix)]
 async fn sync_directory(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let dir = dir.to_path_buf();
-        tokio::task::spawn_blocking(move || std::fs::File::open(dir)?.sync_all())
-            .await
-            .map_err(|error| {
-                std::io::Error::other(format!("directory sync task failed: {error}"))
-            })?
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        Ok(())
-    }
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::File::open(dir)?.sync_all())
+        .await
+        .map_err(|error| std::io::Error::other(format!("directory sync task failed: {error}")))?
 }
 
 async fn read_text_capped(path: &Path, cap: usize) -> std::io::Result<String> {
