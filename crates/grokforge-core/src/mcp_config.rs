@@ -106,13 +106,12 @@ pub async fn connect_and_register_trusted(
     connected
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn untrusted_project_config_is_not_executed() {
         let workspace = tempfile::tempdir().unwrap();
@@ -141,7 +140,6 @@ mod tests {
         assert!(!marker.exists());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn trusted_config_still_refuses_a_symlink_alias() {
         use std::os::unix::fs::symlink;
