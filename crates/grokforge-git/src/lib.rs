@@ -208,6 +208,11 @@ impl Git {
         }
     }
 
+    /// A `--stat` summary of a diff (e.g. `base..HEAD`).
+    pub fn diff_stat(&self, range: &str) -> Result<String, GitError> {
+        self.run(&["diff", "--stat", range])
+    }
+
     /// Create a worktree at `path` on a new `branch` from `base` (for subagents, M10).
     pub fn worktree_add(&self, path: &Path, branch: &str, base: &str) -> Result<(), GitError> {
         let p = path.to_string_lossy();

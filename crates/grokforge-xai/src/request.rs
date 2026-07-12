@@ -142,6 +142,15 @@ impl ToolDef {
         })
     }
 
+    /// The function name, for client-side function tools.
+    #[must_use]
+    pub fn function_name(&self) -> Option<&str> {
+        match self {
+            ToolDef::Function(f) => Some(&f.name),
+            ToolDef::Server(_) => None,
+        }
+    }
+
     #[must_use]
     pub fn web_search() -> Self {
         ToolDef::Server(serde_json::json!({ "type": "web_search" }))

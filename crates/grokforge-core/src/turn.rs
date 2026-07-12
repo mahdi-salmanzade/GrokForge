@@ -33,6 +33,8 @@ pub struct Agent {
     events: UnboundedSender<EventMsg>,
     /// Whether approvals are resolved without a human (headless); recorded on `ApprovalResolved`.
     auto_approval: bool,
+    /// Whether this agent may spawn subagents (false inside a subagent — depth cap 1).
+    allow_subagents: bool,
 }
 
 impl std::fmt::Debug for Agent {
@@ -60,6 +62,7 @@ impl Agent {
             approver,
             events,
             auto_approval: true,
+            allow_subagents: true,
         }
     }
 
@@ -67,6 +70,20 @@ impl Agent {
     pub fn interactive(mut self) -> Self {
         self.auto_approval = false;
         self
+    }
+
+    /// A sibling agent (shared client/registry/sandbox/approver) for running a subagent turn,
+    /// with its own event channel and subagent-spawning disabled (depth cap 1).
+    fn for_subagent(&self, events: UnboundedSender<EventMsg>) -> Self {
+        Self {
+            client: self.client.clone(),
+            registry: self.registry.clone(),
+            sandbox: Arc::clone(&self.sandbox),
+            approver: Arc::clone(&self.approver),
+            events,
+            auto_approval: self.auto_approval,
+            allow_subagents: false,
+        }
     }
 
     fn emit(&self, msg: EventMsg) {
@@ -147,11 +164,15 @@ impl Agent {
             .await;
 
         // Plan mode enforces read-only tools and a read-only sandbox regardless of preset.
-        let tool_defs = if plan {
+        let mut tool_defs = if plan {
             self.registry.readonly_tool_defs()
         } else {
             self.registry.tool_defs()
         };
+        // Subagents (and plan mode) do not offer the subagent-spawning tool.
+        if !self.allow_subagents || plan {
+            tool_defs.retain(|d| d.function_name() != Some(crate::tools::builtins::SPAWN_TASK));
+        }
         let ctx = if plan {
             self.turn_context_readonly(session)
         } else {
@@ -356,6 +377,123 @@ impl Agent {
         }
     }
 
+    /// Run a subagent in an isolated git worktree with a fresh sibling agent (depth cap 1). The
+    /// subagent's commits land on a `gf/agent/<id>` branch for the parent/user to review or merge;
+    /// we do not auto-merge (conflict resolution is a later enhancement).
+    ///
+    /// Declared with a boxed `+ Send` return type (not `async fn`) to break the async-recursion
+    /// auto-trait cycle `run_turn -> run_tool_call -> spawn_subagent -> run_turn`.
+    fn spawn_subagent<'a>(
+        &'a self,
+        session: &'a Session,
+        args: &'a serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolOutput> + Send + 'a>> {
+        Box::pin(async move {
+            let prompt = args
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if prompt.is_empty() {
+                return ToolOutput::failure("spawn_task requires a non-empty `prompt`");
+            }
+            let workspace = session.config.workspace_root.clone();
+            let Some(git) = grokforge_git::Git::discover(&workspace) else {
+                return ToolOutput::failure("subagents require a git repository");
+            };
+            let base = git.head_sha().unwrap_or_else(|_| "HEAD".to_string());
+            let id = ToolCallId::new().to_string();
+            let worktree = workspace.join(".grokforge/worktrees").join(&id);
+            let branch = format!("gf/agent/{id}");
+
+            let (git_c, wt_c, br_c) = (git.clone(), worktree.clone(), branch.clone());
+            match tokio::task::spawn_blocking(move || git_c.worktree_add(&wt_c, &br_c, "HEAD"))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return ToolOutput::failure(format!("could not create worktree: {e}"));
+                }
+                Err(e) => return ToolOutput::failure(format!("worktree task failed: {e}")),
+            }
+
+            // Run the subagent turn in the worktree with its own event channel.
+            let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel();
+            let sub_agent = self.for_subagent(sub_tx);
+            let sub_config =
+                crate::session::SessionConfig::new(worktree.clone(), session.config.model.clone())
+                    .with_policy(session.config.approval_policy, session.config.sandbox_mode);
+            let mut sub_session = crate::session::Session::new(sub_config);
+            // Box with an explicit `+ Send` trait object to break the async-recursion type cycle
+            // (run_turn -> spawn_subagent -> run_turn).
+            let sub_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                Box::pin(async move {
+                    sub_agent
+                        .run_turn(&mut sub_session, &prompt, &mut None)
+                        .await;
+                });
+            let handle = tokio::spawn(sub_fut);
+            let mut final_text = String::new();
+            while let Some(ev) = sub_rx.recv().await {
+                if let EventMsg::AgentMessageDone { text } = ev {
+                    final_text = text;
+                }
+            }
+            let _ = handle.await;
+
+            // Capture the change summary, then remove the worktree (keeping the branch).
+            let (git_d, wt_d, base_d) = (git.clone(), worktree.clone(), base.clone());
+            let diff = tokio::task::spawn_blocking(move || {
+                let d = grokforge_git::Git::discover(&wt_d)
+                    .and_then(|g| g.diff_stat(&format!("{base_d}..HEAD")).ok())
+                    .unwrap_or_default();
+                let _ = git_d.worktree_remove(&wt_d);
+                d
+            })
+            .await
+            .unwrap_or_default();
+
+            let changes = if diff.trim().is_empty() {
+                "(no changes)".to_string()
+            } else {
+                diff.trim().to_string()
+            };
+            ToolOutput::success(format!(
+                "Subagent finished on branch `{branch}` (review or merge it manually).\n\nResult:\n{final_text}\n\nChanges:\n{changes}"
+            ))
+        })
+    }
+
+    async fn handle_spawn_task(
+        &self,
+        session: &mut Session,
+        rollout: &mut Option<RolloutWriter>,
+        call_id: ToolCallId,
+        name: &str,
+        arguments: &str,
+    ) {
+        let args: serde_json::Value =
+            serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+        self.emit(EventMsg::ToolCallBegin {
+            call_id,
+            name: name.to_string(),
+            args_preview: preview(arguments),
+            sandboxed: true,
+        });
+        let output = self.spawn_subagent(session, &args).await;
+        let red = Redactor::apply(output.content());
+        let is_error = output.is_error();
+        self.emit(EventMsg::ToolCallEnd {
+            call_id,
+            ok: !is_error,
+            summary: summarize(&red.text),
+            denial: None,
+        });
+        self.record_tool_result(session, rollout, call_id, &red.text, is_error)
+            .await;
+    }
+
     async fn run_tool_call(
         &self,
         session: &mut Session,
@@ -375,6 +513,13 @@ impl Agent {
             },
         )
         .await;
+
+        // The subagent tool is intercepted by the runtime (it needs the Agent itself).
+        if name == crate::tools::builtins::SPAWN_TASK && self.allow_subagents {
+            self.handle_spawn_task(session, rollout, call_id, name, arguments)
+                .await;
+            return;
+        }
 
         let Some(tool) = self.registry.get(name) else {
             let msg = format!("unknown tool `{name}`");

@@ -12,6 +12,9 @@ use serde_json::json;
 use crate::approvals::ApprovalNeed;
 use crate::tools::{Tool, ToolInvocation, ToolOutput, ToolSpec, TurnContext, arg_str};
 
+/// The name of the subagent-spawning tool, intercepted by the turn runner.
+pub const SPAWN_TASK: &str = "spawn_task";
+
 /// Every built-in tool, ready to register.
 #[must_use]
 pub fn all() -> Vec<Arc<dyn Tool>> {
@@ -23,6 +26,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(ListDir),
         Arc::new(Glob_),
         Arc::new(Grep),
+        Arc::new(SpawnTask),
     ]
 }
 
@@ -401,6 +405,41 @@ impl Tool for Glob_ {
         } else {
             hits.join("\n")
         })
+    }
+}
+
+// ---------- spawn_task (subagent) ----------
+//
+// The runtime intercepts this by name and runs a sub-agent in an isolated git worktree; the
+// `invoke` below is only reached if subagents are disabled (e.g. inside a subagent).
+
+#[derive(Debug)]
+struct SpawnTask;
+
+#[async_trait]
+impl Tool for SpawnTask {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: SPAWN_TASK.to_string(),
+            description: "Run a self-contained subtask in an isolated git worktree and return its \
+                          result. Use for parallelizable or exploratory work."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "prompt": { "type": "string", "description": "The subtask to perform." } },
+                "required": ["prompt"]
+            }),
+            mutating: true,
+            parallel_safe: false,
+        }
+    }
+
+    fn approval(&self, _args: &serde_json::Value, _ctx: &TurnContext) -> ApprovalNeed {
+        ApprovalNeed::None
+    }
+
+    async fn invoke(&self, _inv: ToolInvocation<'_>) -> ToolOutput {
+        ToolOutput::failure("subagents cannot spawn further subagents")
     }
 }
 

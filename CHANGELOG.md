@@ -95,3 +95,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   side effects are outside our sandbox). A `.grokforge/mcp.json` loader connects declared servers
   at session start and registers their tools; wired into both frontends. Verified end-to-end: a
   configured mock MCP server's tool is called through the full agent loop.
+- M10 subagents: a `spawn_task` tool (intercepted by the runtime) runs a self-contained subtask
+  in an **isolated git worktree** on a `gf/agent/<id>` branch, via a fresh sibling agent with
+  subagent-spawning disabled (depth cap 1). The subagent's edits auto-commit in the worktree; the
+  parent receives the final result plus a `git diff --stat` summary and the branch name for
+  manual review/merge (no auto-merge yet). The async-recursion Send cycle is broken with a
+  boxed-`+ Send` return type on `spawn_subagent`. Verified end-to-end: a delegated subtask writes
+  and commits a file on its own branch, visible to the parent.

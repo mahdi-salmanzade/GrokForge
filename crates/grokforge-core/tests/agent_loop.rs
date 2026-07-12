@@ -373,6 +373,88 @@ async fn plan_mode_refuses_writes() {
 }
 
 #[tokio::test]
+async fn subagent_runs_in_an_isolated_worktree_branch() {
+    // Requires git.
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: git unavailable");
+        return;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let ws = workspace.path();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(ws)
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@t.dev"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(ws.join("README"), "x\n").unwrap();
+    git(&["add", "README"]);
+    git(&["commit", "-qm", "init"]);
+
+    let mock = MockXai::builder()
+        // 1: parent asks to spawn a subtask
+        .route(
+            "/v1/responses",
+            tool_call_then_done("spawn_task", json!({ "prompt": "create sub.txt" })),
+        )
+        // 2: subagent writes a file
+        .route(
+            "/v1/responses",
+            tool_call_then_done(
+                "write_file",
+                json!({ "path": "sub.txt", "content": "from subagent\n" }),
+            ),
+        )
+        // 3: subagent final message
+        .route("/v1/responses", final_text("wrote sub.txt"))
+        // 4: parent final message
+        .route("/v1/responses", final_text("subagent completed"))
+        .start()
+        .await;
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let agent = agent_for(&mock, tx);
+    let mut session = Session::new(
+        SessionConfig::new(ws.to_path_buf(), "grok-build-0.1").with_policy(
+            grokforge_protocol::ApprovalPolicy::Never,
+            SandboxMode::DangerFullAccess,
+        ),
+    );
+    agent
+        .run_turn(&mut session, "delegate a subtask", &mut None)
+        .await;
+
+    // A subagent branch was created and carries the file it wrote.
+    let branches = String::from_utf8(git(&["branch", "--list", "gf/agent/*"]).stdout).unwrap();
+    assert!(
+        !branches.trim().is_empty(),
+        "a gf/agent/* branch should exist"
+    );
+    let branch = branches.trim().trim_start_matches('*').trim().to_string();
+    let show = git(&["show", &format!("{branch}:sub.txt")]);
+    assert!(
+        show.status.success(),
+        "sub.txt should exist on the subagent branch"
+    );
+    assert_eq!(String::from_utf8(show.stdout).unwrap(), "from subagent\n");
+
+    // The spawn_task tool result was recorded in the parent transcript.
+    let has_subagent_result = session.history.iter().any(|i| {
+        matches!(i, grokforge_protocol::ResponseItem::ToolResult { content, .. }
+            if content.contains("Subagent finished on branch"))
+    });
+    assert!(has_subagent_result, "parent should see the subagent result");
+}
+
+#[tokio::test]
 async fn headless_denies_and_continues_without_yolo() {
     // With the strict-ish default (OnRequest + read-only) and the default AutoApprover (no
     // allow rules), a write is auto-denied and the model is told — the turn still completes.
