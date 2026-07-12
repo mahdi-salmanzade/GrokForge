@@ -1283,11 +1283,21 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn command_runner_deadline_includes_descendant_pipe_drain() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let ready_file = fixture.path().join("escaped-pid");
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", "setsid /bin/sh -c 'sleep 5' & exit 0"]);
+        command.env("READY_FILE", &ready_file).args([
+            "-c",
+            "setsid /bin/sh -c 'printf \"%s\" \"$$\" > \"$READY_FILE\"; exec sleep 5' & while [ ! -s \"$READY_FILE\" ]; do sleep 0.01; done; exit 0",
+        ]);
         let started = Instant::now();
-        let error = execute_command(&mut command, Duration::from_millis(100), 128)
-            .expect_err("escaped descendant pipe must remain deadline-bounded");
+        let result = execute_command(&mut command, Duration::from_millis(100), 128);
+        if let Ok(pid) = std::fs::read_to_string(&ready_file) {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", pid.trim()])
+                .status();
+        }
+        let error = result.expect_err("escaped descendant pipe must remain deadline-bounded");
         assert!(matches!(error, GitError::Timeout(_)));
         assert!(started.elapsed() < Duration::from_secs(1));
     }
