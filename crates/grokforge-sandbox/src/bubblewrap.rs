@@ -879,6 +879,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn danger_policy_masks_an_external_private_store() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -964,6 +965,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn workspace_write_root_escalation_keeps_other_confinement() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -980,6 +982,7 @@ mod tests {
         }));
     }
 
+    #[cfg(unix)]
     #[test]
     fn root_write_escalation_restores_a_tmp_cwd_after_hiding_tmp() {
         let root = PathBuf::from("/tmp/grokforge-approved-workspace");
@@ -1223,6 +1226,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn danger_masks_exact_external_private_store_globs() {
         let workspace = tempfile::tempdir().expect("workspace");

@@ -566,10 +566,17 @@ mod tests {
 
     #[test]
     fn explicit_environment_allowlist_rejects_unknown_and_malformed_values() {
+        let first_path = std::env::current_dir().expect("current directory");
+        let second_path = std::env::temp_dir();
         let safe = safe_child_environment([
             (
                 OsString::from("PATH"),
-                std::env::join_paths(["/usr/bin", "/bin", "relative"]).expect("test path"),
+                std::env::join_paths([
+                    first_path.as_os_str(),
+                    second_path.as_os_str(),
+                    OsStr::new("relative"),
+                ])
+                .expect("test path"),
             ),
             (OsString::from("LANG"), OsString::from("C.UTF-8")),
             (
@@ -596,8 +603,8 @@ mod tests {
         };
         let path = lookup("PATH").expect("safe PATH");
         let path_entries: Vec<_> = std::env::split_paths(path).collect();
-        assert!(path_entries.contains(&PathBuf::from("/usr/bin")));
-        assert!(path_entries.contains(&PathBuf::from("/bin")));
+        assert!(path_entries.contains(&first_path));
+        assert!(path_entries.contains(&second_path));
         assert!(!path_entries.contains(&PathBuf::from("relative")));
         assert_eq!(lookup("LANG"), Some(&OsString::from("C.UTF-8")));
         assert_eq!(lookup("TERM"), Some(&OsString::from("xterm-256color")));
@@ -705,6 +712,22 @@ mod tests {
 
     #[tokio::test]
     async fn drains_stdout_and_stderr_concurrently_without_deadlock() {
+        #[cfg(windows)]
+        let mut spec = CommandSpec {
+            program: "powershell.exe".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "[Console]::Out.Write(('x' * 200000 -join '')); \
+                 [Console]::Error.Write(('y' * 200000 -join ''))"
+                    .to_string(),
+            ],
+            cwd: std::env::temp_dir(),
+            timeout: Duration::from_secs(5),
+            cancellation: None,
+        };
+        #[cfg(not(windows))]
         let mut spec = CommandSpec::shell(
             "awk 'BEGIN { for(i=0;i<200000;i++) printf \"x\" }'; awk 'BEGIN { for(i=0;i<200000;i++) printf \"y\" }' >&2",
             std::env::temp_dir(),
@@ -721,6 +744,22 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_preserves_partial_output() {
+        #[cfg(windows)]
+        let mut spec = CommandSpec {
+            program: "powershell.exe".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "[Console]::Out.Write('before'); [Console]::Error.Write('warning'); \
+                 Start-Sleep -Seconds 10"
+                    .to_string(),
+            ],
+            cwd: std::env::temp_dir(),
+            timeout: Duration::from_millis(100),
+            cancellation: None,
+        };
+        #[cfg(not(windows))]
         let mut spec = CommandSpec::shell(
             "printf before; printf warning >&2; sleep 10",
             std::env::temp_dir(),

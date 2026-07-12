@@ -517,6 +517,7 @@ mod tests {
         assert_eq!(out.denial, Some(grokforge_protocol::DenialClass::FsWrite));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn danger_full_access_runs_unwrapped() {
         let ws = tempfile::tempdir().unwrap();
@@ -855,6 +856,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn explicit_session_path_is_parameterized_as_read_denial() {
         let ws = tempfile::tempdir().expect("workspace");

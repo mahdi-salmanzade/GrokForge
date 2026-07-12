@@ -43,11 +43,14 @@ impl SandboxRunner for PassthroughRunner {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::time::Duration;
 
     use super::*;
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn runs_a_command_and_captures_stdout() {
         let runner = PassthroughRunner;

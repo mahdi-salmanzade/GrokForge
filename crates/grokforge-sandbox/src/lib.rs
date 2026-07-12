@@ -166,15 +166,19 @@ mod tests {
     #[test]
     fn backend_boundary_rejects_relative_and_unresolvable_paths() {
         let dir = tempfile::tempdir().expect("workspace");
-        let command = CommandSpec::shell("true", dir.path().to_path_buf());
-        let mut policy = SandboxPolicy::workspace_write(dir.path());
+        let root = std::fs::canonicalize(dir.path()).expect("canonical workspace");
+        let command = CommandSpec::shell("true", root.clone());
+        let mut policy = SandboxPolicy::workspace_write(&root);
+        policy.readable_roots = vec![root.clone()];
+        policy.protected_paths.clear();
+        policy.unreadable_globs.clear();
         policy.writable_roots = vec![std::path::PathBuf::from("relative")];
         assert!(matches!(
             validate_backend_policy(&policy, &command),
             Err(ExecError::UnsupportedPolicy(message)) if message.contains("not absolute")
         ));
 
-        policy.writable_roots = vec![dir.path().join("missing")];
+        policy.writable_roots = vec![root.join("missing")];
         assert!(matches!(
             validate_backend_policy(&policy, &command),
             Err(ExecError::UnsupportedPolicy(message)) if message.contains("could not resolve")
@@ -182,7 +186,7 @@ mod tests {
 
         let relative_command = CommandSpec::shell("true", std::path::PathBuf::from("relative"));
         assert!(matches!(
-            validate_backend_policy(&SandboxPolicy::workspace_write(dir.path()), &relative_command),
+            validate_backend_policy(&policy, &relative_command),
             Err(ExecError::UnsupportedPolicy(message)) if message.contains("not absolute")
         ));
     }
