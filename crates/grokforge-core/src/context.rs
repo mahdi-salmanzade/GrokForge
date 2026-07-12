@@ -20,6 +20,7 @@ pub struct Assembled {
 
 /// Build the request for the current session state. `agents_md` content is redacted here;
 /// history items were already redacted at ingress (tool output / user input).
+#[allow(clippy::too_many_lines)]
 pub fn assemble(
     session: &Session,
     agents_md: &[AgentsDoc],
@@ -28,65 +29,150 @@ pub fn assemble(
     let mut input: Vec<InputItem> = Vec::new();
     let mut ledger = RequestLedger::default();
 
-    // System prompt (structural — accounted for in the envelope entry, not as user data).
-    input.push(InputItem::text(
-        Role::Developer,
-        &session.config.system_prompt,
-    ));
+    // A configured system prompt is still user-controlled input and can contain pasted secrets.
+    let system_prompt = Redactor::apply(&session.config.system_prompt);
+    input.push(InputItem::text(Role::Developer, &system_prompt.text));
+    ledger.push(
+        LedgerEntry::new("system_prompt", system_prompt.text.len(), "configuration")
+            .with_redactions(system_prompt.count),
+    );
 
     // AGENTS.md, redacted, counted as auto-context.
     for doc in agents_md {
         let red = Redactor::apply(&doc.content);
-        let block = format!(
-            "<AGENTS.md path=\"{}\">\n{}\n</AGENTS.md>",
-            doc.path.display(),
-            red.text
-        );
+        // Absolute workspace paths disclose local usernames/home layouts without helping the
+        // model. AGENTS discovery is workspace-confined; retain only that relative identity.
+        let relative = doc
+            .path
+            .strip_prefix(&session.config.workspace_root)
+            .unwrap_or_else(|_| std::path::Path::new("AGENTS.md"));
+        let display_path = Redactor::apply(&relative.to_string_lossy());
+        let path_json = serde_json::to_string(&display_path.text)
+            .unwrap_or_else(|_| "\"<invalid path>\"".to_string());
+        let block = format!("<AGENTS.md>\nPath: {path_json}\n{}\n</AGENTS.md>", red.text);
         ledger.push(
             LedgerEntry::new(
-                format!("agents_md:{}", doc.path.display()),
-                red.text.len(),
+                format!("agents_md:{}", display_path.text),
+                block.len(),
                 "auto-context",
             )
-            .with_redactions(red.count),
+            .with_redactions(red.count.saturating_add(display_path.count)),
         );
         input.push(InputItem::text(Role::Developer, block));
     }
 
-    // Conversation history. Reasoning is not resent (cache-friendly).
-    let mut conversation_bytes = 0usize;
+    // Conversation history. Emit per-item provenance rather than collapsing tool/file bytes into
+    // one opaque bucket. Reasoning summaries are not resent (cache-friendly).
+    let mut calls = std::collections::BTreeMap::<String, String>::new();
     for item in &session.history {
         match item {
-            ResponseItem::UserMessage { text } => {
-                conversation_bytes += text.len();
+            ResponseItem::UserMessage { text, redactions } => {
+                ledger.push(
+                    LedgerEntry::new("history:user", text.len(), "history")
+                        .with_redactions(*redactions),
+                );
                 input.push(InputItem::text(Role::User, text));
             }
             ResponseItem::AssistantMessage { text } => {
-                conversation_bytes += text.len();
-                input.push(InputItem::text(Role::Assistant, text));
+                ledger.push(LedgerEntry::new("history:assistant", text.len(), "history"));
+                input.push(InputItem::assistant_output(text));
             }
-            ResponseItem::Reasoning { .. } => {}
+            ResponseItem::Reasoning { .. } | ResponseItem::CompactionCheckpoint { .. } => {}
+            ResponseItem::EncryptedReasoning {
+                id,
+                status,
+                summary,
+                encrypted_content,
+            } => {
+                let bytes = 0usize
+                    .saturating_add(id.len())
+                    .saturating_add(status.len())
+                    .saturating_add(encrypted_content.len())
+                    .saturating_add(
+                        serde_json::to_vec(summary).map_or(0, |serialized| serialized.len()),
+                    );
+                ledger.push(LedgerEntry::new(
+                    "provider_output:reasoning",
+                    bytes,
+                    "stateless continuation",
+                ));
+                input.push(InputItem::Reasoning {
+                    id: id.clone(),
+                    status: status.clone(),
+                    summary: summary.clone(),
+                    encrypted_content: encrypted_content.clone(),
+                });
+            }
+            ResponseItem::ProviderOutput { item } => {
+                let bytes = serde_json::to_vec(item).map_or(0, |serialized| serialized.len());
+                let item_type = item
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let source = if item_type == "function_call" {
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let name = item
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let arguments = item
+                        .get("arguments")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let label = tool_label(name, arguments);
+                    calls.insert(call_id.to_string(), label.clone());
+                    format!("provider_output:{label}")
+                } else {
+                    format!("provider_output:{}", safe_label(item_type))
+                };
+                ledger.push(LedgerEntry::new(source, bytes, "stateless continuation"));
+                input.push(InputItem::Raw(item.clone()));
+            }
             ResponseItem::ToolCall {
                 id,
                 name,
                 arguments,
             } => {
-                conversation_bytes += arguments.len();
+                let label = tool_label(name, arguments);
+                calls.insert(id.to_string(), label.clone());
+                ledger.push(LedgerEntry::new(
+                    format!("tool_call:{label}"),
+                    arguments.len(),
+                    "history",
+                ));
                 input.push(InputItem::FunctionCall {
                     call_id: id.to_string(),
                     name: name.clone(),
                     arguments: arguments.clone(),
                 });
             }
-            ResponseItem::ToolResult { id, content, .. } => {
-                conversation_bytes += content.len();
+            ResponseItem::ToolResult {
+                id,
+                content,
+                redactions,
+                ..
+            } => {
+                let label = calls
+                    .get(id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| format!("unknown:{}", safe_label(id.as_str())));
+                ledger.push(
+                    LedgerEntry::new(format!("tool_result:{label}"), content.len(), "tool output")
+                        .with_redactions(*redactions),
+                );
                 input.push(InputItem::FunctionCallOutput {
                     call_id: id.to_string(),
                     output: content.clone(),
                 });
             }
-            ResponseItem::CompactionSummary { text } => {
-                conversation_bytes += text.len();
+            ResponseItem::CompactionSummary { text, redactions } => {
+                ledger.push(
+                    LedgerEntry::new("history:compaction_summary", text.len(), "history")
+                        .with_redactions(*redactions),
+                );
                 input.push(InputItem::Message {
                     role: Role::Developer,
                     content: vec![ContentPart::InputText {
@@ -96,33 +182,81 @@ pub fn assemble(
             }
         }
     }
-    if conversation_bytes > 0 {
-        ledger.push(LedgerEntry::new(
-            "conversation",
-            conversation_bytes,
-            "history",
-        ));
-    }
 
-    let mut request =
-        ResponsesRequest::new(session.config.model.clone(), input).with_tools(tool_defs);
+    let mut request = ResponsesRequest::new(session.config.model.clone(), input)
+        .with_tools(tool_defs)
+        .with_prompt_cache_key(session.id.as_uuid().to_string());
     request.parallel_tool_calls = Some(true);
     if let Some(effort) = session.config.effort {
         request = request.with_reasoning(effort);
     }
 
-    let (_body, body_len) = XaiClient::serialize_request(&request)?;
+    reconcile(request, ledger)
+}
 
-    // Reconcile: attribute the remaining bytes (system prompt, tool schemas, JSON envelope) to a
-    // single honest entry so the ledger total equals the exact serialized size.
+fn tool_label(name: &str, arguments: &str) -> String {
+    let name = safe_label(name);
+    let path = serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(safe_label)
+        });
+    path.map_or(name.clone(), |path| format!("{name}:{path}"))
+}
+
+fn safe_label(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '_'
+            } else {
+                character
+            }
+        })
+        .take(200)
+        .collect()
+}
+
+/// Build a ledgered auxiliary text request (currently conversation compaction). Keeping this in
+/// the assembler preserves the rule that no network request body bypasses provenance accounting.
+pub(crate) fn assemble_auxiliary(
+    session: &Session,
+    developer_text: &str,
+    user_text: &str,
+    source: &str,
+) -> Result<Assembled, XaiError> {
+    let developer = Redactor::apply(developer_text);
+    let user = Redactor::apply(user_text);
+    let input = vec![
+        InputItem::text(Role::Developer, &developer.text),
+        InputItem::text(Role::User, &user.text),
+    ];
+    let mut ledger = RequestLedger::default();
+    ledger.push(
+        LedgerEntry::new("auxiliary_instruction", developer.text.len(), source)
+            .with_redactions(developer.count),
+    );
+    ledger.push(
+        LedgerEntry::new("auxiliary_input", user.text.len(), source).with_redactions(user.count),
+    );
+    let request = ResponsesRequest::new(session.config.model.clone(), input)
+        .with_prompt_cache_key(session.id.as_uuid().to_string());
+    reconcile(request, ledger)
+}
+
+fn reconcile(request: ResponsesRequest, mut ledger: RequestLedger) -> Result<Assembled, XaiError> {
+    let (_body, body_len) = XaiClient::serialize_request(&request)?;
     let content_bytes = ledger.total_bytes();
     let envelope = body_len.saturating_sub(content_bytes);
     ledger.push(LedgerEntry::new(
-        "system_prompt+tool_specs+envelope",
+        "tool_specs+envelope",
         envelope,
         "protocol",
     ));
-
     Ok(Assembled {
         request,
         ledger,
@@ -146,16 +280,95 @@ mod tests {
 
     #[test]
     fn agents_md_secret_is_redacted_and_counted() {
-        let session = Session::new(SessionConfig::new(PathBuf::from("/tmp"), "m"));
+        let workspace = PathBuf::from("/home/private-user/project");
+        let session = Session::new(SessionConfig::new(workspace.clone(), "m"));
         let docs = vec![AgentsDoc {
-            path: PathBuf::from("/tmp/AGENTS.md"),
+            path: workspace.join("AGENTS.md"),
             content: "deploy key: xai-ABCDEF0123456789ZZZ".to_string(),
         }];
         let assembled = assemble(&session, &docs, vec![]).unwrap();
         let (body, _) = XaiClient::serialize_request(&assembled.request).unwrap();
         let body = String::from_utf8_lossy(&body);
         assert!(!body.contains("xai-ABCDEF0123456789ZZZ"));
+        assert!(!body.contains("/home/private-user/project"));
+        assert!(body.contains("Path: \\\"AGENTS.md\\\""));
         assert!(assembled.ledger.total_redactions() >= 1);
+        let entry = assembled
+            .ledger
+            .entries
+            .iter()
+            .find(|entry| entry.source == "agents_md:AGENTS.md")
+            .unwrap();
+        assert!(entry.bytes > "deploy key: [REDACTED:xai-key]".len());
         assert_eq!(assembled.ledger.total_bytes(), assembled.body_len);
+    }
+
+    #[test]
+    fn system_prompt_is_redacted_and_session_cache_key_is_stable() {
+        let mut config = SessionConfig::new(PathBuf::from("/tmp"), "m");
+        config.system_prompt = "PASSWORD=very-secret-password-value".to_string();
+        let session = Session::new(config);
+        let assembled = assemble(&session, &[], vec![]).unwrap();
+        let (body, _) = XaiClient::serialize_request(&assembled.request).unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("very-secret-password-value"));
+        assert_eq!(
+            assembled.request.prompt_cache_key.as_deref(),
+            Some(session.id.as_uuid().to_string().as_str())
+        );
+        assert_eq!(assembled.ledger.total_bytes(), assembled.body_len);
+    }
+
+    #[test]
+    fn ledger_attributes_tool_results_to_their_tool_and_path() {
+        let mut session = Session::new(SessionConfig::new(PathBuf::from("/tmp"), "m"));
+        session
+            .history
+            .push(ResponseItem::user_redacted("question", 2));
+        let id = grokforge_protocol::ToolCallId::from_raw("call_read");
+        session.history.push(ResponseItem::ToolCall {
+            id: id.clone(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"src/private.rs"}"#.into(),
+        });
+        session.history.push(ResponseItem::ToolResult {
+            id,
+            content: "contents".into(),
+            is_error: false,
+            redactions: 3,
+        });
+        session.history.push(ResponseItem::CompactionSummary {
+            text: "prior summary".into(),
+            redactions: 5,
+        });
+        let assembled = assemble(&session, &[], vec![]).unwrap();
+        assert!(assembled.ledger.entries.iter().any(|entry| {
+            entry.source == "tool_result:read_file:src/private.rs"
+                && entry.bytes == 8
+                && entry.redactions == 3
+        }));
+        assert!(
+            assembled
+                .ledger
+                .entries
+                .iter()
+                .any(|entry| { entry.source == "history:user" && entry.redactions == 2 })
+        );
+        assert!(assembled.ledger.entries.iter().any(|entry| {
+            entry.source == "history:compaction_summary" && entry.redactions == 5
+        }));
+        assert_eq!(assembled.ledger.total_bytes(), assembled.body_len);
+    }
+
+    #[test]
+    fn oversized_resumed_history_is_rejected_before_egress() {
+        let mut session = Session::new(SessionConfig::new(PathBuf::from("/tmp"), "m"));
+        session
+            .history
+            .push(ResponseItem::assistant("x".repeat(33 * 1024 * 1024)));
+        assert!(matches!(
+            assemble(&session, &[], vec![]),
+            Err(XaiError::RequestTooLarge { .. })
+        ));
     }
 }

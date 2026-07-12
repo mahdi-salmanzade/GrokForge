@@ -45,15 +45,46 @@ pub struct RequestLedger {
 impl RequestLedger {
     #[must_use]
     pub fn total_bytes(&self) -> usize {
-        self.entries.iter().map(|e| e.bytes).sum()
+        self.entries
+            .iter()
+            .fold(0usize, |total, entry| total.saturating_add(entry.bytes))
     }
 
     #[must_use]
     pub fn total_redactions(&self) -> usize {
-        self.entries.iter().map(|e| e.redactions).sum()
+        self.entries.iter().fold(0usize, |total, entry| {
+            total.saturating_add(entry.redactions)
+        })
     }
 
     pub fn push(&mut self, entry: LedgerEntry) {
         self.entries.push(entry);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn untrusted_ledger_totals_saturate_instead_of_overflowing() {
+        let ledger = RequestLedger {
+            entries: vec![
+                LedgerEntry {
+                    source: "one".into(),
+                    bytes: usize::MAX,
+                    redactions: usize::MAX,
+                    reason: "test".into(),
+                },
+                LedgerEntry {
+                    source: "two".into(),
+                    bytes: 1,
+                    redactions: 1,
+                    reason: "test".into(),
+                },
+            ],
+        };
+        assert_eq!(ledger.total_bytes(), usize::MAX);
+        assert_eq!(ledger.total_redactions(), usize::MAX);
     }
 }

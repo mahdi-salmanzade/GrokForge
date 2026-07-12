@@ -5,12 +5,12 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-license = "MIT OR Apache-2.0"
-authors = ["GrokForge contributors"]
-repository = "https://github.com/grokforge/grokforge"
-homepage = "https://github.com/grokforge/grokforge"
-description = "Open-source terminal coding agent for Grok — local-first, sandboxed, git-native."
+rust-version = "1.88"
+license = "MIT"
+authors = ["Mahdi Salmanzade"]
+repository = "https://github.com/mahdi-salmanzade/GrokForge"
+homepage = "https://github.com/mahdi-salmanzade/GrokForge"
+description = "A fast, careful, open-source Grok CLI for real work in the terminal."
 keywords = ["grok", "xai", "agent", "tui", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
@@ -76,8 +76,8 @@ regex = "1"
 tempfile = "3"
 
 # --- tui / render ---
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
+ratatui = "0.30.2"
+crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
 unicode-segmentation = "1"
 unicode-width = "0.2"
 pulldown-cmark = "0.12"

@@ -20,6 +20,15 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  msrv:
+    name: minimum Rust 1.88
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --workspace --all-targets
+
   clippy-test:
     name: clippy + test (${{ matrix.os }})
     strategy:
@@ -34,9 +43,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
         env:
           INSTA_UPDATE: "no"
 
@@ -49,17 +58,29 @@ jobs:
         with:
           command: check
 
-  # Sandbox escape smoke tests run on real kernels. Wired up in M5; the job
-  # exists now so the matrix is visible from day one (see docs/design/03-roadmap.md).
+  # Run the sandbox crate separately on the real platform kernels. Tests that require an
+  # unavailable host facility skip themselves after reporting the missing capability.
   sandbox:
     name: sandbox smoke (${{ matrix.os }})
-    if: false # enabled at M5
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04, macos-14, macos-15]
     runs-on: ${{ matrix.os }}
+    env:
+      GROKFORGE_REQUIRE_SANDBOX: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p grokforge-sandbox --features escape-tests -- --include-ignored
+      - name: Install supported bubblewrap
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential meson ninja-build pkg-config libcap-dev libselinux1-dev
+          git clone --depth 1 --branch v0.11.2 https://github.com/containers/bubblewrap.git /tmp/bubblewrap
+          test "$(git -C /tmp/bubblewrap rev-parse HEAD)" = "1b80120ef26a28e065e67f89bfef873f13bdd317"
+          meson setup /tmp/bubblewrap/build /tmp/bubblewrap --prefix=/usr/local
+          meson compile -C /tmp/bubblewrap/build
+          sudo meson install -C /tmp/bubblewrap/build
+          /usr/local/bin/bwrap --version
+      - run: cargo test --locked -p grokforge-sandbox

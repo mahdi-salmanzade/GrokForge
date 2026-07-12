@@ -4,7 +4,8 @@
 //! Fields the caller leaves unset are omitted from the JSON so we send a minimal, stable
 //! prefix (important for xAI's automatic prompt caching).
 
-use serde::Serialize;
+use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
 
 /// A request to the Responses API.
 #[derive(Debug, Clone, Serialize)]
@@ -28,13 +29,26 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,
 
-    /// `response_format` for guaranteed-structure outputs (commit messages, plans). Passed
-    /// through as raw JSON so any json_schema shape works.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Guaranteed-structure output format (commit messages, plans). The public convenience
+    /// value is the `format` object; on the Responses API wire it is nested under `text.format`.
+    #[serde(
+        rename = "text",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_text_format"
+    )]
     pub response_format: Option<serde_json::Value>,
 
-    /// Server-side conversation storage. Forced `false` whenever an image is in context
-    /// (documented xAI failure mode with stored history + vision).
+    /// Stable routing key for automatic prompt-cache reuse within one conversation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+
+    /// Additional provider output fields to return. Encrypted reasoning is requested by default
+    /// because `store: false` tool loops must replay it on their next stateless request.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+
+    /// Server-side conversation storage. GrokForge defaults this to `false`: it replays its
+    /// locally persisted transcript and does not need the API's 30-day response retention.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
 }
@@ -51,7 +65,9 @@ impl ResponsesRequest {
             parallel_tool_calls: None,
             reasoning: None,
             response_format: None,
-            store: None,
+            prompt_cache_key: None,
+            include: vec!["reasoning.encrypted_content".to_string()],
+            store: Some(false),
         }
     }
 
@@ -66,11 +82,43 @@ impl ResponsesRequest {
         self.reasoning = Some(Reasoning { effort });
         self
     }
+
+    /// Request a structured text format. The value is the Responses API `text.format` object.
+    #[must_use]
+    pub fn with_response_format(mut self, format: serde_json::Value) -> Self {
+        self.response_format = Some(format);
+        self
+    }
+
+    /// Route requests from the same conversation to a cache-compatible backend.
+    #[must_use]
+    pub fn with_prompt_cache_key(mut self, key: impl Into<String>) -> Self {
+        self.prompt_cache_key = Some(key.into());
+        self
+    }
+}
+
+#[allow(clippy::ref_option)] // serde's `serialize_with` contract passes `&FieldType`.
+fn serialize_text_format<S>(
+    value: &Option<serde_json::Value>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    #[derive(Serialize)]
+    struct TextFormat<'a> {
+        format: &'a serde_json::Value,
+    }
+
+    match value {
+        Some(format) => TextFormat { format }.serialize(serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// One item in the input list.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub enum InputItem {
     /// A chat message.
     Message {
@@ -85,6 +133,67 @@ pub enum InputItem {
     },
     /// The result of a client-side tool/function call, fed back to the model.
     FunctionCallOutput { call_id: String, output: String },
+    /// A provider-issued encrypted reasoning output item replayed unchanged for stateless
+    /// reasoning continuity.
+    Reasoning {
+        id: String,
+        status: String,
+        summary: Vec<serde_json::Value>,
+        encrypted_content: String,
+    },
+    /// An output item received from the provider and replayed without schema projection.
+    Raw(serde_json::Value),
+}
+
+impl Serialize for InputItem {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            InputItem::Message { role, content } => {
+                let mut state = serializer.serialize_struct("InputItem", 3)?;
+                state.serialize_field("type", "message")?;
+                state.serialize_field("role", role)?;
+                state.serialize_field("content", content)?;
+                state.end()
+            }
+            InputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                let mut state = serializer.serialize_struct("InputItem", 4)?;
+                state.serialize_field("type", "function_call")?;
+                state.serialize_field("call_id", call_id)?;
+                state.serialize_field("name", name)?;
+                state.serialize_field("arguments", arguments)?;
+                state.end()
+            }
+            InputItem::FunctionCallOutput { call_id, output } => {
+                let mut state = serializer.serialize_struct("InputItem", 3)?;
+                state.serialize_field("type", "function_call_output")?;
+                state.serialize_field("call_id", call_id)?;
+                state.serialize_field("output", output)?;
+                state.end()
+            }
+            InputItem::Reasoning {
+                id,
+                status,
+                summary,
+                encrypted_content,
+            } => {
+                let mut state = serializer.serialize_struct("InputItem", 5)?;
+                state.serialize_field("type", "reasoning")?;
+                state.serialize_field("id", id)?;
+                state.serialize_field("status", status)?;
+                state.serialize_field("summary", summary)?;
+                state.serialize_field("encrypted_content", encrypted_content)?;
+                state.end()
+            }
+            InputItem::Raw(item) => item.serialize(serializer),
+        }
+    }
 }
 
 impl InputItem {
@@ -96,6 +205,16 @@ impl InputItem {
             content: vec![ContentPart::InputText { text: text.into() }],
         }
     }
+
+    /// Reconstruct a legacy assistant message using the Responses output-content wire type.
+    /// New responses should prefer replaying their preserved provider output item verbatim.
+    #[must_use]
+    pub fn assistant_output(text: impl Into<String>) -> Self {
+        InputItem::Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::OutputText { text: text.into() }],
+        }
+    }
 }
 
 /// A piece of message content.
@@ -104,6 +223,7 @@ impl InputItem {
 pub enum ContentPart {
     InputText { text: String },
     InputImage { image_url: String },
+    OutputText { text: String },
 }
 
 /// Message author role.
@@ -202,6 +322,10 @@ mod tests {
         assert!(v.get("tools").is_none());
         assert!(v.get("reasoning").is_none());
         assert!(v.get("response_format").is_none());
+        assert!(v.get("text").is_none());
+        assert!(v.get("prompt_cache_key").is_none());
+        assert_eq!(v["store"], false);
+        assert_eq!(v["include"][0], "reasoning.encrypted_content");
         assert_eq!(v["input"][0]["type"], "message");
         assert_eq!(v["input"][0]["role"], "user");
         assert_eq!(v["input"][0]["content"][0]["type"], "input_text");
@@ -228,5 +352,66 @@ mod tests {
         let req = ResponsesRequest::new("m", vec![]).with_reasoning(Effort::High);
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn response_format_uses_responses_api_text_envelope() {
+        let req = ResponsesRequest::new("m", vec![]).with_response_format(
+            serde_json::json!({"type":"json_schema","name":"plan","schema":{"type":"object"}}),
+        );
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v.get("response_format").is_none());
+        assert_eq!(v["text"]["format"]["type"], "json_schema");
+        assert_eq!(v["text"]["format"]["name"], "plan");
+    }
+
+    #[test]
+    fn prompt_cache_key_serializes_at_top_level() {
+        let req = ResponsesRequest::new("m", vec![]).with_prompt_cache_key("session-42");
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["prompt_cache_key"], "session-42");
+    }
+
+    #[test]
+    fn image_requests_keep_server_storage_off() {
+        let req = ResponsesRequest::new(
+            "m",
+            vec![InputItem::Message {
+                role: Role::User,
+                content: vec![ContentPart::InputImage {
+                    image_url: "https://example.test/image.png".into(),
+                }],
+            }],
+        );
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["store"], false);
+    }
+
+    #[test]
+    fn encrypted_reasoning_item_replays_exact_wire_fields() {
+        let req = ResponsesRequest::new(
+            "m",
+            vec![InputItem::Reasoning {
+                id: "rs_1".into(),
+                status: "completed".into(),
+                summary: vec![],
+                encrypted_content: "opaque==".into(),
+            }],
+        );
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["input"][0]["type"], "reasoning");
+        assert_eq!(v["input"][0]["id"], "rs_1");
+        assert_eq!(v["input"][0]["status"], "completed");
+        assert_eq!(v["input"][0]["summary"], serde_json::json!([]));
+        assert_eq!(v["input"][0]["encrypted_content"], "opaque==");
+    }
+
+    #[test]
+    fn legacy_assistant_replay_uses_output_text_content() {
+        let request = ResponsesRequest::new("m", vec![InputItem::assistant_output("answer")]);
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["input"][0]["role"], "assistant");
+        assert_eq!(value["input"][0]["content"][0]["type"], "output_text");
+        assert_eq!(value["input"][0]["content"][0]["text"], "answer");
     }
 }

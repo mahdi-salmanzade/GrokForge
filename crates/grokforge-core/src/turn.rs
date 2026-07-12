@@ -3,25 +3,100 @@
 //! until the model stops or the iteration cap is hit. Every step emits an [`EventMsg`] and is
 //! appended to the canonical JSONL rollout.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use futures::StreamExt;
 use grokforge_protocol::{
-    ApprovalId, ApprovalRequest, EventMsg, ResponseItem, SandboxMode, SandboxPolicy, StopReason,
-    ToolCallId, TurnId, Usage,
+    ApprovalId, ApprovalKind, ApprovalPolicy, ApprovalRequest, Decision, EventMsg, LedgerEntry,
+    ResponseItem, SandboxMode, SandboxPolicy, StopReason, ToolCallId, TurnId, Usage,
 };
 use grokforge_sandbox::SandboxRunner;
-use grokforge_xai::{InputItem, ResponsesRequest, Role, StreamEvent, XaiClient};
+use grokforge_xai::{StreamEvent, XaiClient};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agents_md;
 use crate::approvals::{Approver, Gate, gate};
+use crate::cancellation::TurnCancellation;
 use crate::compaction;
 use crate::context::{self, Assembled};
 use crate::redaction::Redactor;
 use crate::session::Session;
 use crate::store::RolloutWriter;
 use crate::tools::{ToolInvocation, ToolOutput, ToolRegistry, TurnContext};
+
+const MAX_SUBAGENTS_PER_TURN: usize = 8;
+/// Bound both retained transcript text and the amount of delta state a frontend may queue for a
+/// single response. This stays comfortably below the rollout line limit after JSON escaping.
+const MAX_RESPONSE_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_USER_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REASONING_DELTA_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RESPONSE_EVENTS: usize = 32_768;
+const MAX_PROVIDER_OUTPUT_BYTES: usize = 15 * 1024 * 1024;
+const MAX_PROVIDER_OUTPUT_AGGREGATE_BYTES: usize = 24 * 1024 * 1024;
+const MAX_PROVIDER_OUTPUT_ITEMS: usize = 512;
+const MAX_TOOL_CALLS_PER_RESPONSE: usize = 64;
+// Compaction must remain a recovery path even when resumed history is near its in-memory cap.
+// Four MiB stays below the 32 MiB request cap even under worst-case JSON escaping.
+const MAX_COMPACTION_TRANSCRIPT_BYTES: usize = 4 * 1024 * 1024;
+// Keep the summary itself bounded so a coherent recent tail still has room in the durable line.
+const MAX_COMPACTION_SUMMARY_ITEM_BYTES: usize = 7 * 1024 * 1024;
+const MAX_COMPACTION_TAIL_BYTES: usize = 7 * 1024 * 1024;
+// Rollout records are capped at 16 MiB; reserve a full MiB for serialization/newline overhead.
+const MAX_COMPACTION_CHECKPOINT_BYTES: usize = 15 * 1024 * 1024;
+const MAX_COMPACTION_TAIL_CANDIDATES: usize = 1_024;
+
+#[derive(Debug)]
+struct ConsumedResponse {
+    assistant_text: String,
+    tool_calls: Vec<(usize, ToolCallId, String, String)>,
+    provider_outputs: Vec<(usize, serde_json::Value)>,
+    encrypted_reasoning: Vec<(usize, ResponseItem)>,
+    usage: Usage,
+    terminal: grokforge_xai::StopReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCallFlow {
+    Continue,
+    Abort,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsumeError {
+    Cancelled,
+    Failed,
+}
+
+/// Tokio detaches a task when its join handle is dropped. Subagents instead belong to their
+/// parent turn: cancellation of the parent must promptly cancel the nested API loop too.
+struct AbortOnDrop<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn join(mut self) -> Result<T, String> {
+        let Some(handle) = self.handle.take() else {
+            return Err("subagent join handle was already consumed".to_string());
+        };
+        handle.await.map_err(|error| error.to_string())
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
 
 /// Drives turns for a session. Shared, cheap to hold; the mutable per-run state is the session
 /// and the rollout writer passed to [`Agent::run_turn`].
@@ -91,30 +166,123 @@ impl Agent {
         let _ = self.events.send(msg);
     }
 
-    fn turn_context(&self, session: &Session) -> TurnContext {
+    fn turn_context(
+        &self,
+        session: &Session,
+        cancellation: &TurnCancellation,
+    ) -> Result<TurnContext, String> {
         let root = session.config.workspace_root.clone();
-        let policy = match session.config.sandbox_mode {
-            SandboxMode::ReadOnly => SandboxPolicy::read_only(&root),
-            SandboxMode::WorkspaceWrite => SandboxPolicy::workspace_write(&root),
-            SandboxMode::DangerFullAccess => SandboxPolicy::danger_full_access(&root),
-        };
-        TurnContext {
+        let policy = sandbox_policy(
+            &root,
+            session.config.sandbox_mode,
+            session.config.network,
+            session.config.isolated_worktree,
+        )?;
+        Ok(TurnContext {
             workspace_root: root,
             policy,
             sandbox: Arc::clone(&self.sandbox),
             touched: Arc::new(std::sync::Mutex::new(Vec::new())),
-        }
+            bound_write_targets: Vec::new(),
+            cancellation: cancellation.clone(),
+        })
     }
 
     /// Like [`Self::turn_context`] but forces a read-only sandbox policy (plan mode).
-    fn turn_context_readonly(&self, session: &Session) -> TurnContext {
+    fn turn_context_readonly(
+        &self,
+        session: &Session,
+        cancellation: &TurnCancellation,
+    ) -> Result<TurnContext, String> {
         let root = session.config.workspace_root.clone();
-        TurnContext {
-            policy: SandboxPolicy::read_only(&root),
+        Ok(TurnContext {
+            policy: sandbox_policy(
+                &root,
+                SandboxMode::ReadOnly,
+                session.config.network,
+                session.config.isolated_worktree,
+            )?,
             workspace_root: root,
             sandbox: Arc::clone(&self.sandbox),
             touched: Arc::new(std::sync::Mutex::new(Vec::new())),
+            bound_write_targets: Vec::new(),
+            cancellation: cancellation.clone(),
+        })
+    }
+
+    fn elevated_context(ctx: &TurnContext) -> TurnContext {
+        // Filesystem/exec approval is not network approval. Keep an enforcing sandbox mode with
+        // broad filesystem roots while preserving the original network, secret-read, and Git
+        // metadata restrictions. Only `escalation_context(Network)` widens network access.
+        let mut policy = ctx.policy.clone();
+        policy.mode = SandboxMode::WorkspaceWrite;
+        policy.writable_roots = vec![std::path::PathBuf::from("/")];
+        policy.readable_roots = vec![std::path::PathBuf::from("/")];
+        TurnContext {
+            workspace_root: ctx.workspace_root.clone(),
+            policy,
+            sandbox: Arc::clone(&ctx.sandbox),
+            touched: Arc::clone(&ctx.touched),
+            bound_write_targets: Vec::new(),
+            cancellation: ctx.cancellation.clone(),
         }
+    }
+
+    fn elevated_write_context(ctx: &TurnContext, targets: &[std::path::PathBuf]) -> TurnContext {
+        let mut elevated = Self::elevated_context(ctx);
+        elevated.bound_write_targets = targets.to_vec();
+        elevated
+    }
+
+    fn escalation_context(
+        ctx: &TurnContext,
+        denial: grokforge_protocol::DenialClass,
+    ) -> TurnContext {
+        match denial {
+            grokforge_protocol::DenialClass::Network => {
+                let mut policy = ctx.policy.clone();
+                policy.network = grokforge_protocol::NetworkMode::Full;
+                TurnContext {
+                    workspace_root: ctx.workspace_root.clone(),
+                    policy,
+                    sandbox: Arc::clone(&ctx.sandbox),
+                    touched: Arc::clone(&ctx.touched),
+                    bound_write_targets: Vec::new(),
+                    cancellation: ctx.cancellation.clone(),
+                }
+            }
+            grokforge_protocol::DenialClass::FsWrite => Self::elevated_context(ctx),
+            // These capabilities cannot be widened narrowly with the current SandboxPolicy.
+            // `escalation_kind` refuses them, and this conservative fallback preserves policy.
+            grokforge_protocol::DenialClass::FsRead | grokforge_protocol::DenialClass::Signal => {
+                TurnContext {
+                    workspace_root: ctx.workspace_root.clone(),
+                    policy: ctx.policy.clone(),
+                    sandbox: Arc::clone(&ctx.sandbox),
+                    touched: Arc::clone(&ctx.touched),
+                    bound_write_targets: Vec::new(),
+                    cancellation: ctx.cancellation.clone(),
+                }
+            }
+        }
+    }
+
+    async fn open_stream_accounted(
+        &self,
+        request: &grokforge_xai::ResponsesRequest,
+    ) -> Result<grokforge_xai::ResponseStream, grokforge_xai::XaiError> {
+        let events = self.events.clone();
+        self.client
+            .stream_with_attempt_observer(request, move |attempt| {
+                if attempt.number > 1 {
+                    let _ = events.send(EventMsg::LedgerAppended(LedgerEntry::new(
+                        format!("request_retry_{}", attempt.number),
+                        attempt.request_bytes,
+                        "transport retry",
+                    )));
+                }
+            })
+            .await
     }
 
     /// Run one turn to completion (execute mode).
@@ -124,7 +292,20 @@ impl Agent {
         user_text: &str,
         rollout: &mut Option<RolloutWriter>,
     ) -> StopReason {
-        self.run_inner(session, user_text, false, rollout).await
+        self.run_turn_cancellable(session, user_text, rollout, &TurnCancellation::new())
+            .await
+    }
+
+    /// Run one execute-mode turn with cooperative cancellation controlled by the frontend.
+    pub async fn run_turn_cancellable(
+        &self,
+        session: &mut Session,
+        user_text: &str,
+        rollout: &mut Option<RolloutWriter>,
+        cancellation: &TurnCancellation,
+    ) -> StopReason {
+        self.run_inner(session, user_text, false, rollout, cancellation)
+            .await
     }
 
     /// Run a plan-mode turn: read-only tools + read-only sandbox + a planning preamble, so the
@@ -135,18 +316,46 @@ impl Agent {
         user_text: &str,
         rollout: &mut Option<RolloutWriter>,
     ) -> StopReason {
-        self.run_inner(session, user_text, true, rollout).await
+        self.run_plan_turn_cancellable(session, user_text, rollout, &TurnCancellation::new())
+            .await
     }
 
+    /// Run one plan-mode turn with cooperative cancellation controlled by the frontend.
+    pub async fn run_plan_turn_cancellable(
+        &self,
+        session: &mut Session,
+        user_text: &str,
+        rollout: &mut Option<RolloutWriter>,
+        cancellation: &TurnCancellation,
+    ) -> StopReason {
+        self.run_inner(session, user_text, true, rollout, cancellation)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn run_inner(
         &self,
         session: &mut Session,
         user_text: &str,
         plan: bool,
         rollout: &mut Option<RolloutWriter>,
+        cancellation: &TurnCancellation,
     ) -> StopReason {
         let turn_id = grokforge_protocol::TurnId::new();
         self.emit(EventMsg::TurnStarted { turn_id });
+        let clean_repo_at_start = session.config.isolated_worktree
+            && grokforge_git::Git::discover(&session.config.workspace_root)
+                .and_then(|git| git.is_dirty().ok())
+                == Some(false);
+
+        if cancellation.is_cancelled() {
+            let stop = StopReason::Interrupted;
+            self.emit(EventMsg::TurnComplete {
+                turn_id,
+                stop: stop.clone(),
+            });
+            return stop;
+        }
 
         // In plan mode, instruct the model not to change anything.
         let effective_text = if plan {
@@ -157,11 +366,37 @@ impl Agent {
         } else {
             user_text.to_string()
         };
+        if effective_text.len() > MAX_USER_TEXT_BYTES {
+            let stop = StopReason::Error;
+            self.emit(EventMsg::Error {
+                message: format!("user input exceeded the {MAX_USER_TEXT_BYTES}-byte safety limit"),
+                recoverable: false,
+            });
+            self.emit(EventMsg::TurnComplete {
+                turn_id,
+                stop: stop.clone(),
+            });
+            return stop;
+        }
 
         // User input is redacted at ingress (a pasted secret must not enter the transcript).
         let user_red = Redactor::apply(&effective_text);
-        self.record(session, rollout, ResponseItem::user(user_red.text))
-            .await;
+        if self
+            .record(
+                session,
+                rollout,
+                ResponseItem::user_redacted(user_red.text, user_red.count),
+            )
+            .await
+            .is_err()
+        {
+            let stop = StopReason::Error;
+            self.emit(EventMsg::TurnComplete {
+                turn_id,
+                stop: stop.clone(),
+            });
+            return stop;
+        }
 
         // Plan mode enforces read-only tools and a read-only sandbox regardless of preset.
         let mut tool_defs = if plan {
@@ -173,15 +408,71 @@ impl Agent {
         if !self.allow_subagents || plan {
             tool_defs.retain(|d| d.function_name() != Some(crate::tools::builtins::SPAWN_TASK));
         }
-        let ctx = if plan {
-            self.turn_context_readonly(session)
+        let offered_tools: BTreeSet<String> = tool_defs
+            .iter()
+            .filter_map(|definition| definition.function_name().map(str::to_string))
+            .collect();
+        let ctx = match if plan {
+            self.turn_context_readonly(session, cancellation)
         } else {
-            self.turn_context(session)
+            self.turn_context(session, cancellation)
+        } {
+            Ok(ctx) => ctx,
+            Err(message) => {
+                let stop = StopReason::Error;
+                self.emit(EventMsg::Error {
+                    message: format!("could not construct a safe sandbox policy: {message}"),
+                    recoverable: false,
+                });
+                self.emit(EventMsg::TurnComplete {
+                    turn_id,
+                    stop: stop.clone(),
+                });
+                return stop;
+            }
         };
         let agents = agents_md::discover(&session.config.workspace_root);
 
         let mut iteration = 0u32;
-        let stop = loop {
+        let mut spawned = 0usize;
+        let mut auto_commit_has_exclusive_ownership = true;
+        let mut compacted_baseline = None;
+        let mut compaction_failed = false;
+        let mut stop = 'agent: loop {
+            if cancellation.is_cancelled() {
+                break StopReason::Interrupted;
+            }
+            // A single accepted provider/tool round can push replay over the next request's
+            // 32 MiB cap. Compact before every request, including the first request of a resumed
+            // oversized session, so compaction remains a recovery path rather than an end-turn
+            // best effort.
+            let compaction_threshold = compacted_baseline.map_or(
+                session.config.compaction_trigger_bytes,
+                |baseline: usize| baseline.saturating_add(session.config.compaction_trigger_bytes),
+            );
+            if session.config.auto_compact
+                && !compaction_failed
+                && compaction::should_compact(
+                    &session.history,
+                    compaction_threshold,
+                    session.config.compaction_keep_tail,
+                )
+            {
+                if self
+                    .compact_inner(session, rollout.as_mut(), cancellation)
+                    .await
+                {
+                    compacted_baseline = Some(compaction::estimate_bytes(&session.history));
+                } else {
+                    // Do not hammer the summarization endpoint again in the same turn. The
+                    // ordinary request still gets its exact size check and fails closed if the
+                    // un-compacted history cannot be replayed.
+                    compaction_failed = true;
+                }
+            }
+            if cancellation.is_cancelled() {
+                break StopReason::Interrupted;
+            }
             if iteration >= session.config.max_iterations {
                 break StopReason::MaxIterations;
             }
@@ -203,46 +494,207 @@ impl Agent {
                 self.emit(EventMsg::LedgerAppended(entry));
             }
 
-            let stream = match self.client.stream(&request).await {
-                Ok(s) => s,
-                Err(e) => {
+            let stream = match tokio::select! {
+                result = self.open_stream_accounted(&request) => Some(result),
+                () = cancellation.cancelled() => None,
+            } {
+                None => break StopReason::Interrupted,
+                Some(result) => match result {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.emit(EventMsg::Error {
+                            message: format!("model request failed: {e}"),
+                            recoverable: e.is_retriable(),
+                        });
+                        break StopReason::Error;
+                    }
+                },
+            };
+
+            let response = match self.consume_response(stream, cancellation).await {
+                Ok(response) => response,
+                Err(ConsumeError::Cancelled) => break StopReason::Interrupted,
+                Err(ConsumeError::Failed) => break StopReason::Error,
+            };
+            if let Err(message) = validate_provider_response(&response, &session.history) {
+                self.emit(EventMsg::Error {
+                    message,
+                    recoverable: false,
+                });
+                break StopReason::Error;
+            }
+            self.emit(EventMsg::TokenUsage {
+                usage: response.usage,
+            });
+
+            let raw_call_ids: BTreeSet<String> = response
+                .provider_outputs
+                .iter()
+                .filter(|(_, item)| {
+                    item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+                })
+                .filter_map(|(_, item)| {
+                    item.get("call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect();
+            let raw_reasoning_ids: BTreeSet<String> = response
+                .provider_outputs
+                .iter()
+                .filter(|(_, item)| {
+                    item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning")
+                })
+                .filter_map(|(_, item)| {
+                    item.get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect();
+            let raw_has_assistant_message = response.provider_outputs.iter().any(|(_, item)| {
+                item.get("type").and_then(serde_json::Value::as_str) == Some("message")
+            });
+            for (_, item) in response.provider_outputs {
+                if self
+                    .record(session, rollout, ResponseItem::ProviderOutput { item })
+                    .await
+                    .is_err()
+                {
+                    break 'agent StopReason::Error;
+                }
+            }
+            for (_, item) in response.encrypted_reasoning {
+                let duplicate = matches!(
+                    &item,
+                    ResponseItem::EncryptedReasoning { id, .. } if raw_reasoning_ids.contains(id)
+                );
+                if !duplicate && self.record(session, rollout, item).await.is_err() {
+                    break 'agent StopReason::Error;
+                }
+            }
+
+            if !response.assistant_text.is_empty() {
+                if !raw_has_assistant_message
+                    && self
+                        .record(
+                            session,
+                            rollout,
+                            ResponseItem::assistant(response.assistant_text.clone()),
+                        )
+                        .await
+                        .is_err()
+                {
+                    break StopReason::Error;
+                }
+                self.emit(EventMsg::AgentMessageDone {
+                    text: response.assistant_text,
+                });
+            }
+
+            match response.terminal {
+                grokforge_xai::StopReason::MaxTokens => {
                     self.emit(EventMsg::Error {
-                        message: format!("model request failed: {e}"),
-                        recoverable: e.is_retriable(),
+                        message: "model response ended at the output-token limit".to_string(),
+                        recoverable: true,
                     });
                     break StopReason::Error;
                 }
-            };
-
-            let (assistant_text, tool_calls, usage) = self.consume_response(stream).await;
-            self.emit(EventMsg::TokenUsage { usage });
-
-            if !assistant_text.is_empty() {
-                self.emit(EventMsg::AgentMessageDone {
-                    text: assistant_text.clone(),
-                });
-                self.record(session, rollout, ResponseItem::assistant(assistant_text))
-                    .await;
+                grokforge_xai::StopReason::Other(status) => {
+                    self.emit(EventMsg::Error {
+                        message: format!("model response ended with status `{status}`"),
+                        recoverable: false,
+                    });
+                    break StopReason::Error;
+                }
+                grokforge_xai::StopReason::ToolCalls if response.tool_calls.is_empty() => {
+                    self.emit(EventMsg::Error {
+                        message: "model requested continuation without any tool calls".to_string(),
+                        recoverable: false,
+                    });
+                    break StopReason::Error;
+                }
+                grokforge_xai::StopReason::EndTurn if response.tool_calls.is_empty() => {
+                    break StopReason::EndTurn;
+                }
+                grokforge_xai::StopReason::EndTurn | grokforge_xai::StopReason::ToolCalls => {}
             }
 
-            if tool_calls.is_empty() {
-                break StopReason::EndTurn;
-            }
-
-            for (call_id, name, arguments) in tool_calls {
-                self.run_tool_call(session, rollout, &ctx, call_id, &name, &arguments)
-                    .await;
+            for (_, call_id, name, arguments) in response.tool_calls {
+                auto_commit_has_exclusive_ownership &= tool_preserves_auto_commit_ownership(&name);
+                let record_call = !raw_call_ids.contains(call_id.as_str());
+                let spawn_allowed = if name == crate::tools::builtins::SPAWN_TASK {
+                    spawned += 1;
+                    spawned <= MAX_SUBAGENTS_PER_TURN
+                } else {
+                    true
+                };
+                match self
+                    .run_tool_call(
+                        session,
+                        rollout,
+                        &ctx,
+                        call_id,
+                        &name,
+                        &arguments,
+                        record_call,
+                        offered_tools.contains(&name),
+                        spawn_allowed,
+                        cancellation,
+                    )
+                    .await
+                {
+                    ToolCallFlow::Continue => {}
+                    ToolCallFlow::Abort => break 'agent StopReason::Interrupted,
+                    ToolCallFlow::Error => break 'agent StopReason::Error,
+                }
             }
         };
 
+        if cancellation.is_cancelled() {
+            stop = StopReason::Interrupted;
+        }
+
+        // Raw provider calls are persisted before execution so stateless replay remains exact.
+        // Any early terminal status, user abort, append failure, or cancellation between parallel
+        // calls must therefore close every durable call with a deterministic failed output.
+        for repair in crate::store::interrupted_tool_results(&session.history) {
+            if self.record(session, rollout, repair).await.is_err() {
+                stop = StopReason::Error;
+                break;
+            }
+        }
+
         // Auto-commit the agent's edits from the trusted host process (never in the sandbox).
-        if session.config.auto_commit {
-            self.auto_commit(session, turn_id, &ctx).await;
+        if !plan
+            && session.config.auto_commit
+            && session.config.isolated_worktree
+            && auto_commit_has_exclusive_ownership
+            && stop == StopReason::EndTurn
+        {
+            self.auto_commit(session, turn_id, clean_repo_at_start, ctx.touched_paths())
+                .await;
         }
 
         // Keep the model-visible window bounded on long sessions.
-        if session.config.auto_compact {
-            self.compact(session).await;
+        let end_threshold = compacted_baseline
+            .map_or(session.config.compaction_trigger_bytes, |baseline| {
+                baseline.saturating_add(session.config.compaction_trigger_bytes)
+            });
+        if session.config.auto_compact
+            && !compaction_failed
+            && stop == StopReason::EndTurn
+            && compaction::should_compact(
+                &session.history,
+                end_threshold,
+                session.config.compaction_keep_tail,
+            )
+        {
+            self.compact_inner(session, rollout.as_mut(), cancellation)
+                .await;
+        }
+
+        if cancellation.is_cancelled() {
+            stop = StopReason::Interrupted;
         }
 
         self.emit(EventMsg::TurnComplete {
@@ -254,25 +706,152 @@ impl Agent {
 
     /// Drain a model response stream: emit text/reasoning deltas and collect the final text,
     /// the requested tool calls, and usage.
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_lines)]
     async fn consume_response(
         &self,
         mut stream: grokforge_xai::ResponseStream,
-    ) -> (String, Vec<(ToolCallId, String, String)>, Usage) {
+        cancellation: &TurnCancellation,
+    ) -> Result<ConsumedResponse, ConsumeError> {
         let mut assistant_text = String::new();
-        let mut tool_calls: Vec<(ToolCallId, String, String)> = Vec::new();
+        // `output_item.done` events may arrive out of order. Key them by the provider's
+        // canonical output index, then validate and materialize them in array order only after
+        // the terminal event. BTreeMap keeps sparse/malicious indices from causing allocation.
+        let mut tool_calls: BTreeMap<usize, (ToolCallId, String, String)> = BTreeMap::new();
+        let mut provider_outputs: BTreeMap<usize, serde_json::Value> = BTreeMap::new();
+        let mut encrypted_reasoning: BTreeMap<usize, ResponseItem> = BTreeMap::new();
         let mut usage = Usage::default();
-        while let Some(event) = stream.next().await {
+        let mut terminal = None;
+        let mut event_count = 0usize;
+        let mut reasoning_bytes = 0usize;
+        let mut provider_output_bytes = 0usize;
+        loop {
+            let event = tokio::select! {
+                event = stream.next() => event,
+                () = cancellation.cancelled() => return Err(ConsumeError::Cancelled),
+            };
+            let Some(event) = event else {
+                break;
+            };
+            event_count = event_count.saturating_add(1);
+            if event_count > MAX_RESPONSE_EVENTS {
+                self.emit(EventMsg::Error {
+                    message: format!(
+                        "model response exceeded the {MAX_RESPONSE_EVENTS}-event safety limit"
+                    ),
+                    recoverable: false,
+                });
+                return Err(ConsumeError::Failed);
+            }
             match event {
                 Ok(StreamEvent::TextDelta(d)) => {
+                    if assistant_text
+                        .len()
+                        .checked_add(d.len())
+                        .is_none_or(|len| len > MAX_RESPONSE_TEXT_BYTES)
+                    {
+                        self.emit(EventMsg::Error {
+                            message: format!(
+                                "assistant text exceeded the {MAX_RESPONSE_TEXT_BYTES}-byte safety limit"
+                            ),
+                            recoverable: false,
+                        });
+                        return Err(ConsumeError::Failed);
+                    }
+                    self.emit(EventMsg::AgentMessageDelta { delta: d.clone() });
                     assistant_text.push_str(&d);
-                    self.emit(EventMsg::AgentMessageDelta { delta: d });
                 }
                 Ok(StreamEvent::ReasoningDelta(d)) => {
+                    reasoning_bytes = reasoning_bytes.saturating_add(d.len());
+                    if reasoning_bytes > MAX_REASONING_DELTA_BYTES {
+                        self.emit(EventMsg::Error {
+                            message: format!(
+                                "reasoning deltas exceeded the {MAX_REASONING_DELTA_BYTES}-byte safety limit"
+                            ),
+                            recoverable: false,
+                        });
+                        return Err(ConsumeError::Failed);
+                    }
                     self.emit(EventMsg::ReasoningDelta { delta: d });
                 }
                 Ok(StreamEvent::ToolCall(call)) => {
-                    tool_calls.push((ToolCallId::new(), call.name, call.arguments));
+                    if tool_calls.len() >= MAX_TOOL_CALLS_PER_RESPONSE
+                        || tool_calls
+                            .insert(
+                                call.output_index,
+                                (
+                                    ToolCallId::from_raw(call.call_id),
+                                    call.name,
+                                    call.arguments,
+                                ),
+                            )
+                            .is_some()
+                    {
+                        self.emit(EventMsg::Error {
+                            message: format!(
+                                "provider returned duplicate or excessive typed output index {}",
+                                call.output_index
+                            ),
+                            recoverable: false,
+                        });
+                        return Err(ConsumeError::Failed);
+                    }
+                }
+                Ok(StreamEvent::EncryptedReasoning(reasoning)) => {
+                    let output_index = reasoning.output_index;
+                    let item = ResponseItem::EncryptedReasoning {
+                        id: reasoning.id,
+                        status: reasoning.status,
+                        summary: reasoning.summary,
+                        encrypted_content: reasoning.encrypted_content,
+                    };
+                    if encrypted_reasoning.len() >= MAX_PROVIDER_OUTPUT_ITEMS
+                        || encrypted_reasoning.insert(output_index, item).is_some()
+                    {
+                        self.emit(EventMsg::Error {
+                            message: format!(
+                                "provider returned duplicate or excessive reasoning output index {output_index}"
+                            ),
+                            recoverable: false,
+                        });
+                        return Err(ConsumeError::Failed);
+                    }
+                }
+                Ok(StreamEvent::ProviderOutput { output_index, item }) => {
+                    let serialized_bytes = match serde_json::to_vec(&item) {
+                        Ok(serialized) => serialized.len(),
+                        Err(error) => {
+                            self.emit(EventMsg::Error {
+                                message: format!(
+                                    "provider output could not be serialized: {error}"
+                                ),
+                                recoverable: false,
+                            });
+                            return Err(ConsumeError::Failed);
+                        }
+                    };
+                    provider_output_bytes = provider_output_bytes.saturating_add(serialized_bytes);
+                    if serialized_bytes > MAX_PROVIDER_OUTPUT_BYTES
+                        || provider_output_bytes > MAX_PROVIDER_OUTPUT_AGGREGATE_BYTES
+                    {
+                        self.emit(EventMsg::Error {
+                            message: format!(
+                                "provider output exceeded the per-item or {MAX_PROVIDER_OUTPUT_AGGREGATE_BYTES}-byte aggregate safety limit"
+                            ),
+                            recoverable: false,
+                        });
+                        return Err(ConsumeError::Failed);
+                    }
+                    if provider_outputs.len() >= MAX_PROVIDER_OUTPUT_ITEMS
+                        || provider_outputs.insert(output_index, item).is_some()
+                    {
+                        self.emit(EventMsg::Error {
+                            message: format!(
+                                "provider returned duplicate or excessive output index {output_index}"
+                            ),
+                            recoverable: false,
+                        });
+                        return Err(ConsumeError::Failed);
+                    }
                 }
                 Ok(StreamEvent::Usage(u)) => {
                     usage = Usage {
@@ -282,79 +861,253 @@ impl Agent {
                         reasoning_tokens: u.reasoning_tokens,
                     };
                 }
-                Ok(StreamEvent::Completed { .. } | StreamEvent::Created { .. }) => {}
+                Ok(StreamEvent::Completed { stop }) => terminal = Some(stop),
+                Ok(StreamEvent::Created { .. }) => {}
                 Err(e) => {
                     self.emit(EventMsg::Error {
                         message: format!("stream error: {e}"),
                         recoverable: e.is_retriable(),
                     });
-                    break;
+                    return Err(ConsumeError::Failed);
                 }
             }
         }
-        (assistant_text, tool_calls, usage)
+        let Some(terminal) = terminal else {
+            self.emit(EventMsg::Error {
+                message: "model stream ended before response.completed".to_string(),
+                recoverable: true,
+            });
+            return Err(ConsumeError::Failed);
+        };
+        if let Some((&actual, _)) = provider_outputs
+            .iter()
+            .enumerate()
+            .find(|(expected, (actual, _))| *expected != **actual)
+            .map(|(_, entry)| entry)
+        {
+            self.emit(EventMsg::Error {
+                message: format!(
+                    "provider output indices contain a gap before index {actual}; refusing ambiguous order"
+                ),
+                recoverable: false,
+            });
+            return Err(ConsumeError::Failed);
+        }
+        Ok(ConsumedResponse {
+            assistant_text,
+            tool_calls: tool_calls
+                .into_iter()
+                .map(|(index, (id, name, arguments))| (index, id, name, arguments))
+                .collect(),
+            provider_outputs: provider_outputs.into_iter().collect(),
+            encrypted_reasoning: encrypted_reasoning.into_iter().collect(),
+            usage,
+            terminal,
+        })
     }
 
     /// Compact history if it has grown past the threshold, replacing older items with a
     /// model-written summary plus mechanically-extracted verbatim paths/errors. Returns whether
     /// compaction happened. Public so a `/compact` command can force it.
-    pub async fn compact(&self, session: &mut Session) -> bool {
+    pub async fn compact(
+        &self,
+        session: &mut Session,
+        rollout: &mut Option<RolloutWriter>,
+    ) -> bool {
+        self.compact_inner(session, rollout.as_mut(), &TurnCancellation::new())
+            .await
+    }
+
+    async fn compact_inner(
+        &self,
+        session: &mut Session,
+        mut rollout: Option<&mut RolloutWriter>,
+        cancellation: &TurnCancellation,
+    ) -> bool {
+        if cancellation.is_cancelled() {
+            return false;
+        }
         let trigger = session.config.compaction_trigger_bytes;
         let keep = session.config.compaction_keep_tail;
         if !compaction::should_compact(&session.history, trigger, keep) {
             return false;
         }
-        let split = session.history.len().saturating_sub(keep);
+        let initial_split = coherent_compaction_split(&session.history, keep);
+        // If preserving the configured tail would pull a call/result group all the way to the
+        // beginning, summarize the complete group rather than making compaction impossible.
+        let desired_split = if initial_split == 0 {
+            session.history.len()
+        } else {
+            initial_split
+        };
+        // Decide the durable coherent tail before asking for a summary. If the desired tail is
+        // too large, every item we drop from it must move into the summary input; choosing after
+        // the model call would silently lose that range.
+        let Some(split) = choose_compaction_tail_split(
+            &session.history,
+            desired_split,
+            keep,
+            MAX_COMPACTION_TAIL_BYTES,
+        ) else {
+            tracing::warn!("compaction could not select a coherent durable tail");
+            return false;
+        };
         let older = &session.history[..split];
         let (files, errors) = compaction::extract_verbatim(older);
-        let transcript = compaction::transcript_text(older);
+        let prior_redactions = compaction::redaction_count(older);
+        let transcript =
+            compaction::transcript_text_bounded(older, MAX_COMPACTION_TRANSCRIPT_BYTES);
 
-        let req = ResponsesRequest::new(
-            session.config.model.clone(),
-            vec![
-                InputItem::text(
-                    Role::Developer,
-                    "Summarize the following conversation so the assistant can continue the task. \
-                     Capture decisions, current state, and open work. Be concise.",
-                ),
-                InputItem::text(Role::User, transcript),
-            ],
+        let assembled = match context::assemble_auxiliary(
+            session,
+            "Summarize the following conversation so the assistant can continue the task. \
+             Capture decisions, current state, and open work. Be concise.",
+            &transcript,
+            "compaction",
+        ) {
+            Ok(assembled) => assembled,
+            Err(e) => {
+                tracing::warn!("compaction request assembly failed: {e}");
+                return false;
+            }
+        };
+        for entry in assembled.ledger.entries {
+            self.emit(EventMsg::LedgerAppended(entry));
+        }
+        let summary = match self.collect_text(&assembled.request, cancellation).await {
+            Ok(summary) if !summary.trim().is_empty() => summary,
+            Ok(_) => {
+                tracing::warn!("compaction returned an empty summary; preserving history");
+                return false;
+            }
+            Err(e) => {
+                tracing::warn!("compaction request failed: {e}; preserving history");
+                return false;
+            }
+        };
+        let redacted = Redactor::apply(&summary);
+        let summary_item = compaction::build_summary_item(
+            &redacted.text,
+            &files,
+            &errors,
+            prior_redactions.saturating_add(redacted.count),
         );
-        let summary = self.collect_text(&req).await;
-        let summary_item = compaction::build_summary_item(&summary, &files, &errors);
+        let Some(summary_item) =
+            bound_compaction_summary(summary_item, MAX_COMPACTION_SUMMARY_ITEM_BYTES)
+        else {
+            tracing::warn!("compaction summary could not fit its durable safety budget");
+            return false;
+        };
+        if !checkpoint_fits(
+            &summary_item,
+            &session.history[split..],
+            MAX_COMPACTION_CHECKPOINT_BYTES,
+        ) {
+            tracing::warn!("compaction checkpoint could not fit its durable safety budget");
+            return false;
+        }
 
-        let tail = session.history.split_off(split);
-        session.history.clear();
-        session.history.push(summary_item);
-        session.history.extend(tail);
+        let mut new_history = Vec::with_capacity(1 + session.history.len().saturating_sub(split));
+        new_history.push(summary_item);
+        new_history.extend_from_slice(&session.history[split..]);
+        if let Some(writer) = rollout.as_mut()
+            && let Err(e) = writer
+                .append(&ResponseItem::CompactionCheckpoint {
+                    history: new_history.clone(),
+                })
+                .await
+        {
+            self.emit(EventMsg::Error {
+                message: format!("could not persist compaction checkpoint: {e}"),
+                recoverable: true,
+            });
+            return false;
+        }
+        session.history = new_history;
         tracing::info!("compacted {} items into a summary", split);
         true
     }
 
     /// Stream a request and collect its assistant text (used for summaries/commit messages).
-    async fn collect_text(&self, req: &ResponsesRequest) -> String {
+    async fn collect_text(
+        &self,
+        req: &grokforge_xai::ResponsesRequest,
+        cancellation: &TurnCancellation,
+    ) -> Result<String, String> {
         let mut text = String::new();
-        match self.client.stream(req).await {
-            Ok(mut stream) => {
-                while let Some(ev) = stream.next().await {
-                    if let Ok(StreamEvent::TextDelta(d)) = ev {
-                        text.push_str(&d);
-                    }
-                }
+        let mut usage = Usage::default();
+        let mut stream = tokio::select! {
+            result = self.open_stream_accounted(req) => result.map_err(|e| e.to_string())?,
+            () = cancellation.cancelled() => return Err("turn interrupted".to_string()),
+        };
+        let mut terminal = None;
+        let mut event_count = 0usize;
+        loop {
+            let event = tokio::select! {
+                event = stream.next() => event,
+                () = cancellation.cancelled() => return Err("turn interrupted".to_string()),
+            };
+            let Some(event) = event else {
+                break;
+            };
+            event_count = event_count.saturating_add(1);
+            if event_count > MAX_RESPONSE_EVENTS {
+                return Err(format!(
+                    "summary response exceeded the {MAX_RESPONSE_EVENTS}-event safety limit"
+                ));
             }
-            Err(e) => tracing::warn!("summary request failed: {e}"),
+            match event {
+                Ok(StreamEvent::TextDelta(delta)) => {
+                    if text
+                        .len()
+                        .checked_add(delta.len())
+                        .is_none_or(|len| len > MAX_RESPONSE_TEXT_BYTES)
+                    {
+                        return Err(format!(
+                            "summary response exceeded the {MAX_RESPONSE_TEXT_BYTES}-byte safety limit"
+                        ));
+                    }
+                    text.push_str(&delta);
+                }
+                Ok(StreamEvent::Completed { stop }) => terminal = Some(stop),
+                Ok(StreamEvent::Usage(provider_usage)) => {
+                    usage = Usage {
+                        input_tokens: provider_usage.input_tokens,
+                        cached_tokens: provider_usage.cached_tokens,
+                        output_tokens: provider_usage.output_tokens,
+                        reasoning_tokens: provider_usage.reasoning_tokens,
+                    };
+                }
+                Ok(StreamEvent::ToolCall(_)) => {
+                    return Err("summary model unexpectedly requested a tool".to_string());
+                }
+                Ok(_) => {}
+                Err(e) => return Err(e.to_string()),
+            }
         }
-        text
+        match terminal {
+            Some(grokforge_xai::StopReason::EndTurn) => {
+                self.emit(EventMsg::TokenUsage { usage });
+                Ok(text)
+            }
+            Some(stop) => Err(format!("summary response ended with {stop:?}")),
+            None => Err("summary stream ended before response.completed".to_string()),
+        }
     }
 
     /// Commit files the agent wrote this turn, staging only those paths, from the host process.
-    async fn auto_commit(&self, session: &Session, turn_id: TurnId, ctx: &TurnContext) {
-        let touched: Vec<std::path::PathBuf> = ctx
-            .touched_paths()
-            .into_iter()
-            .filter(|p| p.exists())
-            .collect();
-        if touched.is_empty() {
+    async fn auto_commit(
+        &self,
+        session: &Session,
+        turn_id: TurnId,
+        clean_at_start: bool,
+        touched: Vec<std::path::PathBuf>,
+    ) {
+        // A dirty start means some changes already belong to the user; never sweep them into an
+        // agent commit. Even after a clean start, stage only paths recorded by descriptor-safe
+        // write/edit tools: shell or concurrent user/other-session changes have no reliable
+        // ownership identity and must remain uncommitted.
+        if !clean_at_start || touched.is_empty() {
             return;
         }
         let Some(git) = grokforge_git::Git::discover(&session.config.workspace_root) else {
@@ -383,10 +1136,12 @@ impl Agent {
     ///
     /// Declared with a boxed `+ Send` return type (not `async fn`) to break the async-recursion
     /// auto-trait cycle `run_turn -> run_tool_call -> spawn_subagent -> run_turn`.
+    #[allow(clippy::too_many_lines)]
     fn spawn_subagent<'a>(
         &'a self,
         session: &'a Session,
         args: &'a serde_json::Value,
+        cancellation: &'a TurnCancellation,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolOutput> + Send + 'a>> {
         Box::pin(async move {
             let prompt = args
@@ -404,55 +1159,180 @@ impl Agent {
             };
             let base = git.head_sha().unwrap_or_else(|_| "HEAD".to_string());
             let id = ToolCallId::new().to_string();
-            let worktree = workspace.join(".grokforge/worktrees").join(&id);
+            let worktrees = match crate::store::prepare_worktrees_dir().await {
+                Ok(worktrees) => worktrees,
+                Err(error) => {
+                    tracing::warn!(%error, "secure subagent worktree storage is unavailable");
+                    return ToolOutput::failure(
+                        "secure private subagent worktree storage is unavailable",
+                    );
+                }
+            };
+            let worktree = worktrees.join(&id);
             let branch = format!("gf/agent/{id}");
 
-            let (git_c, wt_c, br_c) = (git.clone(), worktree.clone(), branch.clone());
-            match tokio::task::spawn_blocking(move || git_c.worktree_add(&wt_c, &br_c, "HEAD"))
+            let (git_c, wt_c, br_c, base_c) =
+                (git.clone(), worktree.clone(), branch.clone(), base.clone());
+            match tokio::task::spawn_blocking(move || git_c.worktree_add(&wt_c, &br_c, &base_c))
                 .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    return ToolOutput::failure(format!("could not create worktree: {e}"));
+                    tracing::warn!(error = %e, branch, "could not create private subagent worktree");
+                    return ToolOutput::failure("could not create private subagent worktree");
                 }
-                Err(e) => return ToolOutput::failure(format!("worktree task failed: {e}")),
+                Err(e) => {
+                    tracing::warn!(error = %e, branch, "subagent worktree task failed");
+                    return ToolOutput::failure("subagent worktree task failed");
+                }
             }
 
             // Run the subagent turn in the worktree with its own event channel.
             let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel();
             let sub_agent = self.for_subagent(sub_tx);
-            let sub_config =
+            let mut sub_config =
                 crate::session::SessionConfig::new(worktree.clone(), session.config.model.clone())
-                    .with_policy(session.config.approval_policy, session.config.sandbox_mode);
+                    .with_policy(
+                        session.config.approval_policy,
+                        // Even a yolo parent does not broaden a child into sibling worktrees.
+                        SandboxMode::WorkspaceWrite,
+                    );
+            sub_config.effort = session.config.effort;
+            sub_config
+                .system_prompt
+                .clone_from(&session.config.system_prompt);
+            sub_config.max_iterations = session.config.max_iterations;
+            sub_config.compaction_trigger_bytes = session.config.compaction_trigger_bytes;
+            sub_config.compaction_keep_tail = session.config.compaction_keep_tail;
+            sub_config.auto_compact = session.config.auto_compact;
+            sub_config.network = session.config.network;
+            // This dedicated worktree gives the subagent exclusive path ownership, which is the
+            // precondition for race-safe auto-commit. Keep its default auto-commit enabled even
+            // when the parent disabled auto-commit.
+            sub_config.isolated_worktree = true;
             let mut sub_session = crate::session::Session::new(sub_config);
+            let sessions = match crate::store::sessions_dir() {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    tracing::warn!(%error, branch, "secure subagent session storage is unavailable");
+                    let (git_cleanup, worktree_cleanup) = (git.clone(), worktree.clone());
+                    let _ = tokio::task::spawn_blocking(move || {
+                        git_cleanup.worktree_remove(&worktree_cleanup)
+                    })
+                    .await;
+                    return ToolOutput::failure(
+                        "secure subagent session storage is unavailable; no model call was made",
+                    );
+                }
+            };
+            let sub_writer = match RolloutWriter::create(&sessions, sub_session.id).await {
+                Ok(writer) => writer,
+                Err(error) => {
+                    tracing::warn!(%error, branch, "subagent persistence is unavailable");
+                    let (git_cleanup, worktree_cleanup) = (git.clone(), worktree.clone());
+                    let _ = tokio::task::spawn_blocking(move || {
+                        git_cleanup.worktree_remove(&worktree_cleanup)
+                    })
+                    .await;
+                    return ToolOutput::failure(
+                        "subagent persistence unavailable; no model call was made",
+                    );
+                }
+            };
+            let meta = crate::store::SessionMeta::new(
+                sub_session.id,
+                worktree.clone(),
+                session.config.model.clone(),
+                &prompt,
+            );
+            if let Err(error) = meta.write(&sessions, sub_session.id).await {
+                tracing::warn!(%error, branch, "subagent metadata could not be persisted");
+                drop(sub_writer);
+                let (git_cleanup, worktree_cleanup) = (git.clone(), worktree.clone());
+                let _ = tokio::task::spawn_blocking(move || {
+                    git_cleanup.worktree_remove(&worktree_cleanup)
+                })
+                .await;
+                return ToolOutput::failure(
+                    "subagent metadata could not be persisted; no model call was made",
+                );
+            }
+            let mut sub_rollout = Some(sub_writer);
+            let sub_cancellation = cancellation.clone();
             // Box with an explicit `+ Send` trait object to break the async-recursion type cycle
             // (run_turn -> spawn_subagent -> run_turn).
-            let sub_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            let sub_fut: std::pin::Pin<Box<dyn std::future::Future<Output = StopReason> + Send>> =
                 Box::pin(async move {
                     sub_agent
-                        .run_turn(&mut sub_session, &prompt, &mut None)
-                        .await;
+                        .run_turn_cancellable(
+                            &mut sub_session,
+                            &prompt,
+                            &mut sub_rollout,
+                            &sub_cancellation,
+                        )
+                        .await
                 });
-            let handle = tokio::spawn(sub_fut);
+            let handle = AbortOnDrop::new(tokio::spawn(sub_fut));
             let mut final_text = String::new();
             while let Some(ev) = sub_rx.recv().await {
-                if let EventMsg::AgentMessageDone { text } = ev {
-                    final_text = text;
+                if let EventMsg::AgentMessageDone { text } = &ev {
+                    final_text.clone_from(text);
                 }
+                // Subagent API bytes and usage are still part of this user-visible operation.
+                self.emit(ev);
             }
-            let _ = handle.await;
+            let sub_stop = match handle.join().await {
+                Ok(stop) => stop,
+                Err(e) => {
+                    tracing::warn!(error = %e, branch, "subagent task failed");
+                    return ToolOutput::failure(format!(
+                        "subagent task failed; private recovery worktree for branch `{branch}` was preserved"
+                    ));
+                }
+            };
 
-            // Capture the change summary, then remove the worktree (keeping the branch).
+            // Never force-remove uncommitted edits. A failed auto-commit (for example missing git
+            // identity) must leave recoverable work in place for the user.
             let (git_d, wt_d, base_d) = (git.clone(), worktree.clone(), base.clone());
-            let diff = tokio::task::spawn_blocking(move || {
-                let d = grokforge_git::Git::discover(&wt_d)
-                    .and_then(|g| g.diff_stat(&format!("{base_d}..HEAD")).ok())
-                    .unwrap_or_default();
-                let _ = git_d.worktree_remove(&wt_d);
-                d
+            let inspection = tokio::task::spawn_blocking(move || {
+                let worktree_git = grokforge_git::Git::discover(&wt_d)
+                    .ok_or_else(|| "could not inspect subagent worktree".to_string())?;
+                let dirty = worktree_git.is_dirty().map_err(|e| e.to_string())?;
+                let diff = worktree_git
+                    .diff_stat(&format!("{base_d}..HEAD"))
+                    .map_err(|e| e.to_string())?;
+                if !dirty {
+                    git_d.worktree_remove(&wt_d).map_err(|e| e.to_string())?;
+                }
+                Ok::<_, String>((diff, dirty))
             })
-            .await
-            .unwrap_or_default();
+            .await;
+            let (diff, dirty) = match inspection {
+                Ok(Ok(result)) => result,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, branch, "subagent inspection failed");
+                    return ToolOutput::failure(format!(
+                        "subagent inspection failed; private recovery worktree for branch `{branch}` was preserved"
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, branch, "subagent inspection task failed");
+                    return ToolOutput::failure(format!(
+                        "subagent inspection task failed; private recovery worktree for branch `{branch}` was preserved"
+                    ));
+                }
+            };
+
+            if dirty {
+                return ToolOutput::failure(format!(
+                    "subagent left uncommitted changes; its private recovery worktree was preserved on branch `{branch}` (locate it with `git worktree list`)"
+                ));
+            }
+            if sub_stop != StopReason::EndTurn {
+                return ToolOutput::failure(format!(
+                    "subagent stopped with {sub_stop:?}; committed changes remain on branch `{branch}`"
+                ));
+            }
 
             let changes = if diff.trim().is_empty() {
                 "(no changes)".to_string()
@@ -470,30 +1350,67 @@ impl Agent {
         session: &mut Session,
         rollout: &mut Option<RolloutWriter>,
         call_id: ToolCallId,
-        name: &str,
         arguments: &str,
-    ) {
+        cancellation: &TurnCancellation,
+    ) -> Result<(), ()> {
         let args: serde_json::Value =
             serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
-        self.emit(EventMsg::ToolCallBegin {
-            call_id,
-            name: name.to_string(),
-            args_preview: preview(arguments),
-            sandboxed: true,
-        });
-        let output = self.spawn_subagent(session, &args).await;
-        let red = Redactor::apply(output.content());
-        let is_error = output.is_error();
-        self.emit(EventMsg::ToolCallEnd {
-            call_id,
-            ok: !is_error,
-            summary: summarize(&red.text),
-            denial: None,
-        });
-        self.record_tool_result(session, rollout, call_id, &red.text, is_error)
-            .await;
+        let output = self.spawn_subagent(session, &args, cancellation).await;
+        self.finish_tool_call(session, rollout, call_id, output)
+            .await
     }
 
+    async fn request_approval(
+        &self,
+        call_id: &ToolCallId,
+        kind: ApprovalKind,
+        name: &str,
+        reason: String,
+        cancellation: &TurnCancellation,
+    ) -> Decision {
+        let req = ApprovalRequest {
+            id: ApprovalId::new(),
+            call_id: Some(call_id.clone()),
+            kind,
+            reason,
+        };
+        self.emit(EventMsg::ApprovalRequested(req.clone()));
+        let decision = tokio::select! {
+            decision = self.approver.request(req) => decision,
+            () = cancellation.cancelled() => Decision::Abort,
+        };
+        self.emit(EventMsg::ApprovalResolved {
+            summary: format!("`{name}`"),
+            decision: format!("{decision:?}"),
+            auto: self.auto_approval,
+        });
+        decision
+    }
+
+    async fn finish_tool_call(
+        &self,
+        session: &mut Session,
+        rollout: &mut Option<RolloutWriter>,
+        call_id: ToolCallId,
+        output: ToolOutput,
+    ) -> Result<(), ()> {
+        let red = Redactor::apply(output.content());
+        let is_error = output.is_error();
+        let denial = match &output {
+            ToolOutput::Failure { denial, .. } => *denial,
+            ToolOutput::Success { .. } => None,
+        };
+        self.emit(EventMsg::ToolCallEnd {
+            call_id: call_id.clone(),
+            ok: !is_error,
+            summary: summarize(&red.text),
+            denial,
+        });
+        self.record_tool_result(session, rollout, call_id, &red.text, is_error, red.count)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn run_tool_call(
         &self,
         session: &mut Session,
@@ -502,103 +1419,330 @@ impl Agent {
         call_id: ToolCallId,
         name: &str,
         arguments: &str,
-    ) {
-        self.record(
-            session,
-            rollout,
-            ResponseItem::ToolCall {
-                id: call_id,
-                name: name.to_string(),
-                arguments: arguments.to_string(),
-            },
-        )
-        .await;
+        record_call: bool,
+        offered: bool,
+        spawn_allowed: bool,
+        cancellation: &TurnCancellation,
+    ) -> ToolCallFlow {
+        if record_call
+            && self
+                .record(
+                    session,
+                    rollout,
+                    ResponseItem::ToolCall {
+                        id: call_id.clone(),
+                        name: name.to_string(),
+                        arguments: arguments.to_string(),
+                    },
+                )
+                .await
+                .is_err()
+        {
+            return ToolCallFlow::Error;
+        }
 
-        // The subagent tool is intercepted by the runtime (it needs the Agent itself).
-        if name == crate::tools::builtins::SPAWN_TASK && self.allow_subagents {
-            self.handle_spawn_task(session, rollout, call_id, name, arguments)
-                .await;
-            return;
+        if cancellation.is_cancelled() {
+            return if self
+                .finish_tool_call(
+                    session,
+                    rollout,
+                    call_id,
+                    ToolOutput::failure("[turn interrupted by user before tool execution]"),
+                )
+                .await
+                .is_err()
+            {
+                ToolCallFlow::Error
+            } else {
+                ToolCallFlow::Abort
+            };
+        }
+
+        if !offered {
+            if self
+                .finish_tool_call(
+                    session,
+                    rollout,
+                    call_id,
+                    ToolOutput::failure(format!(
+                        "tool `{name}` is not available in this turn's advertised tool set"
+                    )),
+                )
+                .await
+                .is_err()
+            {
+                return ToolCallFlow::Error;
+            }
+            return ToolCallFlow::Continue;
+        }
+
+        if name == crate::tools::builtins::SPAWN_TASK && (!self.allow_subagents || !spawn_allowed) {
+            let message = if self.allow_subagents {
+                format!("at most {MAX_SUBAGENTS_PER_TURN} subagents may be spawned in one turn")
+            } else {
+                "subagents cannot spawn further subagents".to_string()
+            };
+            if self
+                .finish_tool_call(session, rollout, call_id, ToolOutput::failure(message))
+                .await
+                .is_err()
+            {
+                return ToolCallFlow::Error;
+            }
+            return ToolCallFlow::Continue;
         }
 
         let Some(tool) = self.registry.get(name) else {
             let msg = format!("unknown tool `{name}`");
-            self.emit(EventMsg::ToolCallEnd {
-                call_id,
-                ok: false,
-                summary: msg.clone(),
-                denial: None,
-            });
-            self.record_tool_result(session, rollout, call_id, &msg, true)
-                .await;
-            return;
+            if self
+                .finish_tool_call(session, rollout, call_id, ToolOutput::failure(msg))
+                .await
+                .is_err()
+            {
+                return ToolCallFlow::Error;
+            }
+            return ToolCallFlow::Continue;
         };
 
         let args: serde_json::Value =
             serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
         let need = tool.approval(&args, ctx);
 
-        // Consult the decision table; ask the approver if required.
+        let mut elevated = false;
+        let mut approved_write_targets = Vec::new();
         if let Gate::Ask(kind) = gate(
             session.config.approval_policy,
             session.config.sandbox_mode,
             &need,
         ) {
-            let req = ApprovalRequest {
-                id: ApprovalId::new(),
-                call_id: Some(call_id),
-                kind,
-                reason: format!("run `{name}`"),
+            let exceeds = approval_exceeds_sandbox(&need, &kind, ctx);
+            if session.config.isolated_worktree
+                && exceeds
+                && !matches!(kind, ApprovalKind::Network { .. })
+            {
+                if self
+                    .finish_tool_call(
+                        session,
+                        rollout,
+                        call_id,
+                        ToolOutput::failure(
+                            "isolated subagents cannot widen filesystem access beyond their private worktree",
+                        ),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return ToolCallFlow::Error;
+                }
+                return ToolCallFlow::Continue;
+            }
+            let approval_kind = if exceeds {
+                match physical_write_identity(&kind) {
+                    Ok(Some((identity, targets))) => {
+                        approved_write_targets = targets;
+                        identity
+                    }
+                    Ok(None) => kind.clone(),
+                    Err(message) => {
+                        if self
+                            .finish_tool_call(
+                                session,
+                                rollout,
+                                call_id,
+                                ToolOutput::failure(message),
+                            )
+                            .await
+                            .is_err()
+                        {
+                            return ToolCallFlow::Error;
+                        }
+                        return ToolCallFlow::Continue;
+                    }
+                }
+            } else {
+                kind.clone()
             };
-            self.emit(EventMsg::ApprovalRequested(req.clone()));
-            let decision = self.approver.request(req).await;
-            self.emit(EventMsg::ApprovalResolved {
-                summary: format!("`{name}`"),
-                decision: format!("{decision:?}"),
-                auto: self.auto_approval,
-            });
+            let decision = self
+                .request_approval(
+                    &call_id,
+                    approval_kind,
+                    name,
+                    format!("run `{name}`"),
+                    cancellation,
+                )
+                .await;
+            if decision == Decision::Abort {
+                if self
+                    .finish_tool_call(
+                        session,
+                        rollout,
+                        call_id,
+                        ToolOutput::failure("[turn aborted by user]"),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return ToolCallFlow::Error;
+                }
+                return ToolCallFlow::Abort;
+            }
             if !decision.is_approved() {
                 let feedback = match decision {
-                    grokforge_protocol::Decision::DenyWithFeedback(f) => f,
+                    Decision::DenyWithFeedback(f) => f,
                     _ => "denied".to_string(),
                 };
                 let content = format!("[not run: {feedback}]");
-                self.emit(EventMsg::ToolCallEnd {
-                    call_id,
-                    ok: false,
-                    summary: "denied".to_string(),
-                    denial: None,
-                });
-                self.record_tool_result(session, rollout, call_id, &content, true)
-                    .await;
-                return;
+                if self
+                    .finish_tool_call(session, rollout, call_id, ToolOutput::failure(content))
+                    .await
+                    .is_err()
+                {
+                    return ToolCallFlow::Error;
+                }
+                return ToolCallFlow::Continue;
             }
+            elevated = exceeds;
         }
 
+        // The subagent tool is runtime-owned because it needs the Agent itself. It still passes
+        // through the approval gate above (git worktree/branch mutation + an additional API loop).
+        if name == crate::tools::builtins::SPAWN_TASK {
+            self.emit(EventMsg::ToolCallBegin {
+                call_id: call_id.clone(),
+                name: name.to_string(),
+                args_preview: preview(arguments),
+                sandboxed: false,
+            });
+            if self
+                .handle_spawn_task(session, rollout, call_id, arguments, cancellation)
+                .await
+                .is_err()
+            {
+                return ToolCallFlow::Error;
+            }
+            return ToolCallFlow::Continue;
+        }
+
+        if elevated
+            && !approved_write_targets.is_empty()
+            && !write_targets_still_resolve(&approved_write_targets)
+        {
+            if self
+                .finish_tool_call(
+                    session,
+                    rollout,
+                    call_id,
+                    ToolOutput::failure(
+                        "approved write target changed before invocation; request approval again",
+                    ),
+                )
+                .await
+                .is_err()
+            {
+                return ToolCallFlow::Error;
+            }
+            return ToolCallFlow::Continue;
+        }
+        let elevated_ctx;
+        let invoke_ctx = if elevated {
+            elevated_ctx = if approved_write_targets.is_empty() {
+                Self::elevated_context(ctx)
+            } else {
+                Self::elevated_write_context(ctx, &approved_write_targets)
+            };
+            &elevated_ctx
+        } else {
+            ctx
+        };
+        let invoke_args = bind_approved_write_target(args.clone(), &approved_write_targets);
         self.emit(EventMsg::ToolCallBegin {
-            call_id,
+            call_id: call_id.clone(),
             name: name.to_string(),
             args_preview: preview(arguments),
-            sandboxed: session.config.sandbox_mode.is_sandboxed(),
+            sandboxed: invoke_ctx.policy.mode.is_sandboxed(),
         });
 
-        let output = tool.invoke(ToolInvocation { call_id, args, ctx }).await;
+        let mut output = tool
+            .invoke(ToolInvocation {
+                call_id: call_id.clone(),
+                args: invoke_args,
+                ctx: invoke_ctx,
+            })
+            .await;
 
-        // Redact tool output before it enters the transcript / the next request.
-        let red = Redactor::apply(output.content());
-        let is_error = output.is_error();
         let denial = match &output {
             ToolOutput::Failure { denial, .. } => *denial,
             ToolOutput::Success { .. } => None,
         };
-        self.emit(EventMsg::ToolCallEnd {
-            call_id,
-            ok: !is_error,
-            summary: summarize(&red.text),
-            denial,
-        });
-        self.record_tool_result(session, rollout, call_id, &red.text, is_error)
-            .await;
+        let escalation = denial
+            .filter(|denial| {
+                !elevated
+                    && session.config.approval_policy != ApprovalPolicy::Never
+                    && !(session.config.isolated_worktree
+                        && *denial == grokforge_protocol::DenialClass::FsWrite)
+            })
+            .and_then(|denial| escalation_kind(&need, denial).map(|kind| (denial, kind)));
+        if let Some((denial, kind)) = escalation {
+            let retry_targets = escalation_write_targets(&kind);
+            let decision = self
+                .request_approval(
+                    &call_id,
+                    kind,
+                    name,
+                    format!("retry `{name}` after sandbox denial {denial:?}"),
+                    cancellation,
+                )
+                .await;
+            if decision == Decision::Abort {
+                if self
+                    .finish_tool_call(
+                        session,
+                        rollout,
+                        call_id,
+                        ToolOutput::failure("[turn aborted by user]"),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return ToolCallFlow::Error;
+                }
+                return ToolCallFlow::Abort;
+            }
+            if decision.is_approved() {
+                if !retry_targets.is_empty() && !write_targets_still_resolve(&retry_targets) {
+                    output = ToolOutput::failure(
+                        "approved write target changed before retry; request approval again",
+                    );
+                } else {
+                    let retry_ctx = if retry_targets.is_empty() {
+                        Self::escalation_context(ctx, denial)
+                    } else {
+                        Self::elevated_write_context(ctx, &retry_targets)
+                    };
+                    let retry_args = bind_approved_write_target(args, &retry_targets);
+                    output = tool
+                        .invoke(ToolInvocation {
+                            call_id: call_id.clone(),
+                            args: retry_args,
+                            ctx: &retry_ctx,
+                        })
+                        .await;
+                }
+            }
+        }
+
+        let cancelled = cancellation.is_cancelled();
+        if self
+            .finish_tool_call(session, rollout, call_id, output)
+            .await
+            .is_err()
+        {
+            ToolCallFlow::Error
+        } else if cancelled {
+            ToolCallFlow::Abort
+        } else {
+            ToolCallFlow::Continue
+        }
     }
 
     async fn record(
@@ -606,13 +1750,21 @@ impl Agent {
         session: &mut Session,
         rollout: &mut Option<RolloutWriter>,
         item: ResponseItem,
-    ) {
-        if let Some(w) = rollout.as_mut() {
-            if let Err(e) = w.append(&item).await {
-                tracing::warn!("rollout append failed: {e}");
-            }
+    ) -> Result<(), ()> {
+        if let Some(w) = rollout.as_mut()
+            && let Err(e) = w.append(&item).await
+        {
+            let message =
+                format!("rollout append failed; turn stopped before using unpersisted state: {e}");
+            tracing::warn!("{message}");
+            self.emit(EventMsg::Error {
+                message,
+                recoverable: false,
+            });
+            return Err(());
         }
         session.history.push(item);
+        Ok(())
     }
 
     async fn record_tool_result(
@@ -622,7 +1774,8 @@ impl Agent {
         id: ToolCallId,
         content: &str,
         is_error: bool,
-    ) {
+        redactions: usize,
+    ) -> Result<(), ()> {
         self.record(
             session,
             rollout,
@@ -630,10 +1783,586 @@ impl Agent {
                 id,
                 content: content.to_string(),
                 is_error,
+                redactions,
             },
         )
-        .await;
+        .await
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_provider_response(
+    response: &ConsumedResponse,
+    history: &[ResponseItem],
+) -> Result<(), String> {
+    let mut prior_ids = BTreeSet::new();
+    for item in history {
+        match item {
+            ResponseItem::ToolCall { id, .. } | ResponseItem::ToolResult { id, .. } => {
+                prior_ids.insert(id.as_str());
+            }
+            ResponseItem::ProviderOutput { item }
+                if item.get("type").and_then(serde_json::Value::as_str)
+                    == Some("function_call") =>
+            {
+                if let Some(id) = item.get("call_id").and_then(serde_json::Value::as_str) {
+                    prior_ids.insert(id);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut typed_ids = BTreeSet::new();
+    for (output_index, id, name, arguments) in &response.tool_calls {
+        if id.as_str().is_empty() || !typed_ids.insert(id.as_str()) {
+            return Err(format!(
+                "provider returned duplicate or empty tool call id `{}`",
+                id.as_str()
+            ));
+        }
+        if prior_ids.contains(id.as_str()) {
+            return Err(format!(
+                "provider reused tool call id `{}` from prior session history",
+                id.as_str()
+            ));
+        }
+        let Some((_, raw)) = response
+            .provider_outputs
+            .iter()
+            .find(|(index, _)| index == output_index)
+        else {
+            return Err(format!(
+                "typed tool call `{}` has no provider output at index {output_index}",
+                id.as_str()
+            ));
+        };
+        if raw.get("type").and_then(serde_json::Value::as_str) != Some("function_call")
+            || raw.get("call_id").and_then(serde_json::Value::as_str) != Some(id.as_str())
+            || raw.get("name").and_then(serde_json::Value::as_str) != Some(name.as_str())
+            || raw.get("arguments").and_then(serde_json::Value::as_str) != Some(arguments.as_str())
+        {
+            return Err(format!(
+                "typed tool call `{}` disagrees with provider output index {output_index}",
+                id.as_str()
+            ));
+        }
+    }
+
+    let mut raw_ids = BTreeSet::new();
+    for (output_index, item) in response.provider_outputs.iter().filter(|(_, item)| {
+        item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+    }) {
+        let id = item
+            .get("call_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if id.is_empty() || !raw_ids.insert(id) {
+            return Err(format!(
+                "provider returned duplicate or empty raw tool call id `{id}`"
+            ));
+        }
+        if !response
+            .tool_calls
+            .iter()
+            .any(|(index, typed_id, _, _)| index == output_index && typed_id.as_str() == id)
+        {
+            return Err(format!(
+                "provider function call `{id}` at index {output_index} has no matching typed call"
+            ));
+        }
+    }
+
+    for (output_index, reasoning) in &response.encrypted_reasoning {
+        let ResponseItem::EncryptedReasoning { id, .. } = reasoning else {
+            return Err("internal reasoning item lost its typed representation".to_string());
+        };
+        let Some((_, raw)) = response
+            .provider_outputs
+            .iter()
+            .find(|(index, _)| index == output_index)
+        else {
+            return Err(format!(
+                "typed reasoning `{id}` has no provider output at index {output_index}"
+            ));
+        };
+        if raw.get("type").and_then(serde_json::Value::as_str) != Some("reasoning")
+            || raw.get("id").and_then(serde_json::Value::as_str) != Some(id.as_str())
+        {
+            return Err(format!(
+                "typed reasoning `{id}` disagrees with provider output index {output_index}"
+            ));
+        }
+    }
+
+    let messages: Vec<_> = response
+        .provider_outputs
+        .iter()
+        .filter_map(|(_, item)| {
+            (item.get("type").and_then(serde_json::Value::as_str) == Some("message"))
+                .then_some(item)
+        })
+        .collect();
+    if !messages.is_empty() {
+        let mut finalized = String::new();
+        for message in messages {
+            let content = message
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    "provider finalized message omitted its content array".to_string()
+                })?;
+            for part in content {
+                if part.get("type").and_then(serde_json::Value::as_str) == Some("output_text") {
+                    let text = part
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "provider finalized output_text omitted text".to_string())?;
+                    finalized.push_str(text);
+                }
+            }
+        }
+        if finalized != response.assistant_text {
+            return Err(
+                "streamed assistant text did not match the provider's finalized message"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn sandbox_policy(
+    root: &std::path::Path,
+    mode: SandboxMode,
+    network: grokforge_protocol::NetworkMode,
+    isolated_worktree: bool,
+) -> Result<SandboxPolicy, String> {
+    let mut policy = match mode {
+        SandboxMode::ReadOnly => SandboxPolicy::read_only(root),
+        SandboxMode::WorkspaceWrite => SandboxPolicy::workspace_write(root),
+        SandboxMode::DangerFullAccess => SandboxPolicy::danger_full_access(root),
+    };
+    policy.network = network;
+    if let Some(git) = grokforge_git::Git::discover(root) {
+        protect_git_metadata(&mut policy, &git)?;
+    }
+    let session_dir = crate::store::prepare_sessions_dir_blocking()
+        .map_err(|error| format!("secure session storage is unavailable: {error}"))?;
+    protect_private_store_path(&mut policy, &session_dir);
+    let worktrees = crate::store::prepare_worktrees_dir_blocking()
+        .map_err(|error| format!("secure subagent worktree storage is unavailable: {error}"))?;
+    let canonical_root = std::fs::canonicalize(root).map_err(|error| {
+        format!(
+            "could not resolve workspace root `{}`: {error}",
+            root.display()
+        )
+    })?;
+    let canonical_worktrees = std::fs::canonicalize(&worktrees).map_err(|error| {
+        format!(
+            "could not resolve private worktree root `{}`: {error}",
+            worktrees.display()
+        )
+    })?;
+    if isolated_worktree {
+        if canonical_root.parent() != Some(canonical_worktrees.as_path()) {
+            return Err(
+                "isolated-worktree session is not rooted in private worktree storage".to_string(),
+            );
+        }
+        // The child must access its own checkout. Protect every existing sibling individually;
+        // its forced WorkspaceWrite policy also confines writes to the exact owned root.
+        let entries = std::fs::read_dir(&canonical_worktrees).map_err(|error| {
+            format!("could not inspect private subagent worktree storage: {error}")
+        })?;
+        for (index, entry) in entries.enumerate() {
+            if index >= MAX_SUBAGENTS_PER_TURN.saturating_mul(128) {
+                return Err(
+                    "private subagent worktree storage contains too many entries".to_string(),
+                );
+            }
+            let entry = entry.map_err(|error| {
+                format!("could not inspect private subagent worktree entry: {error}")
+            })?;
+            let metadata = std::fs::symlink_metadata(entry.path()).map_err(|error| {
+                format!("could not inspect private subagent worktree entry: {error}")
+            })?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(
+                    "private subagent worktree storage contains an unsafe entry".to_string()
+                );
+            }
+            let sibling = std::fs::canonicalize(entry.path()).map_err(|error| {
+                format!("could not resolve private subagent worktree entry: {error}")
+            })?;
+            if sibling != canonical_root {
+                protect_private_store_path(&mut policy, &sibling);
+            }
+        }
+    } else {
+        protect_private_store_path(&mut policy, &canonical_worktrees);
+    }
+    Ok(policy)
+}
+
+fn protect_private_store_path(policy: &mut SandboxPolicy, path: &std::path::Path) {
+    if !policy.protected_paths.iter().any(|known| known == path) {
+        policy.protected_paths.push(path.to_path_buf());
+    }
+    let literal = globset::escape(&path.to_string_lossy());
+    for pattern in [literal.clone(), format!("{literal}/**")] {
+        if !policy.unreadable_globs.contains(&pattern) {
+            policy.unreadable_globs.push(pattern);
+        }
+    }
+}
+
+fn protect_git_metadata(
+    policy: &mut SandboxPolicy,
+    git: &grokforge_git::Git,
+) -> Result<(), String> {
+    let paths = git.metadata_paths().map_err(|error| {
+        format!(
+            "could not pin all Git metadata paths for `{}`: {error}",
+            git.root().display()
+        )
+    })?;
+    for path in paths {
+        if !policy.protected_paths.contains(&path) {
+            policy.protected_paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn coherent_compaction_split(history: &[ResponseItem], keep: usize) -> usize {
+    let mut split = history.len().saturating_sub(keep);
+    loop {
+        let mut required = split;
+        for result_id in history[split..].iter().filter_map(|item| match item {
+            ResponseItem::ToolResult { id, .. } => Some(id.as_str()),
+            _ => None,
+        }) {
+            if let Some(call_index) =
+                history[..required]
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(index, item)| match item {
+                        ResponseItem::ToolCall { id, .. } if id.as_str() == result_id => {
+                            Some(index)
+                        }
+                        ResponseItem::ProviderOutput { item }
+                            if item.get("type").and_then(serde_json::Value::as_str)
+                                == Some("function_call")
+                                && item.get("call_id").and_then(serde_json::Value::as_str)
+                                    == Some(result_id) =>
+                        {
+                            Some(index)
+                        }
+                        _ => None,
+                    })
+            {
+                required = required.min(call_index);
+            }
+        }
+        while required > 0
+            && matches!(
+                history.get(required - 1),
+                Some(ResponseItem::ProviderOutput { .. } | ResponseItem::EncryptedReasoning { .. })
+            )
+        {
+            required -= 1;
+        }
+        if required == split {
+            return split;
+        }
+        split = required;
+    }
+}
+
+fn bound_compaction_summary(
+    mut summary: ResponseItem,
+    max_serialized_bytes: usize,
+) -> Option<ResponseItem> {
+    const TRUNCATED: &str = "\n[compaction summary truncated to durable storage limit]";
+    loop {
+        if serde_json::to_vec(&summary).ok()?.len() <= max_serialized_bytes {
+            return Some(summary);
+        }
+        let ResponseItem::CompactionSummary { text, .. } = &mut summary else {
+            return None;
+        };
+        if text.is_empty() {
+            return None;
+        }
+        let mut end = text.len() / 2;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        if text.len().saturating_add(TRUNCATED.len()) <= max_serialized_bytes {
+            text.push_str(TRUNCATED);
+        }
+    }
+}
+
+fn choose_compaction_tail_split(
+    history: &[ResponseItem],
+    initial_split: usize,
+    keep: usize,
+    max_tail_bytes: usize,
+) -> Option<usize> {
+    if tail_fits(&history[initial_split..], max_tail_bytes) {
+        return Some(initial_split);
+    }
+
+    // A coherence expansion can reach arbitrarily far back in a malicious resumed transcript.
+    // If that expanded tail is too large, consider only a bounded recent suffix and drop any
+    // leading results whose calls no longer fit. Empty tail is always the final candidate.
+    let candidates = keep.min(MAX_COMPACTION_TAIL_CANDIDATES);
+    let base = history.len().saturating_sub(candidates);
+    (base..=history.len()).find(|candidate| {
+        let tail = &history[*candidate..];
+        tail_is_coherent(tail) && tail_fits(tail, max_tail_bytes)
+    })
+}
+
+fn tail_is_coherent(tail: &[ResponseItem]) -> bool {
+    let mut calls = BTreeSet::new();
+    for item in tail {
+        match item {
+            ResponseItem::ToolCall { id, .. } => {
+                calls.insert(id.as_str());
+            }
+            ResponseItem::ProviderOutput { item }
+                if item.get("type").and_then(serde_json::Value::as_str)
+                    == Some("function_call") =>
+            {
+                if let Some(id) = item.get("call_id").and_then(serde_json::Value::as_str) {
+                    calls.insert(id);
+                }
+            }
+            ResponseItem::ToolResult { id, .. } if !calls.contains(id.as_str()) => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn checkpoint_fits(
+    summary: &ResponseItem,
+    tail: &[ResponseItem],
+    max_serialized_bytes: usize,
+) -> bool {
+    use std::io::Write as _;
+
+    struct CappedCounter {
+        bytes: usize,
+        max: usize,
+    }
+
+    impl std::io::Write for CappedCounter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            let next = self.bytes.saturating_add(buffer.len());
+            if next > self.max {
+                return Err(std::io::Error::other("checkpoint exceeds byte budget"));
+            }
+            self.bytes = next;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut output = CappedCounter {
+        bytes: 0,
+        max: max_serialized_bytes,
+    };
+    let result = (|| {
+        output.write_all(b"{\"kind\":\"compaction_checkpoint\",\"history\":[")?;
+        serde_json::to_writer(&mut output, summary).map_err(std::io::Error::other)?;
+        for item in tail {
+            output.write_all(b",")?;
+            serde_json::to_writer(&mut output, item).map_err(std::io::Error::other)?;
+        }
+        output.write_all(b"]}")
+    })();
+    result.is_ok()
+}
+
+fn tail_fits(tail: &[ResponseItem], max_serialized_bytes: usize) -> bool {
+    use std::io::Write as _;
+
+    struct CappedCounter {
+        bytes: usize,
+        max: usize,
+    }
+
+    impl std::io::Write for CappedCounter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            let next = self.bytes.saturating_add(buffer.len());
+            if next > self.max {
+                return Err(std::io::Error::other("tail exceeds byte budget"));
+            }
+            self.bytes = next;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut output = CappedCounter {
+        bytes: 0,
+        max: max_serialized_bytes,
+    };
+    let result = (|| {
+        output.write_all(b"[")?;
+        for (index, item) in tail.iter().enumerate() {
+            if index > 0 {
+                output.write_all(b",")?;
+            }
+            serde_json::to_writer(&mut output, item).map_err(std::io::Error::other)?;
+        }
+        output.write_all(b"]")
+    })();
+    result.is_ok()
+}
+
+fn approval_exceeds_sandbox(
+    need: &crate::approvals::ApprovalNeed,
+    kind: &ApprovalKind,
+    ctx: &TurnContext,
+) -> bool {
+    if matches!(need, crate::approvals::ApprovalNeed::OutsideSandbox(_)) {
+        return true;
+    }
+    match kind {
+        ApprovalKind::WriteFile { path } => !ctx.policy.allows_write(path),
+        ApprovalKind::ApplyPatch { files } => {
+            files.iter().any(|path| !ctx.policy.allows_write(path))
+        }
+        ApprovalKind::Network { .. } => ctx.policy.network != grokforge_protocol::NetworkMode::Full,
+        // Approving command source never pre-grants filesystem access. It runs under the
+        // original policy; only a later classified FsWrite denial can request a distinct
+        // SandboxEscalation (which command-prefix grants do not approve).
+        ApprovalKind::ExecCommand { .. }
+        | ApprovalKind::GitMutation { .. }
+        | ApprovalKind::McpToolCall { .. }
+        | ApprovalKind::SandboxEscalation { .. } => false,
+    }
+}
+
+fn physical_write_identity(
+    kind: &ApprovalKind,
+) -> Result<Option<(ApprovalKind, Vec<std::path::PathBuf>)>, String> {
+    fn canonical_target(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        let canonical = crate::path_safety::canonicalize_allow_missing(path)
+            .map_err(|error| format!("cannot resolve write approval target: {error}"))?;
+        let lexical = crate::path_safety::normalize(path);
+        if !path.is_absolute() || lexical != canonical {
+            return Err(format!(
+                "refusing an elevated write through a symlink or non-canonical path `{}`; name the canonical absolute target `{}`",
+                path.display(),
+                canonical.display()
+            ));
+        }
+        Ok(canonical)
+    }
+
+    match kind {
+        ApprovalKind::WriteFile { path } => {
+            let target = canonical_target(path)?;
+            Ok(Some((
+                ApprovalKind::WriteFile {
+                    path: target.clone(),
+                },
+                vec![target],
+            )))
+        }
+        ApprovalKind::ApplyPatch { files } => {
+            let targets = files
+                .iter()
+                .map(|path| canonical_target(path))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some((
+                ApprovalKind::ApplyPatch {
+                    files: targets.clone(),
+                },
+                targets,
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn escalation_write_targets(kind: &ApprovalKind) -> Vec<std::path::PathBuf> {
+    let ApprovalKind::SandboxEscalation { original, .. } = kind else {
+        return Vec::new();
+    };
+    match original.as_ref() {
+        ApprovalKind::WriteFile { path } => vec![path.clone()],
+        ApprovalKind::ApplyPatch { files } => files.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn write_targets_still_resolve(targets: &[std::path::PathBuf]) -> bool {
+    targets.iter().all(|target| {
+        crate::path_safety::canonicalize_allow_missing(target)
+            .is_ok_and(|canonical| canonical == *target)
+    })
+}
+
+fn bind_approved_write_target(
+    mut args: serde_json::Value,
+    targets: &[std::path::PathBuf],
+) -> serde_json::Value {
+    if let [target] = targets
+        && let Some(object) = args.as_object_mut()
+    {
+        object.insert(
+            "path".to_string(),
+            serde_json::Value::String(target.to_string_lossy().into_owned()),
+        );
+    }
+    args
+}
+
+fn escalation_kind(
+    need: &crate::approvals::ApprovalNeed,
+    denial: grokforge_protocol::DenialClass,
+) -> Option<ApprovalKind> {
+    if matches!(
+        denial,
+        grokforge_protocol::DenialClass::FsRead | grokforge_protocol::DenialClass::Signal
+    ) {
+        return None;
+    }
+    let mut kind = match need {
+        crate::approvals::ApprovalNeed::None => return None,
+        crate::approvals::ApprovalNeed::Gated(kind)
+        | crate::approvals::ApprovalNeed::OutsideSandbox(kind)
+        | crate::approvals::ApprovalNeed::Always(kind) => kind.clone(),
+    };
+    if let ApprovalKind::ExecCommand { escalation_of, .. } = &mut kind {
+        *escalation_of = Some(denial);
+    } else if matches!(
+        kind,
+        ApprovalKind::WriteFile { .. } | ApprovalKind::ApplyPatch { .. }
+    ) {
+        let Ok(Some((physical, _))) = physical_write_identity(&kind) else {
+            return None;
+        };
+        kind = ApprovalKind::SandboxEscalation {
+            original: Box::new(physical),
+            denial,
+        };
+    }
+    Some(kind)
 }
 
 /// A heuristic commit subject. Model-generated conventional-commit messages (via structured
@@ -641,9 +2370,12 @@ impl Agent {
 fn commit_message(touched: &[std::path::PathBuf]) -> String {
     let names: Vec<String> = touched
         .iter()
-        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .filter_map(|p| {
+            p.file_name()
+                .map(|n| sanitize_filename(&n.to_string_lossy()))
+        })
         .collect();
-    match names.as_slice() {
+    let message = match names.as_slice() {
         [] => "grokforge: update files".to_string(),
         [one] => format!("grokforge: update {one}"),
         many => {
@@ -659,11 +2391,46 @@ fn commit_message(touched: &[std::path::PathBuf]) -> String {
                 shown.join(", ")
             )
         }
+    };
+    message.chars().take(200).collect()
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| if c.is_control() { '_' } else { c })
+        .take(48)
+        .collect();
+    if sanitized.is_empty() {
+        "file".to_string()
+    } else {
+        sanitized
     }
 }
 
+fn tool_preserves_auto_commit_ownership(name: &str) -> bool {
+    // File tools are awaited host operations and the private worktree excludes sibling agents.
+    // A shell or external/custom tool can leave a daemonized descendant on platforms without a
+    // PID namespace (notably Seatbelt), so its same-path writes cannot be attributed at staging.
+    matches!(
+        name,
+        "read_file" | "write_file" | "edit" | "list" | "glob" | "grep"
+    )
+}
+
 fn preview(s: &str) -> String {
-    let one_line = s.replace('\n', " ");
+    let one_line: String = s
+        .chars()
+        .map(|c| {
+            if matches!(c, '\n' | '\r' | '\t') {
+                ' '
+            } else if c.is_control() {
+                '�'
+            } else {
+                c
+            }
+        })
+        .collect();
     // Truncate on a char boundary to avoid slicing through a multibyte codepoint.
     if one_line.chars().count() > 80 {
         let truncated: String = one_line.chars().take(80).collect();
@@ -676,4 +2443,275 @@ fn preview(s: &str) -> String {
 fn summarize(s: &str) -> String {
     let first = s.lines().next().unwrap_or("");
     preview(first)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct EnforcedRunner;
+
+    #[async_trait::async_trait]
+    impl grokforge_sandbox::SandboxRunner for EnforcedRunner {
+        fn capability(&self) -> grokforge_sandbox::SandboxCapability {
+            grokforge_sandbox::SandboxCapability {
+                backend: "test".into(),
+                enforced: true,
+                notes: Vec::new(),
+            }
+        }
+
+        async fn run(
+            &self,
+            _policy: &SandboxPolicy,
+            _command: &grokforge_sandbox::CommandSpec,
+        ) -> Result<grokforge_sandbox::ExecOutput, grokforge_sandbox::ExecError> {
+            Err(grokforge_sandbox::ExecError::UnsupportedPolicy(
+                "not invoked by this unit test".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_cancels_owned_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct MarkDropped(Arc<AtomicBool>);
+        impl Drop for MarkDropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_flag = Arc::clone(&dropped);
+        let handle = AbortOnDrop::new(tokio::spawn(async move {
+            let _mark = MarkDropped(task_flag);
+            std::future::pending::<()>().await;
+        }));
+        tokio::task::yield_now().await;
+        drop(handle);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted task should be dropped promptly");
+    }
+
+    #[test]
+    fn commit_message_cannot_inject_lines_or_terminal_controls() {
+        let message = commit_message(&[std::path::PathBuf::from(
+            "ok\nGrokforge-Session: forged\u{1b}[31m.rs",
+        )]);
+        assert!(!message.contains('\n'));
+        assert!(!message.contains('\u{1b}'));
+        assert!(message.len() <= 200);
+    }
+
+    #[test]
+    fn shell_and_external_tools_disable_isolated_auto_commit_ownership() {
+        assert!(tool_preserves_auto_commit_ownership("write_file"));
+        assert!(tool_preserves_auto_commit_ownership("read_file"));
+        assert!(!tool_preserves_auto_commit_ownership("shell"));
+        assert!(!tool_preserves_auto_commit_ownership("mcp__docs__search"));
+        assert!(!tool_preserves_auto_commit_ownership("custom_tool"));
+    }
+
+    #[test]
+    fn compaction_tail_keeps_parallel_calls_with_their_results() {
+        let call = |id: &str| ResponseItem::ProviderOutput {
+            item: serde_json::json!({
+                "type":"function_call","call_id":id,"name":"read_file","arguments":"{}"
+            }),
+        };
+        let history = vec![
+            ResponseItem::ProviderOutput {
+                item: serde_json::json!({"type":"reasoning","id":"r","encrypted_content":"x"}),
+            },
+            call("one"),
+            call("two"),
+            ResponseItem::ToolResult {
+                id: ToolCallId::from_raw("one"),
+                content: "1".into(),
+                is_error: false,
+                redactions: 0,
+            },
+            ResponseItem::ToolResult {
+                id: ToolCallId::from_raw("two"),
+                content: "2".into(),
+                is_error: false,
+                redactions: 0,
+            },
+        ];
+        assert_eq!(coherent_compaction_split(&history, 1), 0);
+    }
+
+    #[test]
+    fn compaction_checkpoint_drops_oversized_orphaning_tail() {
+        let summary = ResponseItem::CompactionSummary {
+            text: "summary".into(),
+            redactions: 0,
+        };
+        let history = vec![
+            ResponseItem::ToolCall {
+                id: ToolCallId::from_raw("call"),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+            ResponseItem::ToolResult {
+                id: ToolCallId::from_raw("call"),
+                content: "x".repeat(1_024),
+                is_error: false,
+                redactions: 0,
+            },
+        ];
+        // Keeping only the result would orphan it, while keeping both exceeds this tiny test
+        // budget. The safe fallback summarizes both and retains an empty tail.
+        assert_eq!(
+            choose_compaction_tail_split(&history, 0, 1, 256),
+            Some(history.len())
+        );
+        assert!(checkpoint_fits(&summary, &[], 256));
+    }
+
+    #[test]
+    fn approving_a_command_does_not_widen_a_readonly_filesystem() {
+        let workspace = tempfile::tempdir().unwrap();
+        let kind = ApprovalKind::ExecCommand {
+            command: vec!["touch file".into()],
+            cwd: workspace.path().to_path_buf(),
+            sandbox: SandboxMode::ReadOnly,
+            escalation_of: None,
+        };
+        let need = crate::approvals::ApprovalNeed::Gated(kind.clone());
+        let ctx = TurnContext {
+            workspace_root: workspace.path().to_path_buf(),
+            policy: SandboxPolicy::read_only(workspace.path()),
+            sandbox: Arc::new(grokforge_sandbox::PassthroughRunner),
+            touched: Arc::new(std::sync::Mutex::new(Vec::new())),
+            bound_write_targets: Vec::new(),
+            cancellation: TurnCancellation::new(),
+        };
+        assert!(!approval_exceeds_sandbox(&need, &kind, &ctx));
+    }
+
+    #[test]
+    fn explicit_network_grant_preserves_workspace_filesystem_boundary() {
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = sandbox_policy(
+            workspace.path(),
+            SandboxMode::WorkspaceWrite,
+            grokforge_protocol::NetworkMode::Full,
+            false,
+        )
+        .unwrap();
+        assert_eq!(policy.network, grokforge_protocol::NetworkMode::Full);
+        assert_eq!(policy.writable_roots, [workspace.path().to_path_buf()]);
+        assert_ne!(policy.mode, SandboxMode::DangerFullAccess);
+        let sessions = std::fs::canonicalize(crate::store::sessions_dir().unwrap()).unwrap();
+        assert!(policy.protected_paths.contains(&sessions));
+        let worktrees = std::fs::canonicalize(crate::store::worktrees_dir().unwrap()).unwrap();
+        assert!(policy.protected_paths.contains(&worktrees));
+        let mut globs = globset::GlobSetBuilder::new();
+        for pattern in &policy.unreadable_globs {
+            globs.add(globset::Glob::new(pattern).unwrap());
+        }
+        assert!(
+            globs
+                .build()
+                .unwrap()
+                .is_match(sessions.join("rollout.jsonl"))
+        );
+        assert!(!policy.allows_write(&worktrees.join("other-agent/file")));
+        let yolo = sandbox_policy(
+            workspace.path(),
+            SandboxMode::DangerFullAccess,
+            grokforge_protocol::NetworkMode::Full,
+            false,
+        )
+        .unwrap();
+        assert!(!yolo.allows_write(&worktrees.join("other-agent/file")));
+    }
+
+    #[test]
+    fn escalation_widens_only_the_classified_capability() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = TurnContext {
+            workspace_root: workspace.path().to_path_buf(),
+            policy: SandboxPolicy::workspace_write(workspace.path()),
+            sandbox: Arc::new(EnforcedRunner),
+            touched: Arc::new(std::sync::Mutex::new(Vec::new())),
+            bound_write_targets: Vec::new(),
+            cancellation: TurnCancellation::new(),
+        };
+
+        let filesystem = Agent::escalation_context(&ctx, grokforge_protocol::DenialClass::FsWrite);
+        assert_eq!(
+            filesystem.policy.network,
+            grokforge_protocol::NetworkMode::Isolated
+        );
+        assert_eq!(
+            filesystem.policy.writable_roots,
+            [std::path::PathBuf::from("/")]
+        );
+
+        let network = Agent::escalation_context(&ctx, grokforge_protocol::DenialClass::Network);
+        assert_eq!(
+            network.policy.network,
+            grokforge_protocol::NetworkMode::Full
+        );
+        assert_eq!(network.policy.writable_roots, ctx.policy.writable_roots);
+
+        let need = crate::approvals::ApprovalNeed::Gated(ApprovalKind::ExecCommand {
+            command: vec!["command".into()],
+            cwd: workspace.path().to_path_buf(),
+            sandbox: SandboxMode::WorkspaceWrite,
+            escalation_of: None,
+        });
+        assert!(escalation_kind(&need, grokforge_protocol::DenialClass::FsRead).is_none());
+        assert!(escalation_kind(&need, grokforge_protocol::DenialClass::Signal).is_none());
+    }
+
+    #[test]
+    fn discovered_git_metadata_failure_is_not_silently_omitted() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let initialized = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+        let git = grokforge_git::Git::discover(workspace.path()).unwrap();
+        std::fs::rename(
+            workspace.path().join(".git"),
+            workspace.path().join("metadata-removed"),
+        )
+        .unwrap();
+        let mut policy = SandboxPolicy::workspace_write(workspace.path());
+        assert!(protect_git_metadata(&mut policy, &git).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn elevated_write_identity_refuses_symlinked_path() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), workspace.path().join("link")).unwrap();
+        let kind = ApprovalKind::WriteFile {
+            path: workspace.path().join("link/file"),
+        };
+        assert!(physical_write_identity(&kind).is_err());
+    }
 }

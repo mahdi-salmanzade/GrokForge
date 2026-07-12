@@ -1,74 +1,98 @@
 <div align="center">
   <img src="assets/grokforge.svg" alt="GrokForge" width="96" height="96" />
   <h1>GrokForge</h1>
-  <p><strong>Open-source terminal coding agent for Grok — local-first, sandboxed, git-native.</strong></p>
+  <p><strong>Make Grok great in the terminal.</strong></p>
 </div>
 
----
+GrokForge exists because using Grok from a terminal should feel like a serious development tool, not a chat window wired to `sh`.
 
-> **Status: pre-release (v0.1 in progress).** GrokForge is being built in the open. Interfaces will change until the first tagged release.
+Today it can read and edit project files, run commands, keep a session going, and hand isolated work to a subagent. When a command needs to cross a safety boundary, GrokForge stops and asks.
 
-GrokForge is a terminal AI coding agent that uses xAI's Grok models to read, edit, and run code in your project — with three things the alternatives don't give you together:
+This is a pre-release project. The execution and safety paths are in place; rendering, automatic context selection, and distribution still need work.
 
-- **You see every byte that leaves your machine.** The **context ledger** shows exactly which files and how many bytes go to the API on every request, with secret redaction on by default. No telemetry. Bring your own API key.
-- **Commands run in an OS-native sandbox.** Filesystem writes are confined to your workspace and network is denied by default, enforced by the kernel (Landlock + seccomp on Linux, Seatbelt on macOS) — not by the honor system.
-- **It works like git should.** Every change the agent makes is a real commit with a good message. `/undo` reverts cleanly. Subagents run in isolated worktrees.
+## What works today
 
-## Why GrokForge
+- Streaming conversations in a native Rust TUI
+- Headless runs for scripts and CI
+- File read, write, edit, list, glob, and grep tools
+- Sandboxed shell commands with approval controls
+- Read-only plan mode
+- Persistent sessions with resume support
+- Isolated subagent worktrees with scoped commits
+- A context ledger that accounts for the request body sent to Grok
+- Secret redaction, bounded output, and no telemetry
 
-| | GrokForge | Grok Build (xAI) | grok-cli (superagent) | Aider |
-|---|---|---|---|---|
-| Open source | ✅ MIT OR Apache-2.0 | ❌ closed | ✅ | ✅ |
-| Bring your own key (no subscription) | ✅ | ❌ | ✅ | ✅ |
-| See exactly what's sent (context ledger) | ✅ | ❌ | ❌ | ❌ |
-| OS-native cross-platform sandbox | ✅ | partial | macOS only | ❌ |
-| Git-native workflow | ✅ | ✅ | partial | ✅ |
-| Native `x_search` / live X data | ✅ | ✅ | ❌ | ❌ |
-| Actively maintained | ✅ | ✅ | ~ | ❌ (since Aug 2025) |
+## Why another Grok CLI?
 
-## Sandbox capability by platform
+Because Grok deserves a CLI built for real repositories, not a thin wrapper around an API call.
 
-We state this plainly rather than overpromising:
+Three constraints shape the implementation:
 
-| Platform | v0.1 enforcement |
-|---|---|
-| **Linux** (kernel ≥ 5.13) | Landlock filesystem confinement + seccomp network-deny, in-process. Degradation is surfaced, never silent. |
-| **macOS** | Seatbelt (`sandbox-exec`) profile generated per policy; startup self-test with graceful fallback. |
-| **Windows** | Approval-only in v0.1. **Run GrokForge inside WSL2 for the full Linux sandbox.** Native Windows sandboxing is planned (see Roadmap). |
+- Normal shell commands cannot write outside the workspace or use the network.
+- Sandboxed commands cannot modify Git metadata.
+- If the requested sandbox cannot be enforced, the command does not run.
 
-## Install
+## Build it
 
-_Installers land with the v0.1 release. For now, build from source:_
+You need Rust 1.88 or newer.
 
 ```sh
-git clone https://github.com/grokforge/grokforge
-cd grokforge
+git clone https://github.com/mahdi-salmanzade/GrokForge.git
+cd GrokForge
 cargo build --release
-./target/release/grokforge --help
 ```
 
-Requires a recent stable Rust toolchain (edition 2024).
-
-## Quick start
+Set your xAI key and start the TUI:
 
 ```sh
-export XAI_API_KEY=...          # or run `grokforge login` to store it in your OS keyring
-grokforge                       # interactive TUI in the current repo
-grokforge exec -p "fix the failing tests"   # headless, for scripts and CI
+export XAI_API_KEY=your_key_here
+./target/release/grokforge
 ```
 
-## Roadmap (planned — not yet shipped)
+Or run one task without opening the TUI:
 
-Multi-provider fallback (OpenAI/Anthropic/Ollama) · L7 domain-allowlist network proxy · native Windows sandboxing · semantic (embedding) code index · ACP editor embedding · voice / remote control. Anything above is a goal, not a claim.
+```sh
+./target/release/grokforge exec -p "find the bug and explain the fix"
+```
 
-## Non-goals for v0.1
+Useful commands:
 
-Being a general multi-provider agent (we are Grok-first by design) · a GUI/desktop app · replacing your editor. See `docs/design/` for the full design record and `docs/decisions/` for architecture decisions.
+```sh
+grokforge doctor
+grokforge sessions
+grokforge resume
+grokforge exec --plan -p "plan the refactor"
+```
 
-## Security & privacy
+## Safety
 
-GrokForge makes **no network calls except to endpoints you explicitly configure**, and every one is visible in the context ledger. MCP servers you connect are external processes; their egress is outside our audit scope and flagged as such. Content returned by web/X search and MCP tools is untrusted input to an agent with edit and shell tools — the approval workflow and sandbox are the mitigations. See `SECURITY.md` (coming with v0.1) for the threat model.
+macOS uses Seatbelt. Linux uses Bubblewrap 0.11.2 or newer. Native Windows confinement is not ready; use WSL2 for now.
+
+Commands start with a stripped-down environment, Git metadata stays protected, common secret paths are blocked, and normal workspace mode has no network access. [SECURITY.md](SECURITY.md) documents the exact boundaries and known gaps. Read it before using `--preset yolo` or running GrokForge on code you do not trust.
+
+## Still being built
+
+- Rich Markdown and diff rendering
+- The repository map and smarter automatic context selection
+- Foreground auto-commit and a practical undo workflow
+- Keyring login and full session search
+- A user-facing trust flow for MCP servers
+- Native Windows enforcement
+- Signed installers and package-manager releases
+
+## Work on GrokForge
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo deny check
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the project rules and [docs/design](docs/design) for the design record.
 
 ## License
 
-Dual-licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
+[MIT](LICENSE)
+
+Grok is a trademark of xAI. GrokForge is an independent project and is not affiliated with or endorsed by xAI.

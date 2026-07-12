@@ -45,6 +45,12 @@ pub enum ApprovalKind {
     Network { host: String },
     /// Call an MCP tool.
     McpToolCall { server: String, tool: String },
+    /// Retry an operation outside the sandbox after a classified denial. Keeping this structural
+    /// prevents a pre-granted lexical write boundary from silently authorizing a broader retry.
+    SandboxEscalation {
+        original: Box<ApprovalKind>,
+        denial: DenialClass,
+    },
 }
 
 /// A pending approval the frontend must answer.

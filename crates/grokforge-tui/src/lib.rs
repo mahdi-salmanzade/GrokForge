@@ -38,14 +38,88 @@ pub async fn run(
 /// records session metadata so the session appears in `grokforge sessions`.
 pub async fn run_session(
     client: XaiClient,
-    session: Session,
+    mut session: Session,
     status_preset: String,
 ) -> io::Result<()> {
-    let (events_tx, events_rx) = mpsc::unbounded_channel();
-    let (approver, approvals_rx) = ChannelApprover::new();
+    // Acquire the session's lifetime lock and refresh persisted history before repository checks,
+    // MCP process startup, or any other preflight side effect. A second resume fails here.
+    let dir = sessions_dir()?;
+    let metadata_path = dir.join(format!("rollout-{}.meta.json", session.id.as_uuid()));
+    let metadata_exists = tokio::fs::try_exists(&metadata_path).await.unwrap_or(false);
+    let rollout = match RolloutWriter::open_and_read(&dir, session.id).await {
+        Ok((rollout, persisted_history)) => {
+            if metadata_exists {
+                session.history = persisted_history;
+            }
+            Some(rollout)
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("could not open durable session transcript: {error}"),
+            ));
+        }
+    };
 
+    run_session_ready(
+        client,
+        session,
+        rollout,
+        status_preset,
+        metadata_exists,
+        dir,
+    )
+    .await
+}
+
+/// Launch a session whose rollout has already been exclusively opened and atomically read.
+/// Resume frontends use this so locking happens before workspace, Git, and API preflight.
+pub async fn run_locked_session(
+    client: XaiClient,
+    session: Session,
+    rollout: RolloutWriter,
+    status_preset: String,
+) -> io::Result<()> {
+    let dir = sessions_dir()?;
+    let metadata_path = dir.join(format!("rollout-{}.meta.json", session.id.as_uuid()));
+    let metadata_exists = tokio::fs::try_exists(&metadata_path).await.unwrap_or(false);
+    run_session_ready(
+        client,
+        session,
+        Some(rollout),
+        status_preset,
+        metadata_exists,
+        dir,
+    )
+    .await
+}
+
+async fn run_session_ready(
+    client: XaiClient,
+    mut session: Session,
+    rollout: Option<RolloutWriter>,
+    status_preset: String,
+    metadata_exists: bool,
+    dir: std::path::PathBuf,
+) -> io::Result<()> {
     let model = session.config.model.clone();
     let workspace = session.config.workspace_root.clone();
+
+    // Metadata and rollout are the canonical recovery record. Finish both before Git inspection,
+    // MCP process startup, or the first model request.
+    if !metadata_exists {
+        let meta = SessionMeta::new(session.id, workspace.clone(), model.clone(), "");
+        meta.write(&dir, session.id).await.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("could not persist session metadata: {error}"),
+            )
+        })?;
+    }
+
+    let auto_commit_warning = protect_user_changes(&mut session);
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    let (approver, approvals_rx) = ChannelApprover::new();
 
     let mut registry = ToolRegistry::with_builtins();
     grokforge_core::mcp_config::connect_and_register(&workspace, &mut registry).await;
@@ -61,11 +135,6 @@ pub async fn run_session(
         .interactive(),
     );
 
-    let dir = sessions_dir();
-    let rollout = RolloutWriter::create(&dir, session.id).await.ok();
-    let meta = SessionMeta::new(session.id, workspace, model.clone(), "");
-    let _ = meta.write(&dir, session.id).await;
-
     let mut app = App::new(
         agent,
         session,
@@ -75,23 +144,131 @@ pub async fn run_session(
         model,
         status_preset,
     );
+    if let Some(warning) = auto_commit_warning {
+        app.push_info(warning);
+    }
 
-    let mut terminal = setup_terminal()?;
-    let result = app.run(&mut terminal).await;
-    restore_terminal(&mut terminal)?;
-    result
+    let mut terminal = TerminalGuard::new(setup_terminal()?);
+    let result = app.run(terminal.get_mut()).await;
+    let restore = terminal.restore();
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => restore,
+    }
+}
+
+fn protect_user_changes(session: &mut Session) -> Option<String> {
+    if !session.config.auto_commit {
+        return None;
+    }
+    let git = grokforge_git::Git::discover(&session.config.workspace_root)?;
+    match git.is_dirty() {
+        Ok(false) => None,
+        Ok(true) => {
+            session.config.auto_commit = false;
+            Some("auto-commit disabled: workspace had pre-existing uncommitted changes".to_string())
+        }
+        Err(error) => {
+            session.config.auto_commit = false;
+            Some(format!(
+                "auto-commit disabled: could not verify clean workspace ({error})"
+            ))
+        }
+    }
 }
 
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    Terminal::new(CrosstermBackend::new(stdout))
+    if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(error);
+    }
+    match Terminal::new(CrosstermBackend::new(stdout)) {
+        Ok(terminal) => Ok(terminal),
+        Err(error) => {
+            let mut stdout = io::stdout();
+            let _ = execute!(stdout, LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            Err(error)
+        }
+    }
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
+    let mut first_error = None;
+    if let Err(error) = terminal.show_cursor() {
+        first_error = Some(error);
+    }
+    if let Err(error) = execute!(terminal.backend_mut(), LeaveAlternateScreen)
+        && first_error.is_none()
+    {
+        first_error = Some(error);
+    }
+    if let Err(error) = disable_raw_mode()
+        && first_error.is_none()
+    {
+        first_error = Some(error);
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+#[derive(Debug)]
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+    restored: bool,
+}
+
+impl TerminalGuard {
+    fn new(terminal: Terminal<CrosstermBackend<Stdout>>) -> Self {
+        Self {
+            terminal,
+            restored: false,
+        }
+    }
+
+    fn get_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
+        &mut self.terminal
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        let result = restore_terminal(&mut self.terminal);
+        self.restored = result.is_ok();
+        result
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = restore_terminal(&mut self.terminal);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use std::process::Command;
+
+    use super::*;
+
+    #[test]
+    fn dirty_workspace_disables_auto_commit() {
+        let dir = tempfile::tempdir().expect("workspace");
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        std::fs::write(dir.path().join("user.txt"), "user change\n").expect("user change");
+        let mut session = Session::new(SessionConfig::new(dir.path().to_path_buf(), "model"));
+        let warning = protect_user_changes(&mut session);
+        assert!(!session.config.auto_commit);
+        assert!(warning.is_some());
+    }
 }

@@ -143,6 +143,110 @@ async fn ignores_keepalive_comments_and_unknown_events() {
 }
 
 #[tokio::test]
+async fn malformed_json_frame_is_reported_as_retriable_stream_error() {
+    let mock = MockXai::builder()
+        .route(
+            "/v1/responses",
+            Reply::sse_frames(&["data: {not-json}\n\n"]),
+        )
+        .start()
+        .await;
+
+    let client = fast_client(&mock);
+    let mut stream = client.stream(&simple_req()).await.expect("stream");
+    let error = stream
+        .next()
+        .await
+        .expect("error event")
+        .expect_err("malformed JSON must fail the stream");
+    assert!(matches!(error, XaiError::Stream(_)));
+    assert!(error.is_retriable());
+}
+
+#[tokio::test]
+async fn eof_before_completed_is_reported_as_stream_error() {
+    let mock = MockXai::builder()
+        .route("/v1/responses", Reply::sse_events(&[text_delta("partial")]))
+        .start()
+        .await;
+
+    let client = fast_client(&mock);
+    let mut stream = client.stream(&simple_req()).await.expect("stream");
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(StreamEvent::TextDelta(text))) if text == "partial"
+    ));
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(XaiError::Stream(_)))
+    ));
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn done_sentinel_before_completed_is_reported_as_stream_error() {
+    let mock = MockXai::builder()
+        .route("/v1/responses", Reply::sse_frames(&["data: [DONE]\n\n"]))
+        .start()
+        .await;
+
+    let client = fast_client(&mock);
+    let mut stream = client.stream(&simple_req()).await.expect("stream");
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(XaiError::Stream(_)))
+    ));
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn incomplete_event_finishes_with_max_tokens_reason() {
+    let mock = MockXai::builder()
+        .route(
+            "/v1/responses",
+            Reply::sse_events(&[json!({
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"}
+                }
+            })]),
+        )
+        .start()
+        .await;
+
+    let client = fast_client(&mock);
+    let got = collect(client.stream(&simple_req()).await.expect("stream")).await;
+    assert_eq!(
+        got,
+        vec![StreamEvent::Completed {
+            stop: StopReason::MaxTokens
+        }]
+    );
+}
+
+#[tokio::test]
+async fn failed_event_surfaces_nested_api_message() {
+    let mock = MockXai::builder()
+        .route(
+            "/v1/responses",
+            Reply::sse_events(&[json!({
+                "type": "response.failed",
+                "response": {"error": {"message": "provider exploded"}}
+            })]),
+        )
+        .start()
+        .await;
+
+    let client = fast_client(&mock);
+    let mut stream = client.stream(&simple_req()).await.expect("stream");
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(XaiError::ApiStreamError(message))) if message == "provider exploded"
+    ));
+}
+
+#[tokio::test]
 async fn whole_chunk_tool_call_is_surfaced() {
     let mock = MockXai::builder()
         .route(
@@ -150,6 +254,7 @@ async fn whole_chunk_tool_call_is_surfaced() {
             Reply::sse_events(&[
                 json!({
                     "type": "response.output_item.done",
+                    "output_index": 0,
                     "item": {
                         "type": "function_call",
                         "id": "fc_1",
@@ -174,6 +279,7 @@ async fn whole_chunk_tool_call_is_surfaced() {
         })
         .expect("tool call present");
     assert_eq!(call.call_id, "call_42");
+    assert_eq!(call.output_index, 0);
     assert_eq!(call.name, "read_file");
     assert_eq!(call.arguments, r#"{"path":"src/main.rs"}"#);
     assert!(matches!(
@@ -194,7 +300,7 @@ async fn tool_call_arguments_reassembled_from_deltas() {
             Reply::sse_events(&[
                 json!({"type":"response.function_call_arguments.delta","item_id":"fc_9","delta":"{\"q\":"}),
                 json!({"type":"response.function_call_arguments.delta","item_id":"fc_9","delta":"\"hi\"}"}),
-                json!({"type":"response.output_item.done","item":{"type":"function_call","id":"fc_9","call_id":"c9","name":"search","arguments":""}}),
+                json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_9","call_id":"c9","name":"search","arguments":""}}),
                 json!({"type":"response.completed","response":{"status":"requires_action"}}),
             ]),
         )
@@ -211,6 +317,45 @@ async fn tool_call_arguments_reassembled_from_deltas() {
         })
         .expect("tool call present");
     assert_eq!(call.arguments, r#"{"q":"hi"}"#);
+}
+
+#[tokio::test]
+async fn encrypted_reasoning_output_is_preserved_for_stateless_replay() {
+    let mock = MockXai::builder()
+        .route(
+            "/v1/responses",
+            Reply::sse_events(&[
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "reasoning",
+                        "id": "rs_provider_1",
+                        "status": "completed",
+                        "summary": [{"type":"summary_text","text":"brief"}],
+                        "encrypted_content": "opaque+ciphertext=="
+                    }
+                }),
+                completed_with_usage(),
+            ]),
+        )
+        .start()
+        .await;
+
+    let client = fast_client(&mock);
+    let got = collect(client.stream(&simple_req()).await.expect("stream")).await;
+    let reasoning = got
+        .iter()
+        .find_map(|event| match event {
+            StreamEvent::EncryptedReasoning(reasoning) => Some(reasoning),
+            _ => None,
+        })
+        .expect("encrypted reasoning event");
+    assert_eq!(reasoning.id, "rs_provider_1");
+    assert_eq!(reasoning.output_index, 0);
+    assert_eq!(reasoning.status, "completed");
+    assert_eq!(reasoning.summary[0]["text"], "brief");
+    assert_eq!(reasoning.encrypted_content, "opaque+ciphertext==");
 }
 
 #[tokio::test]
@@ -253,13 +398,13 @@ async fn retries_429_then_succeeds() {
         .await;
 
     let client = fast_client(&mock);
-    let got = collect(
-        client
-            .stream(&simple_req())
-            .await
-            .expect("stream after retry"),
-    )
-    .await;
+    let mut attempts = Vec::new();
+    let stream = client
+        .stream_with_attempt_observer(&simple_req(), |attempt| attempts.push(attempt))
+        .await
+        .expect("stream after retry");
+    assert_eq!(stream.request_attempts(), 2);
+    let got = collect(stream).await;
     let text: String = got
         .iter()
         .filter_map(|e| match e {
@@ -268,7 +413,12 @@ async fn retries_429_then_succeeds() {
         })
         .collect();
     assert_eq!(text, "recovered");
-    assert_eq!(mock.received().len(), 2, "should have retried exactly once");
+    let received = mock.received();
+    assert_eq!(received.len(), 2, "should have retried exactly once");
+    assert_eq!(attempts.len(), 2, "every send must be observable");
+    for (attempt, request) in attempts.iter().zip(&received) {
+        assert_eq!(attempt.request_bytes, request.body_len());
+    }
 }
 
 #[tokio::test]
@@ -281,6 +431,59 @@ async fn auth_error_is_not_retried() {
     let err = client.stream(&simple_req()).await.expect_err("should fail");
     assert!(matches!(err, XaiError::Auth { status: 401, .. }));
     assert_eq!(mock.received().len(), 1, "auth failures must not retry");
+}
+
+#[tokio::test]
+async fn every_failed_retry_attempt_is_observable_for_egress_accounting() {
+    let mock = MockXai::builder()
+        .route("/v1/responses", Reply::status_with_retry_after(503, None))
+        .start()
+        .await;
+    let client = fast_client(&mock);
+    let mut attempts = Vec::new();
+    let error = client
+        .stream_with_attempt_observer(&simple_req(), |attempt| attempts.push(attempt))
+        .await
+        .expect_err("repeated 503 must eventually fail");
+    assert!(matches!(error, XaiError::Server { status: 503, .. }));
+
+    let received = mock.received();
+    assert_eq!(received.len(), 4);
+    assert_eq!(attempts.len(), received.len());
+    for (attempt, request) in attempts.iter().zip(&received) {
+        assert_eq!(attempt.request_bytes, request.body_len());
+    }
+}
+
+#[tokio::test]
+async fn redirects_cannot_replay_context_to_another_origin() {
+    let sink = MockXai::builder()
+        .route("/capture", Reply::sse_events(&[completed_with_usage()]))
+        .start()
+        .await;
+    let source = MockXai::builder()
+        .route(
+            "/v1/responses",
+            Reply::Http {
+                status: 307,
+                headers: vec![("location".into(), format!("{}/capture", sink.base_url()))],
+                body: Vec::new(),
+            },
+        )
+        .start()
+        .await;
+
+    let client = fast_client(&source);
+    let error = client
+        .stream(&simple_req())
+        .await
+        .expect_err("redirect must be surfaced, not followed");
+    assert!(matches!(error, XaiError::Api { status: 307, .. }));
+    assert_eq!(source.received().len(), 1);
+    assert!(
+        sink.received().is_empty(),
+        "request body must not reach redirect target"
+    );
 }
 
 #[tokio::test]
@@ -320,7 +523,7 @@ async fn list_and_validate_models() {
             Reply::json(
                 200,
                 &json!({"object":"list","data":[
-                    {"id":"grok-build-0.1","owned_by":"xai"},
+                    {"id":"grok-build-0.1","owned_by":"xai","aliases":["grok-build-latest"],"context_length":256_000},
                     {"id":"grok-4.5","owned_by":"xai"}
                 ]}),
             ),
@@ -331,11 +534,17 @@ async fn list_and_validate_models() {
 
     let models = client.list_models().await.expect("models");
     assert_eq!(models.len(), 2);
+    assert_eq!(models[0].context_window, Some(256_000));
 
     client
         .validate_model("grok-build-0.1")
         .await
         .expect("known model ok");
+
+    client
+        .validate_model("grok-build-latest")
+        .await
+        .expect("advertised alias is valid");
 
     let err = client
         .validate_model("grok-code-fast-1")
@@ -348,4 +557,49 @@ async fn list_and_validate_models() {
         }
         other => panic!("expected UnknownModel, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn oversized_models_response_is_rejected_before_json_decode() {
+    let mock = MockXai::builder()
+        .route(
+            "/v1/models",
+            Reply::Http {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: vec![b' '; 2 * 1024 * 1024 + 1],
+            },
+        )
+        .start()
+        .await;
+    let client = fast_client(&mock);
+    let error = client
+        .list_models()
+        .await
+        .expect_err("oversized model list must fail");
+    assert!(matches!(error, XaiError::Stream(message) if message.contains("models response body")));
+}
+
+#[tokio::test]
+async fn oversized_error_body_is_reduced_to_a_bounded_message() {
+    let mock = MockXai::builder()
+        .route(
+            "/v1/responses",
+            Reply::Http {
+                status: 400,
+                headers: vec![("content-type".into(), "text/plain".into())],
+                body: vec![b'x'; 256 * 1024],
+            },
+        )
+        .start()
+        .await;
+    let client = fast_client(&mock);
+    let error = client
+        .stream(&simple_req())
+        .await
+        .expect_err("400 must fail");
+    let XaiError::Api { message, .. } = error else {
+        panic!("expected API error");
+    };
+    assert_eq!(message.len(), 200);
 }

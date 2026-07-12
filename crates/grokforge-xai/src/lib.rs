@@ -19,9 +19,9 @@ mod model;
 mod request;
 mod stream;
 
-pub use client::{RetryConfig, XaiClient};
+pub use client::{RequestAttempt, RetryConfig, XaiClient};
 pub use error::XaiError;
-pub use event::{StopReason, StreamEvent, ToolCall, Usage};
+pub use event::{EncryptedReasoning, StopReason, StreamEvent, ToolCall, Usage};
 pub use model::ModelInfo;
 pub use request::{
     ContentPart, Effort, FunctionTool, InputItem, Reasoning, ResponsesRequest, Role, ToolDef,

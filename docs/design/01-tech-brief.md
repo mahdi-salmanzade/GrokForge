@@ -31,7 +31,7 @@ Synthesized from 5 research reports: **[xai-api]**, **[rust-stack]**, **[sandbox
 | PTY / exec | portable-pty | 0.9.0 | codex-validated [rust-stack] |
 | Release | cargo-dist + cargo-binstall artifacts | 0.32.0 / 1.20.1 | Shell/PowerShell/Homebrew installers are table stakes; watch cadence (axo shutdown) [rust-stack] |
 | Testing | insta (TUI frame snapshots) + color-eyre | 1.48 / 0.6.5 | codex-validated [rust-stack] |
-| License | Apache-2.0 | — | Clean OSI license is differentiator #1; enables cribbing codex-rs code legally; avoid FSL (crush's contributor problem) [competitors] |
+| License | MIT | — | Short, permissive, familiar, and compatible with broad open-source adoption. |
 
 **Flagged cross-report conflict:** [competitors] recommends AppContainer for Windows sandboxing; [sandbox] documents that OpenAI explicitly evaluated and **rejected** AppContainer (capability model wrong shape) in favor of restricted tokens. Resolved: restricted tokens (see §3).
 
@@ -73,7 +73,7 @@ Architecture (all phases): one platform-agnostic `SandboxPolicy` struct (writabl
 
 **MVP (ship with v1)**
 - **Linux:** in-process, zero external deps — landlock 0.4.5 at ABI::V5 BestEffort (read-only `/`, full access on writable roots + /dev/null) **+** seccompiler network-deny filter (EPERM on connect/bind/listen/sendto etc. except AF_UNIX; hard-block io_uring_setup/enter/register, ptrace, process_vm_*) **+** `PR_SET_NO_NEW_PRIVS`. Surface `RulesetStatus` in the TUI — never silently degrade. Kernel floor 5.13.
-- **macOS:** dynamically generated SBPL exec'd via hardcoded `/usr/bin/sandbox-exec -p <policy> -D PARAM=path` — paths always as `-D` parameters (never string-interpolated; injection risk). Start from codex's Apache-2.0 `seatbelt_base_policy.sbpl`. Startup self-test (`sandbox-exec -n no-network true`) with graceful approval-only fallback.
+- **macOS:** dynamically generated SBPL exec'd via hardcoded `/usr/bin/sandbox-exec -p <policy> -D PARAM=path` — paths always as `-D` parameters (never string-interpolated; injection risk). Author the policy locally from documented platform behavior. Startup self-test (`sandbox-exec -n no-network true`) with graceful approval-only fallback.
 - **Windows:** delegate to WSL2 (run the Linux backend inside), native fallback = sandbox-off + explicit per-command approval. Matches Claude Code/nono; already beats nothing.
 - Default-deny egress in workspace-write mode from day one.
 
@@ -96,7 +96,7 @@ Architecture (all phases): one platform-agnostic `SandboxPolicy` struct (writabl
 
 From **[competitors]**, with **[xai-api]** and **[sandbox]** support.
 
-1. **Grok Build's privacy scandal (full-repo + .env uploads to xAI GCS buckets, HN 48877371).** → Ship a **"context ledger"**: a TUI panel showing exactly which files/bytes leave the machine per request, with .env/secret redaction on by default and zero telemetry without opt-in. Apache-2.0, local-first, BYO API key (pay-as-you-go vs Grok Build's SuperGrok gate). This is the marketing wedge; the implementation must be airtight or HN will find the gap.
+1. **Grok Build's privacy scandal (full-repo + .env uploads to xAI GCS buckets, HN 48877371).** → Ship a **"context ledger"**: a TUI panel showing exactly which files/bytes leave the machine per request, with .env/secret redaction on by default and zero telemetry without opt-in. MIT-licensed, local-first, BYO API key (pay-as-you-go vs Grok Build's SuperGrok gate). This is the marketing wedge; the implementation must be airtight or HN will find the gap.
 
 2. **No open agent has Codex-class cross-platform sandboxing.** → The §3 plan **is** the feature. Headline it: read-only/workspace-write/full-access modes, default-deny network, per-command escalation. Don't overpromise Windows native before Phase 2 lands — that burns trust.
 
@@ -146,6 +146,6 @@ All from **[tui-patterns]** (codex-rs is the canonical reference), versions per 
 | 5 | **Linux userns restrictions** (Ubuntu 24.04 AppArmor breaks bwrap; Debian following) [sandbox] | Keep the namespace-free Landlock+seccomp path as automatic fallback; detect and print the AppArmor fix instead of failing cryptically |
 | 6 | **Windows native sandboxing is genuinely hard** (deny-read unenforceable unelevated; AV/GPO breakage) [sandbox][competitors] | Phase it (WSL2 → unelevated tokens → elevated dual-user); never market "cross-platform sandboxing" ahead of what's shipped |
 | 7 | **Ecosystem version cliffs** — ratatui 0.30 stranded widgets; reqwest 0.13 orphaned middleware; rmcp 2.x breaking + MCP spec drift; fastembed's exact ort rc pin [rust-stack] | Verify every widget crate declares ratatui ^0.30/ratatui-core ^0.1; isolate rmcp behind an internal trait; own the composer and markdown renderer (fewest third-party TUI deps); defer fastembed to post-MVP |
-| 8 | **Silent security degradation** — Landlock BestEffort no-ops on old/disabled kernels; Landlock alone can't block DNS/UDP exfil pre-ABI-10; io_uring bypasses socket-syscall deny lists [sandbox] | Always pair Landlock with the seccomp net filter; block io_uring/ptrace explicitly (copy codex's list); surface `RulesetStatus` in the TUI — never claim enforcement that isn't active |
+| 8 | **Silent security degradation** — Landlock BestEffort no-ops on old/disabled kernels; Landlock alone can't block DNS/UDP exfil pre-ABI-10; io_uring bypasses socket-syscall deny lists [sandbox] | Always pair Landlock with the seccomp net filter; block io_uring/ptrace explicitly; surface `RulesetStatus` in the TUI — never claim enforcement that isn't active |
 | 9 | **TUI perf/compat landmines** — O(n²) re-render, unicode-width emoji drift, OSC reply leakage, multiplexer breakage [tui-patterns] | The §5 decisions are the mitigations; add insta snapshot tests and a tmux/Zellij/SSH CI matrix from day one |
 | 10 | **Reputational blast radius on privacy claims** — any hidden telemetry or remote calls (opencode's title-generation scandal), unsigned binaries [competitors] | Context ledger + opt-in-only telemetry enforced in code review; sign/notarize macOS binaries; server-side tool calls ($5–10/1k) metered and displayed so users never get surprise bills [xai-api] |

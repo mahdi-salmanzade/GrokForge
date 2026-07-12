@@ -22,7 +22,7 @@ pub enum XaiError {
     Auth { status: u16, message: String },
 
     /// 429 — rate limited. `retry_after` carries the server's hint when present.
-    #[error("rate limited ({status}); retry after {retry_after:?}")]
+    #[error("rate limited ({status}); retry after {retry_after:?}: {message}")]
     RateLimited {
         status: u16,
         retry_after: Option<Duration>,
@@ -53,6 +53,10 @@ pub enum XaiError {
     /// A response body could not be deserialized.
     #[error("decode error: {0}")]
     Decode(#[source] serde_json::Error),
+
+    /// The fully serialized request would exceed the local egress/memory safety limit.
+    #[error("request body exceeds the {max}-byte safety limit")]
+    RequestTooLarge { max: usize },
 
     /// The API reported an error inside the stream (`error` / `response.failed` event).
     #[error("model reported error: {0}")]
@@ -85,5 +89,20 @@ impl XaiError {
 impl From<serde_json::Error> for XaiError {
     fn from(e: serde_json::Error) -> Self {
         XaiError::Decode(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_display_keeps_provider_message() {
+        let error = XaiError::RateLimited {
+            status: 429,
+            retry_after: Some(Duration::from_secs(2)),
+            message: "monthly spending limit reached".into(),
+        };
+        assert!(error.to_string().contains("monthly spending limit reached"));
     }
 }

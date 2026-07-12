@@ -1,7 +1,3 @@
-I have both inputs (the brief and the strategy doc). The project is greenfield, so this spec defines the UX from scratch, anchored to the brief's settled architecture (inline viewport + native scrollback, bottom-pane approvals, denial classifier, host-owned git mutations) and the five user-locked decisions. Below is the complete design document.
-
----
-
 # GrokForge v0.1 — UX Specification: TUI, Git-Native Workflow, Safety Surfaces
 
 Scope: full differentiator build (sandboxing, git-native, repo map/local RAG, MCP, skills, plan mode). Grok-only client against `api.x.ai/v1/responses` (base URL + model IDs are config). Binary: `grokforge`. Everything below is v0.1 unless tagged **[post-v0.1]**.
@@ -260,11 +256,16 @@ Real failures are handed to the model without a prompt. Under `on-failure` polic
 All mutations execute in the **trusted host process**; inside any sandbox, `.git/**` is deny-write (protected metadata in `SandboxPolicy`). Reads (`git status/log/diff/blame`) via gix in-process; mutations shell out to `git` CLI from the host.
 
 ### 5.1 When auto-commits happen
-Two triggers, both host-initiated, staging **only agent-touched paths** (`git add -- <paths>`; user's unrelated dirty files are never swept in):
-1. **Pre-command checkpoint:** immediately before the first shell command that follows ≥1 uncommitted agent edit in a turn — mechanical message `grokforge: checkpoint before \`cargo test\`` — so a command can never destroy unreviewed edits.
-2. **Turn end:** any remaining agent edits → one commit with a generated message.
+Foreground auto-commit is disabled in v0.1. Recording a path touched by a file tool is not enough
+to prove ownership: a user or sibling process can race a write to that same path before staging.
+Foreground edits therefore remain in the worktree for explicit review/commit.
 
-Net effect: ≥1 commit per mutating turn; edit→test→fix loops yield a small chain. `git.auto_commit = turn|off` (default `turn`); with `off`, `/diff` + `/commit` remain and /undo degrades to `git checkout -- <agent paths>` with confirm.
+Subagents are the safe exception. Each owns a mode-0700 worktree outside every parent project and
+stages only descriptor-safe `write_file`/`edit` paths at turn end when every tool used in that
+turn was an awaited built-in file/read operation. A shell, MCP, or custom tool disables the
+automatic commit because a descendant can outlive Seatbelt process-group cleanup and race a
+same-path write. Pre-command checkpoints remain a future design once content identity can be
+bound through staging.
 
 ### 5.2 Commit message format (structured outputs)
 Turn-end messages come from one cheap call (`git.commit_model`, default `grok-4.3`, effort low/none) with `response_format: json_schema`:
@@ -273,10 +274,9 @@ Turn-end messages come from one cheap call (`git.commit_model`, default `grok-4.
 ```
 Grokforge-Session: 8c2f…
 Grokforge-Turn: 14
-Co-Authored-By: <configurable, default "GrokForge <grokforge@localhost>">
 ```
 
-Author identity: user's git identity, committer `GrokForge` (configurable). Auto-commits run with hooks neutralized (`-c core.hooksPath=` + `--no-verify`) to close the hook-injection vector; `git.run_hooks = true` opts in; user-initiated `/commit` runs hooks by default. This call appears in the ledger like any other request (`#14 grok-4.3 · commit-msg · 0.9 KB`).
+Author and committer identity come from the user's Git configuration. Auto-commits run with hooks neutralized (`-c core.hooksPath=` + `--no-verify`) to close the hook-injection vector; `git.run_hooks = true` opts in; user-initiated `/commit` runs hooks by default. This call appears in the ledger like any other request (`#14 grok-4.3 · commit-msg · 0.9 KB`).
 
 ### 5.3 `/undo` semantics
 - Walks back from HEAD over commits with the current session's `Grokforge-Session` trailer **only**; stops at the first foreign commit ("next commit is yours — stopping").
@@ -303,7 +303,7 @@ If the agent later edits a file *you* have uncommitted changes in, that edit alw
 
 ### 5.6 Worktree-per-subagent lifecycle
 For each subagent (≤8, plan-mode fan-out or `/agents`):
-1. **Create:** host runs `git worktree add .grokforge/worktrees/<agent-id> -b gf/agent/<id> <session-branch>`; the subagent's `SandboxPolicy` writable root = that worktree (+ its tmp); it cannot see sibling worktrees; its `.git` file/dir remains deny-write.
+1. **Create:** host runs `git worktree add <per-user-data>/worktrees/<agent-id> -b gf/agent/<id> <session-branch>` under an owner-private root outside all parent projects; the subagent's `SandboxPolicy` writable root = only that worktree. Its `.git` file/dir remains deny-write.
 2. **Run:** subagent's edits/commits follow §5.1–5.2 with `Grokforge-Agent: <id>` trailer; its approvals funnel into the main queue tagged `[agent <id>]`; `/agents` shows live status/cost per worktree.
 3. **Merge-or-discard:** completion produces a result card in `/agents`: `m` merge (host: squash-merge `gf/agent/<id>` into the session branch; conflicts open a special approval with the conflict diff and `[k]eep mine / [t]ake agent / [e]dit later` per file), `x` discard (`git worktree remove --force` + `git branch -D`).
 4. **Cleanup:** worktrees pruned at session end; startup scans `.grokforge/worktrees` + `git worktree prune` for orphans (crash recovery) and offers resume-or-discard.
@@ -343,7 +343,7 @@ CI example:
 
 Sequential wizard on first `grokforge` launch (each step skippable via flags/env; re-runnable via `grokforge setup`):
 
-1. **Welcome** — one screen: name, version, "MIT OR Apache-2.0", the privacy promise ("the only network calls go to the API endpoint you configure — verify anytime with Ctrl+O").
+1. **Welcome** — one screen: name, version, "MIT", the privacy promise ("the only network calls go to the API endpoint you configure — verify anytime with Ctrl+O").
 2. **API key** — `XAI_API_KEY` env detected → offer to store in the OS keyring (keyring crate, `spawn_blocking`; encrypted-file fallback on headless Linux, path printed); else masked paste prompt. Never written to config files.
 3. **Model validation** — spinner on `GET /v1/models`; table of available models (id, ctx, $/M in/out, reasoning); default suggestion `grok-build-0.1` (agentic) + `grok-4.5` (plan); any *configured* slug missing from the list gets a loud warning (retired slugs silently redirect and re-price — brief §2). Base URL shown as editable config, not a constant.
 4. **Sandbox self-test** — platform probes, results table:
@@ -367,9 +367,7 @@ Embedding-based semantic index (UX surfaces unchanged) · L7 domain-allowlist pr
 
 ### Critical Files for Implementation
 (Greenfield — proposed paths; the brief is the settled input.)
-- /tmp/grokforge_brief.md — settled stack/architecture decisions this spec binds to
-- /Users/intzero/Documents/GrokForge/crates/grokforge-tui/src/app.rs — event loop (crossterm EventStream + tokio::select), inline viewport, insert_before scrollback commit, overlay routing
-- /Users/intzero/Documents/GrokForge/crates/grokforge-tui/src/bottom_pane/mod.rs — composer widget, approval modal, @-mention/slash popups, status line
-- /Users/intzero/Documents/GrokForge/crates/grokforge-core/src/git/workflow.rs — host-side git engine: auto-commit triggers, trailers, /undo, worktree-per-subagent lifecycle
-- /Users/intzero/Documents/GrokForge/crates/grokforge-core/src/ledger.rs — context-ledger choke point: per-request byte accounting, redaction pipeline, audit JSON
-- /Users/intzero/Documents/GrokForge/crates/grokforge-sandboxing/src/policy.rs — SandboxPolicy, per-platform backends, denial classifier, RulesetStatus surfacing
+- `crates/grokforge-tui/src/app.rs` — event loop and terminal UI.
+- `crates/grokforge-core/src/turn.rs` — turn lifecycle, Git workflow, and subagents.
+- `crates/grokforge-core/src/context.rs` — context ledger and redaction boundary.
+- `crates/grokforge-sandbox/src/lib.rs` — sandbox selection and policy boundary.

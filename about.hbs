@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>GrokForge third-party licenses</title>
+  <style>
+    body { font-family: sans-serif; line-height: 1.5; margin: 2rem auto; max-width: 70rem; padding: 0 1rem; }
+    table { border-collapse: collapse; width: 100%; }
+    td, th { border-bottom: 1px solid #ccc; padding: 0.35rem; text-align: left; }
+    pre { border: 1px solid #ccc; overflow: auto; padding: 1rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>GrokForge third-party licenses</h1>
+  <p>This file lists the third-party components included in GrokForge and the license terms selected for distribution.</p>
+  <table>
+    <thead><tr><th>Component</th><th>Version</th><th>License</th></tr></thead>
+    <tbody>
+    {{#each crates}}
+      <tr>
+        <td><a href="{{#if package.repository}}{{package.repository}}{{else}}https://crates.io/crates/{{package.name}}{{/if}}">{{package.name}}</a></td>
+        <td>{{package.version}}</td>
+        <td>{{license}}</td>
+      </tr>
+    {{/each}}
+    </tbody>
+  </table>
+  {{#each overview}}
+    <h2 id="{{id}}">{{name}}</h2>
+    <pre>{{text}}</pre>
+  {{/each}}
+</body>
+</html>

@@ -1,4 +1,4 @@
-# cargo-deny — mechanically enforces the dual-license decision (docs/decisions/0001)
+# cargo-deny — dependency license and advisory policy
 # and keeps copyleft/Fair-Source deps out of the tree.
 
 [graph]
@@ -6,7 +6,7 @@ all-features = true
 
 [licenses]
 version = 2
-# Only OSI-permissive licenses that are compatible with `MIT OR Apache-2.0`.
+# Only permissive dependency licenses that are compatible with this MIT project.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -19,6 +19,9 @@ allow = [
     "Unicode-DFS-2016",
     "CC0-1.0",
     "MPL-2.0",
+    # Mozilla's CA certificate data, pulled by rustls/webpki-roots. This permissive data license
+    # does not impose copyleft terms on GrokForge's source or binaries.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 # Explicitly deny the families we never want (GPL copyleft, Fair Source).

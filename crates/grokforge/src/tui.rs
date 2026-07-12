@@ -7,6 +7,13 @@ use grokforge_protocol::{ApprovalPolicy, SandboxMode};
 use grokforge_xai::XaiClient;
 
 pub async fn launch() -> ExitCode {
+    let workspace = match canonical_workspace() {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            eprintln!("cannot start TUI: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let Ok(api_key) = std::env::var("XAI_API_KEY") else {
         eprintln!("XAI_API_KEY is not set. Export it, or run `grokforge login` (lands in M8).");
         return ExitCode::from(3);
@@ -16,13 +23,16 @@ pub async fn launch() -> ExitCode {
     let client = match XaiClient::new(&base_url, api_key) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("client error: {e}");
+            eprintln!("client error: {}", crate::sanitize_terminal(&e.to_string()));
             return ExitCode::from(2);
         }
     };
+    let model = "grok-build-0.1";
+    if let Err(code) = crate::validate_model_startup(&client, model).await {
+        return code;
+    }
 
-    let workspace = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let config = SessionConfig::new(workspace, "grok-build-0.1")
+    let config = SessionConfig::new(workspace, model)
         // Default `auto` preset: workspace-write, ask before exceeding the sandbox.
         .with_policy(ApprovalPolicy::OnRequest, SandboxMode::WorkspaceWrite);
 
@@ -33,4 +43,15 @@ pub async fn launch() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn canonical_workspace() -> Result<std::path::PathBuf, String> {
+    let current = std::env::current_dir()
+        .map_err(|error| format!("current directory is unavailable: {error}"))?;
+    let workspace = std::fs::canonicalize(&current)
+        .map_err(|error| format!("cannot resolve {}: {error}", current.display()))?;
+    if !workspace.is_dir() {
+        return Err(format!("{} is not a directory", workspace.display()));
+    }
+    Ok(workspace)
 }

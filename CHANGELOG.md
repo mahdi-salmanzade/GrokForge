@@ -7,7 +7,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- M0 scaffold: Cargo workspace with 12 crates, dual `MIT OR Apache-2.0` licensing,
+- M0 scaffold: Cargo workspace with 12 crates, MIT licensing,
   `cargo-deny` license gate, CI matrix (Linux/macOS/Windows), and the design record
   under `docs/design/` and `docs/decisions/`.
 - M1 xAI client (`grokforge-xai`): typed `POST /v1/responses` request model, SSE streaming

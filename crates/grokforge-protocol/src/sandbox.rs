@@ -12,12 +12,14 @@ pub enum SandboxMode {
     ReadOnly,
     /// Write inside the workspace (and temp); network denied by default.
     WorkspaceWrite,
-    /// No confinement at all. The `yolo` preset.
+    /// Broad filesystem/network access for the `yolo` preset. A concrete policy may still carry
+    /// protected paths (notably Git/session metadata) that require an enforcing wrapper.
     DangerFullAccess,
 }
 
 impl SandboxMode {
-    /// Whether this mode confines anything at all.
+    /// Whether this mode requests the ordinary read/workspace confinement tier. This does not
+    /// imply that a full-access policy has no residual protected-path requirements.
     #[must_use]
     pub fn is_sandboxed(self) -> bool {
         !matches!(self, SandboxMode::DangerFullAccess)
@@ -90,7 +92,7 @@ impl SandboxPolicy {
         }
     }
 
-    /// No confinement.
+    /// Broad access while retaining the invariant that Git metadata is deny-write.
     #[must_use]
     pub fn danger_full_access(workspace: &Path) -> Self {
         Self {
@@ -106,15 +108,51 @@ impl SandboxPolicy {
     /// Whether `path` falls inside any writable root and is not a protected path.
     #[must_use]
     pub fn allows_write(&self, path: &Path) -> bool {
-        if self.protected_paths.iter().any(|p| path.starts_with(p)) {
+        let Some(path) = normalize_lexically(path) else {
+            return false;
+        };
+        if self.protected_paths.iter().any(|protected| {
+            normalize_lexically(protected).is_none_or(|protected| path.starts_with(protected))
+        }) {
             return false;
         }
         match self.mode {
             SandboxMode::DangerFullAccess => true,
             SandboxMode::ReadOnly => false,
-            SandboxMode::WorkspaceWrite => self.writable_roots.iter().any(|r| path.starts_with(r)),
+            SandboxMode::WorkspaceWrite => self
+                .writable_roots
+                .iter()
+                .filter_map(|root| normalize_lexically(root))
+                .any(|root| path.starts_with(root)),
         }
     }
+}
+
+/// Remove `.` and `..` components without touching the filesystem. Attempts to traverse above
+/// the path's lexical root fail closed. Symlink resolution remains the responsibility of the
+/// host-side file tool immediately before it performs I/O.
+fn normalize_lexically(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    return None;
+                }
+                normalized.pop();
+            }
+        }
+    }
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
 }
 
 /// Secret-bearing paths that are never read into context by default. Kept in one place so the
@@ -129,7 +167,19 @@ pub fn default_secret_globs() -> Vec<String> {
         "**/*.p12",
         "**/id_rsa",
         "**/id_ed25519",
+        "**/id_ecdsa",
+        "**/id_dsa",
         "**/*.pfx",
+        "**/.netrc",
+        "**/.npmrc",
+        "**/.pypirc",
+        "**/.git-credentials",
+        "**/.docker/config.json",
+        "**/.aws/credentials",
+        "**/.aws/config",
+        "**/.config/gcloud/application_default_credentials.json",
+        "**/.kube/config",
+        "**/credentials.json",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -148,6 +198,45 @@ mod tests {
         assert!(!policy.allows_write(&PathBuf::from("/etc/passwd")));
         // .git is protected even though it is inside the workspace.
         assert!(!policy.allows_write(&ws.join(".git/config")));
+    }
+
+    #[test]
+    fn workspace_write_rejects_parent_traversal_outside_workspace() {
+        let policy = SandboxPolicy::workspace_write(Path::new("/home/u/proj"));
+        assert!(!policy.allows_write(Path::new("/home/u/proj/../../../etc/passwd")));
+    }
+
+    #[test]
+    fn parent_traversal_cannot_bypass_protected_git_path() {
+        let policy = SandboxPolicy::workspace_write(Path::new("/home/u/proj"));
+        assert!(!policy.allows_write(Path::new("/home/u/proj/src/../.git/config")));
+    }
+
+    #[test]
+    fn empty_workspace_root_fails_closed() {
+        let policy = SandboxPolicy::workspace_write(Path::new(""));
+        assert!(!policy.allows_write(Path::new("relative.txt")));
+    }
+
+    #[test]
+    fn default_secret_globs_cover_common_package_and_cloud_credentials() {
+        let globs = default_secret_globs();
+        for expected in [
+            "**/.netrc",
+            "**/.npmrc",
+            "**/.pypirc",
+            "**/.git-credentials",
+            "**/.docker/config.json",
+            "**/.aws/credentials",
+            "**/.config/gcloud/application_default_credentials.json",
+            "**/.kube/config",
+            "**/credentials.json",
+        ] {
+            assert!(
+                globs.iter().any(|glob| glob == expected),
+                "missing {expected}"
+            );
+        }
     }
 
     #[test]

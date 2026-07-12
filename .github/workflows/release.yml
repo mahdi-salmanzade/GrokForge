@@ -6,11 +6,53 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  preflight:
+    name: verify release tag and gates
+    runs-on: ubuntu-latest
+    env:
+      GROKFORGE_REQUIRE_SANDBOX: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Verify tag matches the workspace version
+        shell: bash
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -er '[.packages[] | select(.source == null) | .version] | unique | if length == 1 then .[0] else error("workspace package versions differ") end')"
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: Install supported bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential meson ninja-build pkg-config libcap-dev libselinux1-dev
+          git clone --depth 1 --branch v0.11.2 https://github.com/containers/bubblewrap.git /tmp/bubblewrap
+          test "$(git -C /tmp/bubblewrap rev-parse HEAD)" = "1b80120ef26a28e065e67f89bfef873f13bdd317"
+          meson setup /tmp/bubblewrap/build /tmp/bubblewrap --prefix=/usr/local
+          meson compile -C /tmp/bubblewrap/build
+          sudo meson install -C /tmp/bubblewrap/build
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+      - name: Generate third-party license notices
+        run: |
+          cargo install cargo-about --locked --version 0.9.1 --features cli
+          cargo about generate --workspace --all-features --locked --fail about.hbs -o THIRD_PARTY_LICENSES.html
+      - name: Stage legal notices
+        uses: actions/upload-artifact@v4
+        with:
+          name: legal-notices
+          path: THIRD_PARTY_LICENSES.html
+          if-no-files-found: error
+
   build:
     name: build ${{ matrix.target }}
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -38,22 +80,58 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
       - name: Build
-        run: cargo build --release --bin grokforge --target ${{ matrix.target }}
+        run: cargo build --locked --release --bin grokforge --target ${{ matrix.target }}
+      - name: Fetch legal notices
+        uses: actions/download-artifact@v4
+        with:
+          name: legal-notices
+          path: legal
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
-          tar -C target/${{ matrix.target }}/release -czf grokforge-${{ matrix.target }}.tar.gz grokforge
+          package="grokforge-${{ matrix.target }}"
+          mkdir "$package"
+          cp target/${{ matrix.target }}/release/grokforge "$package/"
+          cp LICENSE legal/THIRD_PARTY_LICENSES.html "$package/"
+          tar -czf "$package.tar.gz" "$package"
+          shasum -a 256 grokforge-${{ matrix.target }}.tar.gz > grokforge-${{ matrix.target }}.tar.gz.sha256
       - name: Package (windows)
         if: runner.os == 'Windows'
         run: |
-          Compress-Archive -Path target/${{ matrix.target }}/release/grokforge.exe -DestinationPath grokforge-${{ matrix.target }}.zip
-      - name: Upload to release
+          $package = "grokforge-${{ matrix.target }}"
+          $archive = "$package.zip"
+          New-Item -ItemType Directory -Path $package
+          Copy-Item target/${{ matrix.target }}/release/grokforge.exe "$package/"
+          Copy-Item LICENSE, legal/THIRD_PARTY_LICENSES.html "$package/"
+          Compress-Archive -Path "$package/*" -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
+      - name: Stage release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grokforge-${{ matrix.target }}
+          path: |
+            grokforge-${{ matrix.target }}.tar.gz*
+            grokforge-${{ matrix.target }}.zip*
+          if-no-files-found: error
+
+  publish:
+    name: publish verified artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: grokforge-*
+          path: dist
+          merge-multiple: true
+      - name: Upload complete release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            grokforge-${{ matrix.target }}.tar.gz
-            grokforge-${{ matrix.target }}.zip
-          fail_on_unmatched_files: false
+          files: dist/*
+          fail_on_unmatched_files: true
 
   # macOS signing/notarization (rcodesign) and a Homebrew tap are wired here once the project has
   # signing credentials — see docs/design/03-roadmap.md (M11). Until then, macOS artifacts are

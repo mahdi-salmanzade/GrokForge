@@ -1,6 +1,6 @@
 # GrokForge v0.1 Implementation Roadmap
 
-Design document synthesized from `/tmp/grokforge_brief.md` (primary input) and the strategy doc at `/Users/intzero/Documents/GrokForge/Yes, there's a great opportunity here. You can bui`. All user-locked decisions honored: full differentiator v0.1, Grok-only in-house client (own crate, no provider trait), OS-native sandbox tier in v0.1, dual `MIT OR Apache-2.0` (codex-rs studied, never copied), name GrokForge / binary `grokforge`.
+Project decisions: full differentiator scope, a Grok-only in-house client, OS-native sandboxing in v0.1, the MIT License, and the `grokforge` binary.
 
 ---
 
@@ -33,8 +33,8 @@ M10 requires M2+M5+M6 (+M9 if subagents get MCP tools). M11 requires everything.
 
 **Deliverables**
 - Cargo workspace (layout in §2), all crates stubbed with `lib.rs` and one trivial test each; `crates/grokforge` binary prints version.
-- `LICENSE-MIT`, `LICENSE-APACHE`, `license = "MIT OR Apache-2.0"` in workspace `Cargo.toml`; `deny.toml` (cargo-deny) forbidding GPL/FSL-family deps and unknown licenses — this mechanically enforces user decision 4.
-- `README.md` (positioning, §2), `AGENTS.md` (dogfood, §2), `CONTRIBUTING.md` (incl. the codex-rs study-don't-copy rule and dual-license contribution clause), `rustfmt.toml`, workspace `[workspace.lints]`, `.gitignore`.
+- `LICENSE`, `license = "MIT"` in workspace `Cargo.toml`; `deny.toml` (cargo-deny) forbidding incompatible or unknown dependency licenses.
+- `README.md` (positioning, §2), `AGENTS.md` (dogfood, §2), `CONTRIBUTING.md`, `rustfmt.toml`, workspace `[workspace.lints]`, `.gitignore`.
 - `.github/workflows/ci.yml`: 3-OS matrix, fmt + `clippy -D warnings` + test + cargo-deny (§3).
 - Checklist item executed: "Grok" trademark exposure check (brief §4) — record outcome in a `docs/decisions/0001-name.md` ADR.
 - Version-cliff verification (risk #7): lock ratatui 0.30.2 / crossterm 0.29 / reqwest 0.13.4 / eventsource-stream 0.2.3 / rmcp 2.2 in workspace deps now; confirm every planned widget dep declares `ratatui ^0.30`.
@@ -201,9 +201,9 @@ Two internal tracks, parallelizable: (a) shell/input, (b) render pipeline.
 
 **Workspace layout**
 ```
-/Users/intzero/Documents/GrokForge/
-├── Cargo.toml                 # workspace; [workspace.lints]; license = "MIT OR Apache-2.0"
-├── LICENSE-MIT, LICENSE-APACHE
+GrokForge/
+├── Cargo.toml                 # workspace; [workspace.lints]; license = "MIT"
+├── LICENSE
 ├── README.md, AGENTS.md, CONTRIBUTING.md, CHANGELOG.md
 ├── rustfmt.toml, deny.toml, .gitignore
 ├── .github/workflows/{ci.yml,release.yml,nightly.yml}
@@ -224,8 +224,8 @@ Two internal tracks, parallelizable: (a) shell/input, (b) render pipeline.
 ```
 `grokforge-session` starts as a `core` module and splits out at M8 only if dependency pressure demands it.
 
-- **README positioning** (brief §4): headline "Open-source terminal coding agent for Grok — local-first, sandboxed, git-native." Bullets: BYO API key (no subscription), context ledger ("see every byte that leaves your machine"), cross-platform OS-native sandboxing **with an honest per-OS capability table** (Windows = WSL2 delegation, stated plainly — risk #6), Aider-class git workflow, MIT OR Apache-2.0. Comparison table vs Grok Build / grok-cli / Aider. Roadmap section lists multi-model, ACP, network proxy as *planned* — never implied shipped.
-- **Licensing**: standard Rust dual-license boilerplate; CONTRIBUTING gains two hard rules: (1) contributions are dual-licensed unless stated otherwise; (2) **codex-rs and other Apache-2.0 sources may be read for patterns but never pasted** — PRs with copied code are rejected (decision 4). cargo-deny enforces the dep side.
+- **README positioning**: “Make Grok great in the terminal.” Explain what works, state platform limits plainly, and keep roadmap items clearly separate from shipped features.
+- **Licensing**: MIT. CONTRIBUTING requires original or MIT-compatible contributions; cargo-deny enforces dependency policy.
 - **AGENTS.md** (dogfood from M2): build/test commands (`cargo test --workspace`, `cargo insta review`, `cargo clippy -- -D warnings`), crate map + ownership boundaries, conventions (no `unwrap` outside tests — clippy-enforced; errors via thiserror in libs, color-eyre in bins; protocol types are append-only once released), sandbox note ("agents run workspace-write; git mutations via the host").
 - **rustfmt.toml**: stable-only options (edition 2024 in Cargo.toml, default style + `newline_style = "Unix"`). Skip nightly-only options (codex uses them; not worth forcing nightly on contributors).
 - **Lints** (workspace `Cargo.toml`): `[workspace.lints.rust] unsafe_code = "deny"` except `grokforge-sandbox` (opts out locally — landlock/seccomp need it); `[workspace.lints.clippy] unwrap_used = "warn"`, `expect_used = "warn"`, `pedantic = { level = "warn", priority = -1 }` with targeted allows.
@@ -296,8 +296,8 @@ Two internal tracks, parallelizable: (a) shell/input, (b) render pipeline.
 ---
 
 ### Critical Files for Implementation
-- /Users/intzero/Documents/GrokForge/Cargo.toml (workspace root: crate graph, dual license, workspace lints, dep pins — everything hangs off it)
-- /Users/intzero/Documents/GrokForge/crates/grokforge-xai/src/lib.rs (in-house /v1/responses client + SSE event types; M1 spine)
-- /Users/intzero/Documents/GrokForge/crates/grokforge-core/src/agent.rs (turn loop, tool dispatch, approval engine integration; M2 spine)
-- /Users/intzero/Documents/GrokForge/crates/grokforge-sandbox/src/policy.rs (`SandboxPolicy` — defined at M2, compiled by per-OS backends at M5; the seam that prevents rework)
-- /Users/intzero/Documents/GrokForge/.github/workflows/ci.yml (3-OS matrix, clippy -D warnings, insta, sandbox + terminal-matrix jobs from day one)
+- `Cargo.toml` — workspace metadata, lints, and dependency pins.
+- `crates/grokforge-xai/src/lib.rs` — in-house Responses API client.
+- `crates/grokforge-core/src/turn.rs` — turn loop, tool dispatch, and approvals.
+- `crates/grokforge-sandbox/src/lib.rs` — sandbox policy and backend boundary.
+- `.github/workflows/ci.yml` — cross-platform checks.

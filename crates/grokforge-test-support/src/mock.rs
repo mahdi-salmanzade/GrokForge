@@ -13,6 +13,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+const MAX_REQUEST_HEAD: usize = 64 * 1024;
+const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
+
 /// A request the mock received, captured for assertions (e.g. ledger byte reconciliation).
 #[derive(Clone, Debug)]
 pub struct Received {
@@ -173,22 +176,24 @@ impl MockXaiBuilder {
 
         let received_bg = Arc::clone(&received);
         let handle = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
             loop {
                 let Ok((sock, _)) = listener.accept().await else {
                     break;
                 };
                 let received = Arc::clone(&received_bg);
                 let routes = Arc::clone(&routes);
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let _ = serve_conn(sock, received, routes).await;
                 });
+                while connections.try_join_next().is_some() {}
             }
         });
 
         MockXai {
             addr,
             received,
-            _handle: handle,
+            handle,
         }
     }
 }
@@ -198,7 +203,13 @@ impl MockXaiBuilder {
 pub struct MockXai {
     addr: SocketAddr,
     received: Arc<Mutex<Vec<Received>>>,
-    _handle: tokio::task::JoinHandle<()>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MockXai {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 impl MockXai {
@@ -245,6 +256,12 @@ async fn serve_conn(
             return Ok(());
         }
         buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > MAX_REQUEST_HEAD {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mock request headers exceeded limit",
+            ));
+        }
     };
 
     let (method, path, headers) = parse_request_head(&buf[..header_end]);
@@ -253,6 +270,12 @@ async fn serve_conn(
         .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, v)| v.trim().parse::<usize>().ok())
         .unwrap_or(0);
+    if content_length > MAX_REQUEST_BODY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mock request body exceeded limit",
+        ));
+    }
 
     let mut body = buf[header_end..].to_vec();
     while body.len() < content_length {
@@ -373,4 +396,18 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropping_server_stops_accepting_connections() {
+        let server = MockXai::builder().start().await;
+        let addr = server.addr;
+        drop(server);
+        tokio::task::yield_now().await;
+        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+    }
 }

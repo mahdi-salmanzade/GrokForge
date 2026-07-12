@@ -13,6 +13,7 @@ use grokforge_protocol::{DenialClass, SandboxPolicy, ToolCallId};
 use grokforge_sandbox::SandboxRunner;
 use grokforge_xai::ToolDef;
 
+use crate::TurnCancellation;
 use crate::approvals::ApprovalNeed;
 
 /// A tool's advertised interface.
@@ -36,6 +37,11 @@ pub struct TurnContext {
     pub sandbox: Arc<dyn SandboxRunner>,
     /// Paths the agent has written this turn, collected so only those are auto-committed.
     pub touched: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    /// Canonical physical paths approved for an elevated host-process write. File tools bind the
+    /// actual descriptor-relative mutation to these targets, closing approval/use symlink races.
+    pub bound_write_targets: Vec<PathBuf>,
+    /// Cooperative cancellation for network and sandbox operations in this turn.
+    pub cancellation: TurnCancellation,
 }
 
 impl std::fmt::Debug for TurnContext {
@@ -52,19 +58,20 @@ impl TurnContext {
     #[must_use]
     pub fn resolve(&self, path: &str) -> PathBuf {
         let p = PathBuf::from(path);
-        if p.is_absolute() {
+        let joined = if p.is_absolute() {
             p
         } else {
             self.workspace_root.join(p)
-        }
+        };
+        crate::path_safety::normalize(&joined)
     }
 
     /// Record that a path was written this turn (for auto-commit).
     pub fn record_touched(&self, path: PathBuf) {
-        if let Ok(mut touched) = self.touched.lock() {
-            if !touched.contains(&path) {
-                touched.push(path);
-            }
+        if let Ok(mut touched) = self.touched.lock()
+            && !touched.contains(&path)
+        {
+            touched.push(path);
         }
     }
 
@@ -72,6 +79,14 @@ impl TurnContext {
     #[must_use]
     pub fn touched_paths(&self) -> Vec<PathBuf> {
         self.touched.lock().map(|t| t.clone()).unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn bound_write_target(&self, path: &std::path::Path) -> Option<PathBuf> {
+        self.bound_write_targets
+            .iter()
+            .find(|target| target.as_path() == path)
+            .cloned()
     }
 }
 
@@ -153,8 +168,8 @@ impl std::fmt::Debug for ToolRegistry {
     }
 }
 
-/// The maximum number of tools xAI accepts in one request.
-pub const MAX_TOOLS: usize = 200;
+/// The maximum number of tools xAI accepts in one Responses API request.
+pub const MAX_TOOLS: usize = 128;
 
 impl ToolRegistry {
     /// A registry with all built-in tools registered.
@@ -174,7 +189,19 @@ impl ToolRegistry {
 
     /// Register an additional tool (e.g. an MCP adapter).
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.spec().name, tool);
+        let name = tool.spec().name;
+        if builtins::is_builtin(&name) {
+            tracing::warn!(tool = %name, "refusing to replace an existing or built-in tool");
+            return;
+        }
+        match self.tools.entry(name) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(tool);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                tracing::warn!(tool = %entry.key(), "refusing to replace an existing tool");
+            }
+        }
     }
 
     #[must_use]
@@ -195,9 +222,12 @@ impl ToolRegistry {
     }
 
     fn defs_where(&self, keep: impl Fn(&ToolSpec) -> bool) -> Vec<ToolDef> {
-        self.specs()
+        let mut specs: Vec<ToolSpec> = self.specs().into_iter().filter(keep).collect();
+        // Built-ins are the agent's basic safety/repair surface; a large MCP registry must not
+        // push `read_file`/`write_file` out of the provider's tool limit.
+        specs.sort_by_key(|spec| (!builtins::is_builtin(&spec.name), spec.name.clone()));
+        specs
             .into_iter()
-            .filter(keep)
             .take(MAX_TOOLS)
             .map(|s| ToolDef::function(s.name, s.description, s.parameters))
             .collect()
@@ -209,4 +239,65 @@ pub(crate) fn arg_str<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a 
     args.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
         ToolOutput::failure(format!("missing or non-string required argument `{key}`"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct ExtraTool(String);
+
+    #[async_trait]
+    impl Tool for ExtraTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.0.clone(),
+                description: "test".into(),
+                parameters: serde_json::json!({"type":"object"}),
+                mutating: false,
+                parallel_safe: true,
+            }
+        }
+
+        fn approval(&self, _args: &serde_json::Value, _ctx: &TurnContext) -> ApprovalNeed {
+            ApprovalNeed::None
+        }
+
+        async fn invoke(&self, _inv: ToolInvocation<'_>) -> ToolOutput {
+            ToolOutput::success("ok")
+        }
+    }
+
+    #[test]
+    fn provider_tool_cap_preserves_all_builtins() {
+        let mut registry = ToolRegistry::with_builtins();
+        for index in 0..200 {
+            registry.register(Arc::new(ExtraTool(format!("extra_{index:03}"))));
+        }
+        let defs = registry.tool_defs();
+        assert_eq!(defs.len(), MAX_TOOLS);
+        let names: Vec<&str> = defs.iter().filter_map(ToolDef::function_name).collect();
+        for builtin in [
+            "read_file",
+            "write_file",
+            "edit",
+            "shell",
+            "list",
+            "glob",
+            "grep",
+            builtins::SPAWN_TASK,
+        ] {
+            assert!(names.contains(&builtin), "missing built-in {builtin}");
+        }
+    }
+
+    #[test]
+    fn additional_tools_cannot_replace_a_builtin() {
+        let mut registry = ToolRegistry::with_builtins();
+        registry.register(Arc::new(ExtraTool("write_file".into())));
+        let write = registry.get("write_file").unwrap().spec();
+        assert_ne!(write.description, "test");
+        assert!(write.mutating);
+    }
 }

@@ -11,9 +11,11 @@
 
 pub mod agents_md;
 pub mod approvals;
+mod cancellation;
 pub mod compaction;
 pub mod context;
 pub mod mcp_config;
+mod path_safety;
 pub mod redaction;
 pub mod session;
 pub mod store;
@@ -21,6 +23,7 @@ pub mod tools;
 pub mod turn;
 
 pub use approvals::{AllowRule, ApprovalNeed, Approver, AutoApprover, Gate, gate};
+pub use cancellation::TurnCancellation;
 pub use redaction::{Redacted, Redactor};
 pub use session::{DEFAULT_SYSTEM_PROMPT, Session, SessionConfig};
 pub use store::{LogRotation, RolloutWriter, SessionMeta, rollout_path, sessions_dir};

@@ -48,13 +48,13 @@ enum Command {
         #[arg(long = "allow")]
         allow: Vec<String>,
         /// Reasoning effort: low, medium, or high.
-        #[arg(long)]
+        #[arg(long, value_parser = ["low", "medium", "high"])]
         effort: Option<String>,
         /// Plan mode: read-only tools + sandbox, produce a plan without changing anything.
         #[arg(long)]
         plan: bool,
         /// Maximum tool-call iterations within the turn.
-        #[arg(long, default_value_t = 32)]
+        #[arg(long, default_value_t = 32, value_parser = positive_u32)]
         max_iterations: u32,
     },
     /// Resume a previous session.
@@ -79,6 +79,84 @@ enum Command {
         #[command(subcommand)]
         cmd: DebugCommand,
     },
+}
+
+fn positive_u32(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| format!("`{value}` is not a valid positive integer"))?;
+    if parsed == 0 {
+        Err("value must be at least 1".to_string())
+    } else {
+        Ok(parsed)
+    }
+}
+
+/// Remove terminal control characters from untrusted human-readable output. JSON mode keeps
+/// the original data encoded by serde, so machine consumers lose no information.
+pub(crate) fn sanitize_terminal(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| {
+            matches!(ch, '\n' | '\t')
+                || (!ch.is_control()
+                    && !matches!(*ch as u32, 0x7f..=0x9f)
+                    && !matches!(
+                        *ch as u32,
+                        0x061c | 0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069
+                    ))
+        })
+        .collect()
+}
+
+pub(crate) fn sanitize_terminal_line(value: &str) -> String {
+    sanitize_terminal(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub(crate) async fn validate_model_startup(
+    client: &grokforge_xai::XaiClient,
+    model: &str,
+) -> Result<(), std::process::ExitCode> {
+    eprintln!("[model validation: GET /v1/models; no project context sent]");
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.validate_model(model),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error @ grokforge_xai::XaiError::UnknownModel { .. })) => {
+            eprintln!(
+                "model validation failed: {}",
+                sanitize_terminal(&error.to_string())
+            );
+            Err(std::process::ExitCode::from(3))
+        }
+        Ok(Err(error @ grokforge_xai::XaiError::Auth { .. })) => {
+            // Authentication has already been checked without sending any project context.
+            // Do not continue into the first full prompt request with credentials the endpoint
+            // has explicitly rejected.
+            eprintln!(
+                "model validation failed: {}",
+                sanitize_terminal(&error.to_string())
+            );
+            Err(std::process::ExitCode::from(3))
+        }
+        Ok(Err(error)) => {
+            eprintln!(
+                "warning: model validation was unavailable; continuing: {}",
+                sanitize_terminal(&error.to_string())
+            );
+            Ok(())
+        }
+        Err(_) => {
+            eprintln!("warning: model validation timed out after 10 seconds; continuing");
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -157,4 +235,85 @@ async fn main() -> std::process::ExitCode {
 fn milestone(feature: &str, ms: &str) -> std::process::ExitCode {
     eprintln!("{feature} lands in {ms} (see docs/design/03-roadmap.md)");
     std::process::ExitCode::from(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::*;
+
+    #[test]
+    fn global_and_exec_prompt_forms_parse() {
+        assert!(Cli::try_parse_from(["grokforge", "-p", "task"]).is_ok());
+        assert!(Cli::try_parse_from(["grokforge", "exec", "-p", "task"]).is_ok());
+        assert!(Cli::try_parse_from(["grokforge", "-p", "global", "exec", "-p", "local"]).is_ok());
+    }
+
+    #[test]
+    fn parser_rejects_zero_iterations_and_invalid_effort() {
+        assert!(
+            Cli::try_parse_from(["grokforge", "exec", "-p", "task", "--max-iterations", "0"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["grokforge", "exec", "-p", "task", "--effort", "extreme"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn terminal_sanitizer_blocks_escape_and_c1_sequences() {
+        let sanitized = sanitize_terminal("safe\u{1b}]52;c;payload\u{7} text\u{009d}bad\u{202e}");
+        assert_eq!(sanitized, "safe]52;c;payload textbad");
+        assert_eq!(sanitize_terminal_line("one\n two\tthree"), "one two three");
+    }
+
+    #[tokio::test]
+    async fn startup_model_validation_accepts_advertised_and_rejects_unknown_slugs() {
+        let server = grokforge_test_support::MockXai::builder()
+            .route(
+                "/v1/models",
+                grokforge_test_support::Reply::json(
+                    200,
+                    &serde_json::json!({
+                        "data": [{"id": "grok-build-0.1", "aliases": ["grok-build-latest"]}]
+                    }),
+                ),
+            )
+            .start()
+            .await;
+        let client =
+            grokforge_xai::XaiClient::new(&server.base_url(), "test-key").expect("test client");
+        assert!(
+            validate_model_startup(&client, "grok-build-latest")
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            validate_model_startup(&client, "retired-model")
+                .await
+                .expect_err("unknown model"),
+            std::process::ExitCode::from(3)
+        );
+
+        let unauthorized = grokforge_test_support::MockXai::builder()
+            .route(
+                "/v1/models",
+                grokforge_test_support::Reply::json(
+                    401,
+                    &serde_json::json!({"error": {"message": "invalid key"}}),
+                ),
+            )
+            .start()
+            .await;
+        let client = grokforge_xai::XaiClient::new(&unauthorized.base_url(), "bad-key")
+            .expect("test client");
+        assert_eq!(
+            validate_model_startup(&client, "grok-build-0.1")
+                .await
+                .expect_err("authentication failure"),
+            std::process::ExitCode::from(3)
+        );
+    }
 }

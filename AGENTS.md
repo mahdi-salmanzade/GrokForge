@@ -40,7 +40,7 @@ cargo deny check                       # license / advisory gate
 - **Protocol types are append-only** after a release — frontends and persistence depend on the wire format.
 - **All git mutations run from the trusted host process**, never inside the sandbox. `.git` is deny-write in every sandbox policy.
 - **The context ledger is the privacy guarantee.** Any code path that sends bytes to the network must go through the ledgered request path — never construct a raw request to the API.
-- **codex-rs and other Apache-2.0 sources may be read for patterns but never pasted.** This project is MIT OR Apache-2.0; copied Apache-2.0-only code cannot be relicensed under MIT. Reimplement.
+- **Do not paste code from projects whose license is incompatible with MIT.** Learn from ideas and public interfaces, then implement the work independently.
 - Agents run in `workspace-write` by default; commands are sandboxed with network off.
 
 ## Where to start

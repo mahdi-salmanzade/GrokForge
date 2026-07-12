@@ -1,12 +1,8 @@
-I have everything I need — the brief is comprehensive, the strategy doc adds nothing technical beyond what's locked, and I've verified the codex-rs workspace shape as the reference pattern. Below is the architecture design document.
-
----
-
 # GrokForge v0.1 — System Architecture
 
-Greenfield Rust workspace. Inputs: `/tmp/grokforge_brief.md` (settled stack decisions), user-locked decisions (full differentiator scope, Grok-only client, OS-native sandbox in v0.1, dual MIT OR Apache-2.0, name/binary `grokforge`).
+Greenfield Rust workspace. The settled direction is a Grok-only client, OS-native sandboxing in v0.1, the MIT License, and the `grokforge` binary.
 
-**License consequence (applies throughout):** dual MIT OR Apache-2.0 overrides the brief's Apache-2.0-only pick. codex-rs (Apache-2.0) is a *pattern reference only* — this includes `seatbelt_base_policy.sbpl`, which the brief suggested copying; it must instead be **authored from scratch** (SBPL is code). Same for the seccomp syscall deny list: the *list of syscalls* (io_uring_setup/enter/register, ptrace, process_vm_*, socket family filtering) is uncopyrightable facts and fine to reproduce; the filter-building code is not.
+**License consequence (applies throughout):** project code must be original or compatible with MIT. External implementations may inform public behavior and interfaces, but incompatible source code is not copied into the project.
 
 **Provider consequence:** Grok-only, no provider trait in v1. The brief's "multi-model fallback" hedge is explicitly deferred; the mitigation retained is (a) `grokforge-xai` as an isolated crate (the future seam), (b) base URL + model IDs as config data, (c) startup `GET /v1/models` validation.
 
@@ -90,7 +86,7 @@ grokforge/
 - *Justification:* separate from `sandbox` because policy compilation and process management change for different reasons; separate from `tools` so `grokforge debug sandbox -- <cmd>` (brief §3) reuses it without the tool layer.
 
 **`grokforge-git`** — deps: none internal (gix + std::process). The brief's split: **gix for reads** (status, diff, log, blame, worktree enumeration), **shell out to `git` CLI for mutations** — and per brief §3's decided git-native tension resolution, *all mutations run from the trusted host process*, never inside the sandbox; `.git` stays deny-write in `SandboxPolicy.protected_paths`.
-- Modules: `read` (RepoSnapshot: status/diff/blame via gix), `mutate` (commit/branch/revert/stash via CLI, always with `-c core.hooksPath=/dev/null` style hook neutralization on agent-initiated mutations), `autocommit` (ghost-commit stack: every agent edit → commit with generated message; `/undo` = revert), `worktree` (create/remove/list under `.grokforge/worktrees/<task-id>`, merge-back: rebase or patch extraction), `identity` (attribute commits `Co-Authored-By: GrokForge`).
+- Modules: `read` (RepoSnapshot: status/diff/blame via gix), `mutate` (commit/branch/revert/stash via CLI, always with `-c core.hooksPath=/dev/null` style hook neutralization on agent-initiated mutations), `autocommit` (isolated-worktree commits only; foreground changes remain uncommitted), `worktree` (create/remove/list under the owner-private per-user data root outside project workspaces), `identity` (session and turn trailers used by `/undo`).
 - *Justification:* Aider-replacement positioning (gap #3) makes git a first-class subsystem, not a tool detail; `tools` and `core` both consume it (edit tool auto-commits; subagent manager needs worktrees).
 
 **`grokforge-mcp`** — rmcp 2.2 **behind an internal trait** (brief risk #7: rmcp breaking churn stays inside this crate). Deps: `protocol`.
@@ -528,7 +524,7 @@ Trigger: post-turn tokens > 80% of the active model's context (from `ModelInfo`)
 
 ### 6.2 Subagents in worktrees
 - `core::subagent::SubagentManager` (core-resident tool, §1 cycle note). Tool `spawn_task { prompt, model?, isolated: bool }`:
-  1. Host process (trusted) calls `grokforge-git::worktree::create(task_id)` → `.grokforge/worktrees/<task-id>` on branch `grokforge/task/<task-id>`.
+  1. Host process (trusted) calls `grokforge-git::worktree::create(task_id)` → `<per-user-data>/worktrees/<task-id>` on branch `grokforge/task/<task-id>`.
   2. Spawns a child `Session` (same `ConversationManager`, `parent_session_id` set) with a **narrowed** `SandboxPolicy` (`writable_roots = [worktree]`, network per parent), depth cap 1, concurrency cap 8 (brief table stakes), a child `CancellationToken` under the parent turn's token (parent Esc kills all tasks).
   3. Child events are re-emitted wrapped as `EventMsg::SubagentEvent{task_id, ..}` — TUI renders a collapsed task cell with live status; headless emits them as JSONL with a `task_id` field.
   4. Completion: tool output = final message + `git diff --stat` of the worktree; merge-back is a **separate approval-gated host git mutation** (`ApprovalKind::GitMutation`) — rebase onto the main workspace or extract as a patch; worktree removed after merge/discard.
@@ -555,8 +551,8 @@ Trigger: post-turn tokens > 80% of the active model's context (from `ModelInfo`)
 Cross-cutting risks carried from the brief into structure: rmcp churn isolated in `mcp`; ratatui-widget churn avoided by owning composer/markdown (`render`, `tui::composer`); fastembed's ort pin feature-gated off in `index`; sandbox degradation always surfaced (`SandboxCapability` in `SessionConfigured`); logs size-capped in exactly one module.
 
 ### Critical Files for Implementation
-- /Users/intzero/Documents/GrokForge/crates/protocol/src/lib.rs — Op/Event/ApprovalRequest/SandboxPolicy: the contract every other crate compiles against; freeze first.
-- /Users/intzero/Documents/GrokForge/crates/core/src/turn.rs — TurnRunner state machine (stream → tools → approvals → loop), cancellation unwind, compaction trigger.
-- /Users/intzero/Documents/GrokForge/crates/core/src/context.rs — ContextAssembler + Redactor + ledger choke point (the privacy guarantee lives or dies here).
-- /Users/intzero/Documents/GrokForge/crates/xai/src/stream.rs — /v1/responses SSE decode into typed StreamEvent, reconnect/backoff, whole-chunk tool calls.
-- /Users/intzero/Documents/GrokForge/crates/sandbox/src/linux.rs — landlock+seccompiler backend, `apply_in_child`, RulesetStatus surfacing, denial classifier hooks.
+- `crates/grokforge-protocol/src/lib.rs` — shared protocol contract.
+- `crates/grokforge-core/src/turn.rs` — turn state machine, cancellation, and compaction.
+- `crates/grokforge-core/src/context.rs` — context assembly, redaction, and ledger choke point.
+- `crates/grokforge-xai/src/stream.rs` — Responses API stream decoding.
+- `crates/grokforge-sandbox/src/lib.rs` — sandbox selection and policy boundary.

@@ -17,7 +17,7 @@ pub fn run() -> ExitCode {
     let status = if cap.enforced {
         "● enforced"
     } else {
-        "○ NOT enforced (approval-only)"
+        "○ NOT enforced (confined commands fail closed)"
     };
     println!("sandbox backend: {}  [{status}]", cap.backend);
     for note in &cap.notes {
@@ -26,18 +26,10 @@ pub fn run() -> ExitCode {
     println!();
 
     // Git availability (needed for the git-native workflow).
-    let git_ok = std::process::Command::new("git")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    println!(
-        "git: {}",
-        if git_ok {
-            "found"
-        } else {
-            "NOT FOUND (auto-commit/undo unavailable)"
-        }
-    );
+    match grokforge_git::Git::trusted_executable() {
+        Ok(path) => println!("git: trusted executable at {}", path.display()),
+        Err(error) => println!("git: unavailable ({error}; auto-commit/undo disabled)"),
+    }
 
     // API key presence (not the value).
     let key = std::env::var("XAI_API_KEY").is_ok();
@@ -50,11 +42,23 @@ pub fn run() -> ExitCode {
         }
     );
     let base = std::env::var("XAI_BASE_URL").unwrap_or_else(|_| "https://api.x.ai".to_string());
-    println!("endpoint: {base}");
+    let endpoint = crate::sanitize_terminal_line(&base);
+    // This only parses and validates the URL; no request is made and the placeholder is never
+    // logged or retained after this branch.
+    match grokforge_xai::XaiClient::new(&base, "doctor-validation-only") {
+        Ok(_) => println!("endpoint: {endpoint}"),
+        Err(error) => println!(
+            "endpoint: {endpoint}  [INVALID: {}]",
+            crate::sanitize_terminal_line(&error.to_string())
+        ),
+    }
 
     println!();
-    println!("privacy: no network egress except the endpoint above and any MCP servers you");
-    println!("connect; every request is accounted for in the context ledger. Telemetry: off.");
+    println!("privacy: serialized model-request body bytes (including retries) are accounted for");
+    println!(
+        "in the context ledger. HTTP headers, MCP, and approved/full-access tools are separate"
+    );
+    println!("egress boundaries. Telemetry: off.");
 
     ExitCode::SUCCESS
 }

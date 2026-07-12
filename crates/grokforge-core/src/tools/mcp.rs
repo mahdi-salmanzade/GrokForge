@@ -2,6 +2,7 @@
 //! treat them exactly like built-ins. MCP tools are always approval-gated (their side effects are
 //! outside our sandbox) and their calls are recorded in the ledger like any other request.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -31,7 +32,31 @@ impl McpToolAdapter {
 
     #[must_use]
     pub fn qualified_name(server: &str, tool: &str) -> String {
-        format!("mcp__{server}__{tool}")
+        let raw = format!("mcp__{server}__{tool}");
+        if raw.len() <= 64
+            && raw
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return raw;
+        }
+        let mut safe: String = raw
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(51)
+            .collect();
+        // Stable FNV-1a suffix prevents two distinct invalid/truncated names from colliding.
+        let hash = raw.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
+            (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+        });
+        let _ = write!(safe, "__{hash:08x}");
+        safe
     }
 }
 
@@ -61,9 +86,35 @@ impl Tool for McpToolAdapter {
     }
 
     async fn invoke(&self, inv: ToolInvocation<'_>) -> ToolOutput {
-        match self.conn.call_tool(&self.tool.name, inv.args).await {
-            Ok(text) => ToolOutput::success(text),
-            Err(e) => ToolOutput::failure(format!("mcp `{}` error: {e}", self.server)),
+        let result = tokio::select! {
+            result = self.conn.call_tool(&self.tool.name, inv.args) => Some(result),
+            () = inv.ctx.cancellation.cancelled() => None,
+        };
+        match result {
+            None => ToolOutput::failure("[turn interrupted by user; MCP call cancelled]"),
+            Some(Ok(text)) => ToolOutput::success(text),
+            Some(Err(e)) => ToolOutput::failure(format!("mcp `{}` error: {e}", self.server)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::McpToolAdapter;
+
+    #[test]
+    fn qualified_names_are_provider_safe_and_collision_resistant() {
+        assert_eq!(
+            McpToolAdapter::qualified_name("docs", "search"),
+            "mcp__docs__search"
+        );
+        let a = McpToolAdapter::qualified_name("bad server", "tool/name");
+        let b = McpToolAdapter::qualified_name("bad/server", "tool name");
+        assert!(a.len() <= 64);
+        assert!(
+            a.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+        );
+        assert_ne!(a, b);
     }
 }
