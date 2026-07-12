@@ -246,7 +246,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     #![allow(clippy::expect_used)]
 

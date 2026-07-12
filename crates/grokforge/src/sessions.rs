@@ -236,6 +236,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn project_root_groups_subdirectories_but_not_other_repositories() {
         use std::process::Command;

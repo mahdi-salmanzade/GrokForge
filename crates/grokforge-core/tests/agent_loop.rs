@@ -65,9 +65,11 @@ impl Tool for DelayedHostMutation {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 struct EnforcedTestRunner;
 
+#[cfg(unix)]
 #[async_trait]
 impl SandboxRunner for EnforcedTestRunner {
     fn capability(&self) -> SandboxCapability {
@@ -154,6 +156,7 @@ fn agent_for(mock: &MockXai, events: mpsc::UnboundedSender<EventMsg>) -> Agent {
     )
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn creates_a_file_via_write_tool() {
     let workspace = tempfile::tempdir().unwrap();
@@ -578,6 +581,7 @@ async fn plan_mode_refuses_writes() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn subagent_runs_in_an_isolated_worktree_branch() {
     // Requires git.
@@ -1413,6 +1417,7 @@ async fn assistant_text_deltas_are_forwarded_as_they_arrive() {
     assert_eq!(deltas, ["one", "two"]);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn approved_outside_write_uses_a_one_call_elevated_context() {
     let workspace = tempfile::tempdir().unwrap();
@@ -1476,6 +1481,7 @@ async fn plan_mode_rejects_a_hallucinated_unadvertised_mutating_tool() {
     )));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn auto_commit_does_not_sweep_shell_created_files() {
     if std::process::Command::new("git")
@@ -1537,6 +1543,7 @@ async fn auto_commit_does_not_sweep_shell_created_files() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn foreground_file_tool_changes_remain_uncommitted_without_isolation() {
     if std::process::Command::new("git")

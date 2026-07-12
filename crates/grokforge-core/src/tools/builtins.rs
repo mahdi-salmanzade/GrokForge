@@ -851,6 +851,7 @@ mod tests {
         assert!(output.content().contains("blocked"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn read_truncates_on_a_utf8_boundary() {
         let workspace = tempfile::tempdir().unwrap();

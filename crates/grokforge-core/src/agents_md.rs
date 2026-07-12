@@ -48,6 +48,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn discovers_workspace_agents_md() {
         let dir = tempfile::tempdir().unwrap();

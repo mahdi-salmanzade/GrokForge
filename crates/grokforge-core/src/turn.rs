@@ -2675,6 +2675,7 @@ mod tests {
         assert!(escalation_kind(&need, grokforge_protocol::DenialClass::Signal).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn discovered_git_metadata_failure_is_not_silently_omitted() {
         if std::process::Command::new("git")

@@ -447,6 +447,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn dirty_workspace_disables_auto_commit() {
         use std::process::Command;
