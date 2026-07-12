@@ -14,7 +14,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use grokforge_core::{Agent, Session, SessionConfig, ToolRegistry};
-use grokforge_sandbox::PassthroughRunner;
+use grokforge_sandbox::default_runner;
 use grokforge_xai::XaiClient;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -37,7 +37,7 @@ pub async fn run(
         Agent::new(
             client,
             ToolRegistry::with_builtins(),
-            Arc::new(PassthroughRunner),
+            default_runner(),
             Arc::new(approver),
             events_tx,
         )

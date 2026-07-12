@@ -7,11 +7,19 @@
 //! a raw `Command`. The M2 runner is [`PassthroughRunner`] — it applies no OS confinement and
 //! honestly reports `enforced = false`, so the UI never claims protection that isn't active.
 
+mod bubblewrap;
+mod classifier;
 mod exec;
 mod passthrough;
+mod seatbelt;
 
+pub use bubblewrap::BubblewrapRunner;
+pub use classifier::classify;
 pub use exec::{CommandSpec, ExecError, ExecOutput, OUTPUT_CAP, run_capture};
 pub use passthrough::PassthroughRunner;
+pub use seatbelt::SeatbeltRunner;
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use grokforge_protocol::SandboxPolicy;
@@ -40,4 +48,24 @@ pub trait SandboxRunner: Send + Sync + std::fmt::Debug {
         policy: &SandboxPolicy,
         command: &CommandSpec,
     ) -> Result<ExecOutput, ExecError>;
+}
+
+/// Select the best available OS-native sandbox runner for this platform, falling back to the
+/// (unenforced) passthrough runner when no backend is usable — never silently claiming
+/// enforcement that isn't active.
+#[must_use]
+pub fn default_runner() -> Arc<dyn SandboxRunner> {
+    #[cfg(target_os = "macos")]
+    {
+        if SeatbeltRunner::available() {
+            return Arc::new(SeatbeltRunner);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if BubblewrapRunner::available() {
+            return Arc::new(BubblewrapRunner);
+        }
+    }
+    Arc::new(PassthroughRunner)
 }

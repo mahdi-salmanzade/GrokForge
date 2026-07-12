@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use grokforge_core::{Agent, AllowRule, AutoApprover, Session, SessionConfig, ToolRegistry};
 use grokforge_protocol::{ApprovalPolicy, EventMsg, SandboxMode, StopReason};
-use grokforge_sandbox::PassthroughRunner;
+use grokforge_sandbox::default_runner;
 use grokforge_xai::{Effort, XaiClient};
 use tokio::sync::mpsc;
 
@@ -101,7 +101,7 @@ pub async fn run(args: ExecArgs) -> ExitCode {
     let agent = Agent::new(
         client,
         ToolRegistry::with_builtins(),
-        Arc::new(PassthroughRunner),
+        default_runner(),
         approver,
         tx,
     );

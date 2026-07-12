@@ -35,3 +35,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   approval modal (`y`/`a`/`d`). `TestBackend` render tests. Launched by the default,
   no-subcommand `grokforge` invocation. (Uses the alternate screen; the inline-viewport +
   native-scrollback render pipeline from the design docs is the planned upgrade.)
+- M5 OS-native sandbox (`grokforge-sandbox`): real kernel-enforced backends replacing the
+  passthrough placeholder. macOS Seatbelt (`sandbox-exec` with a generated, param-passed SBPL
+  profile — canonicalized paths, injection-guarded) confines writes to the workspace, keeps
+  `.git` read-only, and denies network in workspace-write mode. Linux bubblewrap (`bwrap`
+  shell-out: read-only root, workspace bind-mounted, network namespace unshared). Denial
+  classifier (distinguishes sandbox blocks from real failures). `default_runner()` factory
+  selects per platform and reports capability honestly (`enforced` flag). Wired into both
+  frontends. Verified end-to-end: under `--preset auto` the model's write outside the
+  workspace is blocked by the kernel.
