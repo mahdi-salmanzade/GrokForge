@@ -44,6 +44,7 @@ impl BubblewrapRunner {
 
     fn probe() -> Result<PathBuf, String> {
         let executable = resolve_bwrap()?;
+        #[cfg(unix)]
         reject_setuid(&executable)?;
 
         let version = run_probe(&executable, &["--version"])?;
@@ -646,11 +647,6 @@ fn reject_setuid(executable: &Path) -> Result<(), String> {
     } else {
         Ok(())
     }
-}
-
-#[cfg(not(unix))]
-fn reject_setuid(_executable: &Path) -> Result<(), String> {
-    Ok(())
 }
 
 fn supports_read_policy(policy: &SandboxPolicy) -> bool {

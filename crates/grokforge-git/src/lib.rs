@@ -630,6 +630,7 @@ fn execute_command(
         command.process_group(0);
     }
     let mut child = command.spawn()?;
+    #[cfg(unix)]
     let child_id = child.id();
     let stdout = child
         .stdout

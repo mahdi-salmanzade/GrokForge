@@ -345,6 +345,8 @@ impl ProcessGroupGuard {
         {
             self.armed = false;
         }
+        #[cfg(not(unix))]
+        let _ = self;
     }
 
     fn kill_remaining(&self) {
@@ -352,6 +354,8 @@ impl ProcessGroupGuard {
         if let Some(id) = self.id {
             kill_process_group(id);
         }
+        #[cfg(not(unix))]
+        let _ = self;
     }
 }
 

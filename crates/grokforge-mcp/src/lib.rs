@@ -512,6 +512,8 @@ impl ProcessGroupGuard {
         if let Some(id) = self.id {
             kill_process_group(id);
         }
+        #[cfg(not(unix))]
+        let _ = self;
     }
 }
 
