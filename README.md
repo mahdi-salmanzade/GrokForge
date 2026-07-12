@@ -66,7 +66,7 @@ grokforge exec --plan -p "plan the refactor"
 
 ## Safety
 
-macOS uses Seatbelt. Linux uses Bubblewrap 0.11.2 or newer. Native Windows confinement is not ready; use WSL2 for now.
+macOS uses Seatbelt. Linux uses Bubblewrap 0.11.2 or newer; Ubuntu 24.04 also needs an AppArmor user-namespace rule for the Bubblewrap executable. Native Windows confinement is not ready; use WSL2 for now.
 
 Commands start with a stripped-down environment, Git metadata stays protected, common secret paths are blocked, and normal workspace mode has no network access. [SECURITY.md](SECURITY.md) documents the exact boundaries and known gaps. Read it before using `--preset yolo` or running GrokForge on code you do not trust.
 

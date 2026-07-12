@@ -142,8 +142,9 @@ impl BubblewrapRunner {
             || !policy.protected_paths.is_empty()
             || network_isolated;
 
-        // Preserve workspaces below /tmp or /run through the private tmpfs mounts. The temporary
-        // source mounts are hidden again after being rebound at their original destinations.
+        // Preserve workspaces below /tmp or /run through the private tmpfs mounts. Bubblewrap
+        // resolves bind sources below its retained old root, so the original host path remains a
+        // valid source after the destination-side runtime tree has been replaced.
         let mut writable: Vec<PathBuf> = match policy.mode {
             SandboxMode::ReadOnly => Vec::new(),
             SandboxMode::WorkspaceWrite | SandboxMode::DangerFullAccess => policy
@@ -180,69 +181,6 @@ impl BubblewrapRunner {
             } else {
                 Vec::new()
             };
-        let staged_writable: Vec<(PathBuf, String)> = writable
-            .iter()
-            .filter(|path| hide_host_sockets && is_below_hidden_runtime_root(path))
-            .enumerate()
-            .map(|(index, path)| (path.clone(), format!("/.grokforge-bind-sources/w{index}")))
-            .collect();
-        let staged_readonly: Vec<(PathBuf, String)> = read_only_tmp_roots
-            .iter()
-            .enumerate()
-            .map(|(index, path)| (path.clone(), format!("/.grokforge-bind-sources/r{index}")))
-            .collect();
-        // External linked-worktree/common Git directories can also live under `/tmp` or `/run`.
-        // Stage their parent directories before the private tmpfs hides them, then use the
-        // staged source for the final read-only protected bind.
-        let mut protected_runtime_parents: Vec<PathBuf> = policy
-            .protected_paths
-            .iter()
-            .filter(|path| path.exists())
-            .map(|path| canonical(path))
-            .filter(|path| is_below_hidden_runtime_root(path))
-            .filter(|path| {
-                !writable.iter().any(|root| path.starts_with(root))
-                    && !read_only_tmp_roots
-                        .iter()
-                        .any(|root| path.starts_with(root))
-            })
-            .filter_map(|path| path.parent().map(Path::to_path_buf))
-            .collect();
-        protected_runtime_parents.sort();
-        protected_runtime_parents.dedup();
-        let staged_protected: Vec<(PathBuf, String)> = protected_runtime_parents
-            .iter()
-            .enumerate()
-            .map(|(index, path)| (path.clone(), format!("/.grokforge-bind-sources/p{index}")))
-            .collect();
-        if !staged_writable.is_empty()
-            || !staged_readonly.is_empty()
-            || !staged_protected.is_empty()
-        {
-            args.push("--dir".into());
-            args.push("/.grokforge-bind-sources".into());
-            for (source, staging) in &staged_writable {
-                args.push("--dir".into());
-                args.push(staging.clone());
-                args.push("--bind".into());
-                args.push(source.to_string_lossy().into_owned());
-                args.push(staging.clone());
-            }
-            for (source, staging) in &staged_readonly {
-                args.push("--dir".into());
-                args.push(staging.clone());
-                args.push("--ro-bind".into());
-                args.push(source.to_string_lossy().into_owned());
-                args.push(staging.clone());
-            }
-            for (source, staging) in &staged_protected {
-                args.push("--dir".into());
-                args.push(staging.clone());
-                args.push("--ro-bind".into());
-                args.push(source.to_string_lossy().into_owned());
-                args.push(staging.clone());
-            }
-        }
         if hide_host_sockets {
             // A separate network namespace does not block AF_UNIX. Hide the host's common
             // runtime socket directories as well, otherwise Docker/Podman/DBus sockets become
@@ -264,27 +202,17 @@ impl BubblewrapRunner {
         // Workspace roots writable.
         for root in &writable {
             let r = root.to_string_lossy().into_owned();
-            if let Some((_, staging)) = staged_writable.iter().find(|(path, _)| path == root) {
-                args.push("--dir".into());
-                args.push(r.clone());
-                args.push("--bind".into());
-                args.push(staging.clone());
-                args.push(r);
-            } else {
-                args.push("--bind".into());
-                args.push(r.clone());
-                args.push(r);
-            }
+            args.push("--bind".into());
+            args.push(r.clone());
+            args.push(r);
         }
         if hide_host_sockets && policy.mode == SandboxMode::ReadOnly {
             // If the workspace lives below /tmp or /run, restore it read-only after the private
             // tmpfs hid the host path.
-            for (root, staging) in &staged_readonly {
+            for root in &read_only_tmp_roots {
                 let root = root.to_string_lossy().into_owned();
-                args.push("--dir".into());
-                args.push(root.clone());
                 args.push("--ro-bind".into());
-                args.push(staging.clone());
+                args.push(root.clone());
                 args.push(root);
             }
         }
@@ -292,25 +220,9 @@ impl BubblewrapRunner {
         for prot in &policy.protected_paths {
             if prot.exists() {
                 let protected = canonical(prot);
-                let staged_source = staged_protected.iter().find_map(|(parent, staging)| {
-                    protected.strip_prefix(parent).ok().map(|relative| {
-                        Path::new(staging)
-                            .join(relative)
-                            .to_string_lossy()
-                            .into_owned()
-                    })
-                });
-                if staged_source.is_some()
-                    && let Some(parent) = protected.parent()
-                {
-                    args.push("--dir".into());
-                    args.push(parent.to_string_lossy().into_owned());
-                }
-                let source =
-                    staged_source.unwrap_or_else(|| protected.to_string_lossy().into_owned());
                 let p = protected.to_string_lossy().into_owned();
                 args.push("--ro-bind".into());
-                args.push(source);
+                args.push(p.clone());
                 args.push(p);
             }
         }
@@ -323,15 +235,6 @@ impl BubblewrapRunner {
                 args.push("--remount-ro".into());
                 args.push("/tmp".into());
             }
-        }
-        if !staged_writable.is_empty()
-            || !staged_readonly.is_empty()
-            || !staged_protected.is_empty()
-        {
-            args.push("--tmpfs".into());
-            args.push("/.grokforge-bind-sources".into());
-            args.push("--remount-ro".into());
-            args.push("/.grokforge-bind-sources".into());
         }
         // Mask currently existing secret-bearing files in the workspace. Bubblewrap cannot
         // express globs directly, so this is paired with context redaction and an explicit
@@ -1082,18 +985,12 @@ mod tests {
     }
 
     #[test]
-    fn root_write_escalation_preserves_a_tmp_cwd_before_hiding_tmp() {
+    fn root_write_escalation_restores_a_tmp_cwd_after_hiding_tmp() {
         let root = PathBuf::from("/tmp/grokforge-approved-workspace");
         let mut policy = SandboxPolicy::workspace_write(&root);
         policy.writable_roots = vec![PathBuf::from("/")];
         policy.protected_paths.clear();
         let wrapped = wrap(&policy, &spec(root));
-        let staging = "/.grokforge-bind-sources/w0";
-        let source = wrapped
-            .args
-            .windows(3)
-            .position(|args| args == ["--bind", "/tmp/grokforge-approved-workspace", staging])
-            .expect("cwd source staging bind");
         let tmpfs = wrapped
             .args
             .windows(2)
@@ -1102,9 +999,15 @@ mod tests {
         let restore = wrapped
             .args
             .windows(3)
-            .position(|args| args == ["--bind", staging, "/tmp/grokforge-approved-workspace"])
+            .position(|args| {
+                args == [
+                    "--bind",
+                    "/tmp/grokforge-approved-workspace",
+                    "/tmp/grokforge-approved-workspace",
+                ]
+            })
             .expect("cwd restore bind");
-        assert!(source < tmpfs && tmpfs < restore);
+        assert!(tmpfs < restore);
     }
 
     #[cfg(unix)]
@@ -1214,7 +1117,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn external_runtime_protected_tree_is_staged_and_restored_read_only() {
+    fn external_runtime_protected_tree_is_restored_read_only() {
         let workspace = tempfile::tempdir_in("/var/tmp").expect("workspace");
         std::fs::create_dir(workspace.path().join(".git")).expect("workspace git");
         let external = tempfile::tempdir_in("/tmp").expect("external metadata");
@@ -1224,31 +1127,21 @@ mod tests {
         let wrapped = wrap(&policy, &spec(workspace.path().to_path_buf()));
 
         let external = canonical(external.path());
-        let parent = external.parent().expect("runtime parent");
-        let staging = "/.grokforge-bind-sources/p0";
-        let staged_source = wrapped
-            .args
-            .windows(3)
-            .position(|args| {
-                args[0] == "--ro-bind" && args[1] == parent.to_string_lossy() && args[2] == staging
-            })
-            .expect("protected parent staging bind");
         let tmpfs = wrapped
             .args
             .windows(2)
             .position(|args| args == ["--tmpfs", "/tmp"])
             .expect("private tmp");
-        let staged_path = Path::new(staging).join(external.file_name().expect("name"));
         let restore = wrapped
             .args
             .windows(3)
             .position(|args| {
                 args[0] == "--ro-bind"
-                    && args[1] == staged_path.to_string_lossy()
+                    && args[1] == external.to_string_lossy()
                     && args[2] == external.to_string_lossy()
             })
             .expect("protected restore bind");
-        assert!(staged_source < tmpfs && tmpfs < restore);
+        assert!(tmpfs < restore);
     }
 
     #[test]
@@ -1360,16 +1253,10 @@ mod tests {
     }
 
     #[test]
-    fn tmp_workspace_source_is_staged_before_private_tmp_mount() {
+    fn tmp_workspace_is_restored_after_private_tmp_mount() {
         let root = PathBuf::from("/tmp/grokforge-workspace");
         let policy = SandboxPolicy::workspace_write(&root);
         let wrapped = wrap(&policy, &spec(root.clone()));
-        let staging = "/.grokforge-bind-sources/w0";
-        let source_bind = wrapped
-            .args
-            .windows(3)
-            .position(|args| args == ["--bind", "/tmp/grokforge-workspace", staging])
-            .expect("source staging bind");
         let tmpfs = wrapped
             .args
             .windows(2)
@@ -1378,22 +1265,28 @@ mod tests {
         let restore = wrapped
             .args
             .windows(3)
-            .position(|args| args == ["--bind", staging, "/tmp/grokforge-workspace"])
+            .position(|args| {
+                args == [
+                    "--bind",
+                    "/tmp/grokforge-workspace",
+                    "/tmp/grokforge-workspace",
+                ]
+            })
             .expect("workspace restore bind");
-        assert!(source_bind < tmpfs && tmpfs < restore);
+        assert!(tmpfs < restore);
+        assert!(
+            !wrapped
+                .args
+                .iter()
+                .any(|arg| arg.starts_with("/.grokforge-bind-sources"))
+        );
     }
 
     #[test]
-    fn run_workspace_source_is_staged_before_private_run_mount() {
+    fn run_workspace_is_restored_after_private_run_mount() {
         let root = PathBuf::from("/run/user/1000/grokforge-workspace");
         let policy = SandboxPolicy::workspace_write(&root);
         let wrapped = wrap(&policy, &spec(root));
-        let staging = "/.grokforge-bind-sources/w0";
-        let source_bind = wrapped
-            .args
-            .windows(3)
-            .position(|args| args == ["--bind", "/run/user/1000/grokforge-workspace", staging])
-            .expect("source staging bind");
         let tmpfs = wrapped
             .args
             .windows(2)
@@ -1402,15 +1295,35 @@ mod tests {
         let restore = wrapped
             .args
             .windows(3)
-            .position(|args| args == ["--bind", staging, "/run/user/1000/grokforge-workspace"])
+            .position(|args| {
+                args == [
+                    "--bind",
+                    "/run/user/1000/grokforge-workspace",
+                    "/run/user/1000/grokforge-workspace",
+                ]
+            })
             .expect("workspace restore bind");
-        assert!(source_bind < tmpfs && tmpfs < restore);
+        assert!(tmpfs < restore);
     }
 
+    #[cfg(target_os = "linux")]
+    fn live_bwrap_available() -> bool {
+        let capability = BubblewrapRunner.capability();
+        if capability.enforced {
+            return true;
+        }
+        assert!(
+            std::env::var_os("GROKFORGE_REQUIRE_SANDBOX").is_none(),
+            "required live bubblewrap backend unavailable: {capability:?}"
+        );
+        eprintln!("skipping live bubblewrap test: {capability:?}");
+        false
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn real_bwrap_keeps_a_tmp_workspace_writable_when_available() {
-        if !BubblewrapRunner::available() {
-            eprintln!("skipping: bubblewrap unavailable");
+        if !live_bwrap_available() {
             return;
         }
         let dir = tempfile::tempdir().expect("workspace");
@@ -1428,11 +1341,63 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn real_bwrap_keeps_a_tmp_workspace_read_only_when_available() {
+        if !live_bwrap_available() {
+            return;
+        }
+        let workspace = tempfile::tempdir_in("/tmp").expect("workspace");
+        std::fs::create_dir(workspace.path().join(".git")).expect("git dir");
+        std::fs::write(workspace.path().join("input.txt"), "visible").expect("input");
+        let policy = SandboxPolicy::read_only(workspace.path());
+        let command = CommandSpec::shell(
+            "cat input.txt; if printf escaped > result.txt 2>/dev/null; then exit 21; else printf READ_ONLY_OK; fi",
+            workspace.path().to_path_buf(),
+        );
+        let output = BubblewrapRunner
+            .run(&policy, &command)
+            .await
+            .expect("run bwrap");
+        assert!(output.succeeded(), "{output:?}");
+        assert!(output.stdout.contains("visibleREAD_ONLY_OK"), "{output:?}");
+        assert!(!workspace.path().join("result.txt").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn real_bwrap_restores_an_external_tmp_protected_tree_read_only() {
+        if !live_bwrap_available() {
+            return;
+        }
+        let workspace = tempfile::tempdir_in("/var/tmp").expect("workspace");
+        std::fs::create_dir(workspace.path().join(".git")).expect("git dir");
+        let protected = tempfile::tempdir_in("/tmp").expect("protected");
+        let config = protected.path().join("config");
+        std::fs::write(&config, "visible").expect("config");
+        let mut policy = SandboxPolicy::workspace_write(workspace.path());
+        policy.protected_paths.push(protected.path().to_path_buf());
+        let command = CommandSpec::shell(
+            &format!(
+                "cat '{}'; if printf escaped > '{}' 2>/dev/null; then exit 21; else printf PROTECTED_OK; fi",
+                config.display(),
+                config.display()
+            ),
+            workspace.path().to_path_buf(),
+        );
+        let output = BubblewrapRunner
+            .run(&policy, &command)
+            .await
+            .expect("run bwrap");
+        assert!(output.succeeded(), "{output:?}");
+        assert!(output.stdout.contains("visiblePROTECTED_OK"), "{output:?}");
+        assert_eq!(std::fs::read_to_string(config).expect("config"), "visible");
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn real_bwrap_drops_effective_inheritable_and_ambient_capabilities() {
-        if !BubblewrapRunner::available() {
-            eprintln!("skipping: bubblewrap unavailable");
+        if !live_bwrap_available() {
             return;
         }
         let workspace = tempfile::tempdir().expect("workspace");
@@ -1450,31 +1415,34 @@ mod tests {
         assert!(output.succeeded(), "capabilities were retained: {output:?}");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn real_bwrap_masks_uppercase_env_when_available() {
-        if !BubblewrapRunner::available() {
-            eprintln!("skipping: bubblewrap unavailable");
+        if !live_bwrap_available() {
             return;
         }
         let workspace = tempfile::tempdir().expect("workspace");
         std::fs::create_dir(workspace.path().join(".git")).expect("git dir");
         std::fs::write(workspace.path().join(".ENV"), "UPPERCASE SECRET").expect("secret");
         let policy = SandboxPolicy::workspace_write(workspace.path());
-        let command = CommandSpec::shell("cat .ENV", workspace.path().to_path_buf());
+        let command = CommandSpec::shell(
+            "cat .ENV; printf SANDBOX_OK",
+            workspace.path().to_path_buf(),
+        );
 
         let output = BubblewrapRunner
             .run(&policy, &command)
             .await
             .expect("run bwrap");
+        assert!(output.succeeded(), "{output:?}");
+        assert!(output.stdout.contains("SANDBOX_OK"), "{output:?}");
         assert!(!output.stdout.contains("UPPERCASE SECRET"), "{output:?}");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn real_bwrap_danger_masks_an_external_private_store() {
-        if !BubblewrapRunner::available() {
-            eprintln!("skipping: bubblewrap unavailable");
+        if !live_bwrap_available() {
             return;
         }
         let workspace = tempfile::tempdir().expect("workspace");
@@ -1487,7 +1455,7 @@ mod tests {
         let literal = globset::escape(&private.to_string_lossy());
         policy.unreadable_globs = vec![literal.clone(), format!("{literal}/**")];
         let command = CommandSpec::shell(
-            &format!("cat '{}'", rollout.display()),
+            &format!("cat '{}' 2>/dev/null; printf SANDBOX_OK", rollout.display()),
             workspace.path().to_path_buf(),
         );
 
@@ -1495,14 +1463,15 @@ mod tests {
             .run(&policy, &command)
             .await
             .expect("run bwrap");
+        assert!(output.succeeded(), "{output:?}");
+        assert!(output.stdout.contains("SANDBOX_OK"), "{output:?}");
         assert!(!output.stdout.contains("PRIVATE ROLLOUT"), "{output:?}");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn real_bwrap_rejects_a_workspace_hardlink_to_an_outside_file() {
-        if !BubblewrapRunner::available() {
-            eprintln!("skipping: bubblewrap unavailable");
+        if !live_bwrap_available() {
             return;
         }
         let workspace = tempfile::tempdir().expect("workspace");
@@ -1524,11 +1493,10 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn real_bwrap_keeps_a_workspace_symlink_target_read_only() {
-        if !BubblewrapRunner::available() {
-            eprintln!("skipping: bubblewrap unavailable");
+        if !live_bwrap_available() {
             return;
         }
         let workspace = tempfile::tempdir().expect("workspace");
@@ -1538,29 +1506,29 @@ mod tests {
         std::fs::write(&target, "original").expect("outside target");
         std::os::unix::fs::symlink(&target, workspace.path().join("link")).expect("workspace link");
         let policy = SandboxPolicy::workspace_write(workspace.path());
-        let command = CommandSpec::shell("printf escaped > link", workspace.path().to_path_buf());
+        let command = CommandSpec::shell(
+            "if printf escaped > link 2>/dev/null; then exit 21; else printf BLOCKED_OK; fi",
+            workspace.path().to_path_buf(),
+        );
 
         let output = BubblewrapRunner
             .run(&policy, &command)
             .await
             .expect("run bwrap");
-        assert!(
-            !output.succeeded(),
-            "outside symlink write unexpectedly succeeded"
-        );
+        assert!(output.succeeded(), "{output:?}");
+        assert!(output.stdout.contains("BLOCKED_OK"), "{output:?}");
         assert_eq!(
             std::fs::read_to_string(target).expect("outside target"),
             "original"
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn real_bwrap_rejects_an_outside_directory_symlink_containing_a_unix_socket() {
         use std::os::unix::net::UnixListener;
 
-        if !BubblewrapRunner::available() {
-            eprintln!("skipping: bubblewrap unavailable");
+        if !live_bwrap_available() {
             return;
         }
         let workspace = tempfile::tempdir().expect("workspace");

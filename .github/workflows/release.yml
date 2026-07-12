@@ -27,12 +27,24 @@ jobs:
       - name: Install supported bubblewrap
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential meson ninja-build pkg-config libcap-dev libselinux1-dev
+          sudo apt-get install -y apparmor build-essential meson ninja-build pkg-config libcap-dev libselinux1-dev
           git clone --depth 1 --branch v0.11.2 https://github.com/containers/bubblewrap.git /tmp/bubblewrap
           test "$(git -C /tmp/bubblewrap rev-parse HEAD)" = "1b80120ef26a28e065e67f89bfef873f13bdd317"
           meson setup /tmp/bubblewrap/build /tmp/bubblewrap --prefix=/usr
           meson compile -C /tmp/bubblewrap/build
           sudo meson install -C /tmp/bubblewrap/build
+          if test -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns && test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1; then
+            sudo tee /etc/apparmor.d/grokforge-bwrap >/dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          EOF
+            sudo apparmor_parser -r /etc/apparmor.d/grokforge-bwrap
+          fi
+          /usr/bin/bwrap --ro-bind / / --dev /dev --proc /proc --unshare-net --unshare-pid --unshare-ipc --unshare-uts --new-session --die-with-parent --cap-drop ALL -- /bin/true
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
