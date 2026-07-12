@@ -72,6 +72,8 @@ gix = "0.66"
 ignore = "0.4"
 globset = "0.4"
 nucleo = "0.5"
+regex = "1"
+tempfile = "3"
 
 # --- tui / render ---
 ratatui = "0.29"

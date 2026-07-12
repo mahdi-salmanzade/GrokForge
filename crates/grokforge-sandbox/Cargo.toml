@@ -10,3 +10,13 @@ description = "SandboxPolicy compilation, per-OS backends (Landlock/seccomp, Sea
 
 [lints]
 workspace = true
+
+[dependencies]
+grokforge-protocol = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

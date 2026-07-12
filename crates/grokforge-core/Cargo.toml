@@ -10,3 +10,24 @@ description = "Agent loop, tools, approval engine, context assembler + redaction
 
 [lints]
 workspace = true
+
+[dependencies]
+grokforge-protocol = { workspace = true }
+grokforge-xai = { workspace = true }
+grokforge-sandbox = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+ignore = { workspace = true }
+globset = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+grokforge-test-support = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

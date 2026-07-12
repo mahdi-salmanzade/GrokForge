@@ -77,6 +77,12 @@ pub enum InputItem {
         role: Role,
         content: Vec<ContentPart>,
     },
+    /// A prior assistant function call, replayed so the model sees a coherent transcript.
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
     /// The result of a client-side tool/function call, fed back to the model.
     FunctionCallOutput { call_id: String, output: String },
 }

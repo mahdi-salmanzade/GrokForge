@@ -19,6 +19,10 @@ workspace = true
 
 [dependencies]
 clap = { workspace = true }
+grokforge-protocol = { workspace = true }
+grokforge-core = { workspace = true }
+grokforge-sandbox = { workspace = true }
 grokforge-xai = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
+serde_json = { workspace = true }

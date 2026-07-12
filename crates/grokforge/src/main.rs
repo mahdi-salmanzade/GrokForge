@@ -4,6 +4,9 @@
 //! The other subcommands are scaffolded here and implemented at their milestones.
 
 mod debug;
+mod headless;
+
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
@@ -26,6 +29,27 @@ enum Command {
         /// The task for the agent to perform.
         #[arg(short = 'p', long)]
         prompt: Option<String>,
+        /// Approval + sandbox preset.
+        #[arg(long, default_value = "auto", value_parser = ["readonly", "auto", "strict", "yolo"])]
+        preset: String,
+        /// Model slug (defaults to grok-build-0.1).
+        #[arg(long)]
+        model: Option<String>,
+        /// Emit NDJSON events instead of plain text.
+        #[arg(long)]
+        json: bool,
+        /// Run in this directory instead of the current one.
+        #[arg(long)]
+        cd: Option<PathBuf>,
+        /// Pre-grant a boundary: `network`, `write:<path>`, or `cmd:<prefix>`. Repeatable.
+        #[arg(long = "allow")]
+        allow: Vec<String>,
+        /// Reasoning effort: low, medium, or high.
+        #[arg(long)]
+        effort: Option<String>,
+        /// Maximum tool-call iterations within the turn.
+        #[arg(long, default_value_t = 32)]
+        max_iterations: u32,
     },
     /// Resume a previous session.
     Resume {
@@ -70,9 +94,46 @@ async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        None if cli.prompt.is_some() => milestone("headless exec", "M2"),
+        None if cli.prompt.is_some() => {
+            headless::run(headless::ExecArgs {
+                prompt: cli.prompt.unwrap_or_default(),
+                preset: "auto".to_string(),
+                model: None,
+                json: false,
+                cd: None,
+                allow: Vec::new(),
+                effort: None,
+                max_iterations: 32,
+            })
+            .await
+        }
         None => milestone("the interactive TUI", "M3"),
-        Some(Command::Exec { .. }) => milestone("headless exec", "M2"),
+        Some(Command::Exec {
+            prompt,
+            preset,
+            model,
+            json,
+            cd,
+            allow,
+            effort,
+            max_iterations,
+        }) => {
+            let Some(prompt) = prompt.or(cli.prompt) else {
+                eprintln!("provide a prompt with -p/--prompt");
+                return std::process::ExitCode::from(2);
+            };
+            headless::run(headless::ExecArgs {
+                prompt,
+                preset,
+                model,
+                json,
+                cd,
+                allow,
+                effort,
+                max_iterations,
+            })
+            .await
+        }
         Some(Command::Doctor) => {
             println!("grokforge {}", env!("CARGO_PKG_VERSION"));
             println!("minimum toolchain: {}", env!("CARGO_PKG_RUST_VERSION"));
