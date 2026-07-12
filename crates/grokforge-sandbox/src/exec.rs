@@ -712,26 +712,7 @@ mod tests {
 
     #[tokio::test]
     async fn drains_stdout_and_stderr_concurrently_without_deadlock() {
-        #[cfg(windows)]
-        let mut spec = CommandSpec {
-            program: "powershell.exe".to_string(),
-            args: vec![
-                "-NoProfile".to_string(),
-                "-NonInteractive".to_string(),
-                "-Command".to_string(),
-                "[Console]::Out.Write(('x' * 200000 -join '')); \
-                 [Console]::Error.Write(('y' * 200000 -join ''))"
-                    .to_string(),
-            ],
-            cwd: std::env::temp_dir(),
-            timeout: Duration::from_secs(5),
-            cancellation: None,
-        };
-        #[cfg(not(windows))]
-        let mut spec = CommandSpec::shell(
-            "awk 'BEGIN { for(i=0;i<200000;i++) printf \"x\" }'; awk 'BEGIN { for(i=0;i<200000;i++) printf \"y\" }' >&2",
-            std::env::temp_dir(),
-        );
+        let mut spec = reexec_ignored_test("exec::tests::capture_child_writes_large_output");
         spec.timeout = Duration::from_secs(5);
         let out = run_capture(&spec).await.expect("run");
         assert!(out.succeeded(), "{out:?}");
@@ -744,32 +725,62 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_preserves_partial_output() {
-        #[cfg(windows)]
-        let mut spec = CommandSpec {
-            program: "powershell.exe".to_string(),
-            args: vec![
-                "-NoProfile".to_string(),
-                "-NonInteractive".to_string(),
-                "-Command".to_string(),
-                "[Console]::Out.Write('before'); [Console]::Error.Write('warning'); \
-                 Start-Sleep -Seconds 10"
-                    .to_string(),
-            ],
-            cwd: std::env::temp_dir(),
-            timeout: Duration::from_millis(100),
-            cancellation: None,
-        };
-        #[cfg(not(windows))]
-        let mut spec = CommandSpec::shell(
-            "printf before; printf warning >&2; sleep 10",
-            std::env::temp_dir(),
-        );
+        let mut spec = reexec_ignored_test("exec::tests::capture_child_writes_then_waits");
         spec.timeout = Duration::from_millis(100);
         let out = run_capture(&spec).await.expect("run");
         assert!(out.timed_out);
         assert!(out.stdout.contains("before"));
         assert!(out.stderr.contains("warning"));
         assert!(out.stderr.contains("timed out"));
+    }
+
+    fn reexec_ignored_test(name: &str) -> CommandSpec {
+        CommandSpec {
+            program: std::env::current_exe()
+                .expect("current test executable")
+                .to_string_lossy()
+                .into_owned(),
+            args: vec![
+                "--ignored".to_string(),
+                "--exact".to_string(),
+                name.to_string(),
+                "--nocapture".to_string(),
+            ],
+            cwd: std::env::temp_dir(),
+            timeout: Duration::from_secs(5),
+            cancellation: None,
+        }
+    }
+
+    #[test]
+    #[ignore = "helper process for output-capture tests"]
+    fn capture_child_writes_large_output() {
+        use std::io::Write as _;
+
+        let output = vec![b'x'; 200_000];
+        std::io::stdout()
+            .write_all(&output)
+            .expect("write helper stdout");
+        let output = vec![b'y'; 200_000];
+        std::io::stderr()
+            .write_all(&output)
+            .expect("write helper stderr");
+    }
+
+    #[test]
+    #[ignore = "helper process for timeout tests"]
+    fn capture_child_writes_then_waits() {
+        use std::io::Write as _;
+
+        std::io::stdout()
+            .write_all(b"before")
+            .expect("write helper stdout");
+        std::io::stdout().flush().expect("flush helper stdout");
+        std::io::stderr()
+            .write_all(b"warning")
+            .expect("write helper stderr");
+        std::io::stderr().flush().expect("flush helper stderr");
+        std::thread::sleep(Duration::from_secs(10));
     }
 
     #[cfg(unix)]
