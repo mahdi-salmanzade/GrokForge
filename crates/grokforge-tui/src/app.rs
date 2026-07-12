@@ -30,6 +30,7 @@ enum Entry {
     Assistant(String),
     Tool(String),
     ToolResult { ok: bool, text: String },
+    Git(String),
     Error(String),
     Info(String),
 }
@@ -223,6 +224,11 @@ impl App {
                 self.transcript
                     .push(Entry::ToolResult { ok, text: summary });
             }
+            EventMsg::Committed { sha, message } => {
+                let short = &sha[..sha.len().min(8)];
+                self.transcript
+                    .push(Entry::Git(format!("committed {short}  {message}")));
+            }
             EventMsg::Error { message, .. } => {
                 self.transcript.push(Entry::Error(message));
             }
@@ -367,6 +373,12 @@ fn push_entry_lines(lines: &mut Vec<Line<'static>>, entry: &Entry) {
             lines.push(Line::from(Span::styled(
                 format!("  {glyph} {text}"),
                 Style::default().fg(color),
+            )));
+        }
+        Entry::Git(text) => {
+            lines.push(Line::from(Span::styled(
+                format!("⎿ {text}"),
+                Style::default().fg(Color::Blue),
             )));
         }
         Entry::Error(text) => {

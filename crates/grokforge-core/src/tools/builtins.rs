@@ -133,7 +133,10 @@ impl Tool for WriteFile {
             }
         }
         match tokio::fs::write(&resolved, content).await {
-            Ok(()) => ToolOutput::success(format!("wrote {} bytes to `{path}`", content.len())),
+            Ok(()) => {
+                inv.ctx.record_touched(resolved);
+                ToolOutput::success(format!("wrote {} bytes to `{path}`", content.len()))
+            }
             Err(e) => ToolOutput::failure(format!("cannot write `{path}`: {e}")),
         }
     }
@@ -210,6 +213,7 @@ impl Tool for EditFile {
         };
         match tokio::fs::write(&resolved, updated).await {
             Ok(()) => {
+                inv.ctx.record_touched(resolved);
                 ToolOutput::success(format!("edited `{path}` ({occurrences} replacement(s))"))
             }
             Err(e) => ToolOutput::failure(format!("cannot write `{path}`: {e}")),

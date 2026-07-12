@@ -50,6 +50,8 @@ pub enum EventMsg {
     },
     /// A ledger entry was recorded for the request being assembled.
     LedgerAppended(LedgerEntry),
+    /// The host process created an auto-commit for the agent's edits.
+    Committed { sha: String, message: String },
     /// Token usage and cost for a response.
     TokenUsage { usage: Usage },
     /// The client is replaying the request after a failure.

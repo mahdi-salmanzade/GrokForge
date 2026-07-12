@@ -22,6 +22,8 @@ pub struct SessionConfig {
     pub system_prompt: String,
     /// Hard cap on tool-call iterations within one turn.
     pub max_iterations: u32,
+    /// Auto-commit the agent's edits at the end of a mutating turn (when in a git repo).
+    pub auto_commit: bool,
 }
 
 impl SessionConfig {
@@ -36,6 +38,7 @@ impl SessionConfig {
             effort: None,
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             max_iterations: 32,
+            auto_commit: true,
         }
     }
 

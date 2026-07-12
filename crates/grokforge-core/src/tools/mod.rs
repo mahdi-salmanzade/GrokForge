@@ -33,6 +33,8 @@ pub struct TurnContext {
     pub workspace_root: PathBuf,
     pub policy: SandboxPolicy,
     pub sandbox: Arc<dyn SandboxRunner>,
+    /// Paths the agent has written this turn, collected so only those are auto-committed.
+    pub touched: Arc<std::sync::Mutex<Vec<PathBuf>>>,
 }
 
 impl std::fmt::Debug for TurnContext {
@@ -54,6 +56,21 @@ impl TurnContext {
         } else {
             self.workspace_root.join(p)
         }
+    }
+
+    /// Record that a path was written this turn (for auto-commit).
+    pub fn record_touched(&self, path: PathBuf) {
+        if let Ok(mut touched) = self.touched.lock() {
+            if !touched.contains(&path) {
+                touched.push(path);
+            }
+        }
+    }
+
+    /// The paths written this turn.
+    #[must_use]
+    pub fn touched_paths(&self) -> Vec<PathBuf> {
+        self.touched.lock().map(|t| t.clone()).unwrap_or_default()
     }
 }
 

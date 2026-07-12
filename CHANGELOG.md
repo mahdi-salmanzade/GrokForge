@@ -44,3 +44,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   selects per platform and reports capability honestly (`enforced` flag). Wired into both
   frontends. Verified end-to-end: under `--preset auto` the model's write outside the
   workspace is blocked by the kernel.
+- M6 git-native workflow (`grokforge-git` + core wiring): every mutating turn's edits become a
+  real commit from the trusted host process (never in the sandbox). `Git` shells out to the
+  `git` CLI for discovery/status/commit/undo/worktrees. Auto-commit stages **only the paths the
+  agent touched** (a `TurnContext` collector fed by write_file/edit), attaches
+  `Grokforge-Session`/`Grokforge-Turn` trailers, and neutralizes hooks (`--no-verify` + empty
+  `hooksPath`). `undo_last` walks the session's contiguous trailer commits (`reset --keep` at the
+  tip, else `revert`) and stops at foreign commits. Worktree add/remove primitives for M10.
+  New `Committed` event surfaced in both frontends. Verified end-to-end: a write in a git repo
+  produces a trailered `grokforge: update greet.py` commit.

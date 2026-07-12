@@ -565,6 +565,7 @@ dependencies = [
  "async-trait",
  "futures",
  "globset",
+ "grokforge-git",
  "grokforge-protocol",
  "grokforge-sandbox",
  "grokforge-test-support",
@@ -583,6 +584,12 @@ dependencies = [
 [[package]]
 name = "grokforge-git"
 version = "0.1.0"
+dependencies = [
+ "grokforge-protocol",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "grokforge-mcp"

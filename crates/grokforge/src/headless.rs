@@ -155,6 +155,10 @@ fn emit(ev: &EventMsg, json: bool) {
                 if *ok { "ok" } else { "failed/denied" }
             );
         }
+        EventMsg::Committed { sha, message } => {
+            let short = &sha[..sha.len().min(8)];
+            eprintln!("[commit {short}] {message}");
+        }
         EventMsg::TurnComplete { stop, .. } => {
             println!();
             eprintln!("[done: {stop:?}]");

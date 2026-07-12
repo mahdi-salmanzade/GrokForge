@@ -6,7 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "gix reads; git-CLI mutations from the trusted host process; auto-commit, undo, worktrees."
+description = "Git reads and host-process mutations: auto-commit, undo, worktrees."
 
 [lints]
 workspace = true
+
+[dependencies]
+grokforge-protocol = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

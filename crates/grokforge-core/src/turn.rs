@@ -8,7 +8,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use grokforge_protocol::{
     ApprovalId, ApprovalRequest, EventMsg, ResponseItem, SandboxMode, SandboxPolicy, StopReason,
-    ToolCallId, Usage,
+    ToolCallId, TurnId, Usage,
 };
 use grokforge_sandbox::SandboxRunner;
 use grokforge_xai::{StreamEvent, XaiClient};
@@ -84,6 +84,7 @@ impl Agent {
             workspace_root: root,
             policy,
             sandbox: Arc::clone(&self.sandbox),
+            touched: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -195,11 +196,43 @@ impl Agent {
             }
         };
 
+        // Auto-commit the agent's edits from the trusted host process (never in the sandbox).
+        if session.config.auto_commit {
+            self.auto_commit(session, turn_id, &ctx).await;
+        }
+
         self.emit(EventMsg::TurnComplete {
             turn_id,
             stop: stop.clone(),
         });
         stop
+    }
+
+    /// Commit files the agent wrote this turn, staging only those paths, from the host process.
+    async fn auto_commit(&self, session: &Session, turn_id: TurnId, ctx: &TurnContext) {
+        let touched: Vec<std::path::PathBuf> =
+            ctx.touched_paths().into_iter().filter(|p| p.exists()).collect();
+        if touched.is_empty() {
+            return;
+        }
+        let Some(git) = grokforge_git::Git::discover(&session.config.workspace_root) else {
+            return;
+        };
+        let message = commit_message(&touched);
+        let session_id = session.id;
+        let result = tokio::task::spawn_blocking(move || {
+            git.agent_commit(&touched, &message, session_id, turn_id)
+                .map(|sha| (sha, message))
+        })
+        .await;
+        match result {
+            Ok(Ok((Some(sha), message))) => {
+                self.emit(EventMsg::Committed { sha, message });
+            }
+            Ok(Ok((None, _))) => {}
+            Ok(Err(e)) => tracing::warn!("auto-commit failed: {e}"),
+            Err(e) => tracing::warn!("auto-commit task failed: {e}"),
+        }
     }
 
     async fn run_tool_call(
@@ -334,6 +367,28 @@ impl Agent {
             },
         )
         .await;
+    }
+}
+
+/// A heuristic commit subject. Model-generated conventional-commit messages (via structured
+/// outputs) are a planned refinement; this keeps the git-native workflow self-contained.
+fn commit_message(touched: &[std::path::PathBuf]) -> String {
+    let names: Vec<String> = touched
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    match names.as_slice() {
+        [] => "grokforge: update files".to_string(),
+        [one] => format!("grokforge: update {one}"),
+        many => {
+            let shown: Vec<&str> = many.iter().take(3).map(String::as_str).collect();
+            let more = if many.len() > 3 {
+                format!(", +{}", many.len() - 3)
+            } else {
+                String::new()
+            };
+            format!("grokforge: update {} files ({}{more})", many.len(), shown.join(", "))
+        }
     }
 }
 
