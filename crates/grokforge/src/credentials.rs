@@ -105,26 +105,55 @@ pub async fn resolve(allow_prompt: bool) -> Option<String> {
         return Some(token);
     }
     if allow_prompt && std::io::stdin().is_terminal() {
-        eprintln!("No xAI credentials found.");
-        eprintln!("  • Paste an API key below (saved to your OS keychain), or");
-        eprintln!("  • press Ctrl+C and run `grokforge login --subscription` to sign in with");
-        eprintln!("    your SuperGrok / X Premium+ subscription instead.");
-        if let Some(key) = prompt_hidden() {
-            match store(&key) {
-                Ok(()) => eprintln!("✓ saved to keychain (change it later with `grokforge login`)"),
-                Err(e) => eprintln!(
-                    "warning: couldn't save to keychain ({e}); using it for this session only"
-                ),
-            }
-            return Some(key);
-        }
-        eprintln!("no key entered.");
-    } else {
-        eprintln!(
-            "No xAI credentials. Set XAI_API_KEY, run `grokforge login` (API key), or `grokforge login --subscription` (SuperGrok)."
-        );
+        return onboard_interactive().await;
     }
+    eprintln!(
+        "No xAI credentials. Set XAI_API_KEY, run `grokforge login` (API key), or `grokforge login --subscription` (SuperGrok)."
+    );
     None
+}
+
+/// First-run onboarding shown inside `grokforge` when no credential exists: let the user sign in
+/// with their subscription or paste an API key, right here — no separate command needed.
+async fn onboard_interactive() -> Option<String> {
+    use std::io::Write as _;
+    eprintln!("\nWelcome to GrokForge 👋  You're not signed in yet. Choose how to connect:");
+    eprintln!("  [1] Sign in with your Grok subscription (SuperGrok / X Premium+) — no API key");
+    eprintln!("  [2] Paste an xAI API key (console.x.ai)");
+    eprint!("Choice [1/2] (default 1): ");
+    let _ = std::io::stderr().flush();
+
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return None;
+    }
+    if line.trim() == "2" {
+        // Paste an API key.
+        let key = prompt_hidden()?;
+        match store(&key) {
+            Ok(()) => eprintln!("✓ saved to keychain"),
+            Err(e) => eprintln!("warning: couldn't save to keychain ({e}); using for this session"),
+        }
+        Some(key)
+    } else {
+        // Default: subscription OAuth.
+        eprintln!("Note: subscription API access currently requires the SuperGrok Heavy tier.\n");
+        match oauth::login().await {
+            Ok(tokens) => {
+                let token = tokens.access_token.clone();
+                if let Err(e) = store_oauth(&tokens) {
+                    eprintln!("signed in, but couldn't store tokens ({e}); using for this session");
+                } else {
+                    eprintln!("✓ signed in — starting GrokForge…");
+                }
+                Some(token)
+            }
+            Err(e) => {
+                eprintln!("sign-in failed: {e}");
+                None
+            }
+        }
+    }
 }
 
 // ---------- login subcommands ----------
