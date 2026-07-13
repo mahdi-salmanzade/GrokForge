@@ -1,15 +1,24 @@
-//! xAI API key resolution + secure storage.
+//! xAI credential resolution + secure storage, for two auth methods:
+//! - **API key** (`XAI_API_KEY` / `grokforge login`) — pay-per-token developer billing.
+//! - **Subscription OAuth** (`grokforge login --subscription`) — signs in with SuperGrok /
+//!   X Premium+ so usage bills against the subscription. The bearer token is used identically.
 //!
-//! Resolution order: `XAI_API_KEY` env (best for CI) → OS keychain → (interactive) hidden
-//! prompt that saves into the keychain. The key is never written to disk in plaintext.
+//! Resolution order: `XAI_API_KEY` env → stored API key → stored OAuth token (refreshed if
+//! expired) → (interactive) hidden API-key prompt. Nothing is written to disk in plaintext;
+//! secrets live in the OS keychain.
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
+use grokforge_xai::oauth::{self, OAuthTokens};
+
 const SERVICE: &str = "grokforge";
 const ACCOUNT: &str = "xai-api-key";
+const OAUTH_ACCOUNT: &str = "xai-oauth";
 
-/// Load a stored key from the OS keychain, if present.
+// ---------- API key storage ----------
+
+/// Load a stored API key from the OS keychain, if present.
 #[must_use]
 pub fn load_stored() -> Option<String> {
     let entry = keyring::Entry::new(SERVICE, ACCOUNT).ok()?;
@@ -19,11 +28,59 @@ pub fn load_stored() -> Option<String> {
     }
 }
 
-/// Store (or replace) the key in the OS keychain.
+/// Store (or replace) the API key in the OS keychain.
 pub fn store(key: &str) -> Result<(), String> {
     let entry = keyring::Entry::new(SERVICE, ACCOUNT).map_err(|e| e.to_string())?;
     entry.set_password(key).map_err(|e| e.to_string())
 }
+
+// ---------- OAuth (subscription) token storage ----------
+
+fn load_oauth() -> Option<OAuthTokens> {
+    let entry = keyring::Entry::new(SERVICE, OAUTH_ACCOUNT).ok()?;
+    let json = entry.get_password().ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+/// Whether a subscription (OAuth) token is stored. Used by `doctor` (no network).
+#[must_use]
+pub fn has_oauth() -> bool {
+    load_oauth().is_some()
+}
+
+fn store_oauth(tokens: &OAuthTokens) -> Result<(), String> {
+    let entry = keyring::Entry::new(SERVICE, OAUTH_ACCOUNT).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string(tokens).map_err(|e| e.to_string())?;
+    entry.set_password(&json).map_err(|e| e.to_string())
+}
+
+/// Return a usable OAuth access token, refreshing (and re-storing) if it has expired.
+async fn oauth_access_token() -> Option<String> {
+    let tokens = load_oauth()?;
+    if tokens.is_valid() {
+        return Some(tokens.access_token);
+    }
+    // Expired — try to refresh.
+    let refresh = tokens.refresh_token?;
+    match oauth::refresh(&refresh).await {
+        Ok(mut fresh) => {
+            if fresh.refresh_token.is_none() {
+                fresh.refresh_token = Some(refresh);
+            }
+            let token = fresh.access_token.clone();
+            let _ = store_oauth(&fresh);
+            Some(token)
+        }
+        Err(e) => {
+            eprintln!(
+                "subscription token refresh failed ({e}); run `grokforge login --subscription` again."
+            );
+            None
+        }
+    }
+}
+
+// ---------- resolution ----------
 
 fn prompt_hidden() -> Option<String> {
     rpassword::prompt_password("xAI API key (input hidden): ")
@@ -32,11 +89,10 @@ fn prompt_hidden() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Resolve the API key. When `allow_prompt` is set, stdin is a TTY, and nothing is configured,
-/// interactively prompt (hidden) and save it to the keychain. Returns `None` (after printing
-/// guidance) when no key can be obtained.
-#[must_use]
-pub fn resolve(allow_prompt: bool) -> Option<String> {
+/// Resolve a bearer token for the API (an API key or an OAuth access token — the client sends
+/// either as `Authorization: Bearer`). When `allow_prompt` is set and stdin is a TTY, prompt for
+/// an API key as a last resort. Returns `None` (after printing guidance) when nothing is available.
+pub async fn resolve(allow_prompt: bool) -> Option<String> {
     if let Ok(key) = std::env::var("XAI_API_KEY")
         && !key.trim().is_empty()
     {
@@ -45,32 +101,35 @@ pub fn resolve(allow_prompt: bool) -> Option<String> {
     if let Some(key) = load_stored() {
         return Some(key);
     }
+    if let Some(token) = oauth_access_token().await {
+        return Some(token);
+    }
     if allow_prompt && std::io::stdin().is_terminal() {
-        eprintln!("No xAI API key found. Paste it below — it will be saved to your OS keychain.");
-        eprintln!("(Get a key at https://console.x.ai; you'll need API credits.)");
+        eprintln!("No xAI credentials found.");
+        eprintln!("  • Paste an API key below (saved to your OS keychain), or");
+        eprintln!("  • press Ctrl+C and run `grokforge login --subscription` to sign in with");
+        eprintln!("    your SuperGrok / X Premium+ subscription instead.");
         if let Some(key) = prompt_hidden() {
             match store(&key) {
-                Ok(()) => {
-                    eprintln!("✓ saved to keychain (change it later with `grokforge login`)");
-                }
-                Err(e) => {
-                    eprintln!(
-                        "warning: couldn't save to keychain ({e}); using it for this session only"
-                    );
-                }
+                Ok(()) => eprintln!("✓ saved to keychain (change it later with `grokforge login`)"),
+                Err(e) => eprintln!(
+                    "warning: couldn't save to keychain ({e}); using it for this session only"
+                ),
             }
             return Some(key);
         }
         eprintln!("no key entered.");
     } else {
         eprintln!(
-            "No xAI API key. Set XAI_API_KEY, or run `grokforge login` to store one securely."
+            "No xAI credentials. Set XAI_API_KEY, run `grokforge login` (API key), or `grokforge login --subscription` (SuperGrok)."
         );
     }
     None
 }
 
-/// `grokforge login` — prompt for a key and store it in the OS keychain.
+// ---------- login subcommands ----------
+
+/// `grokforge login` — prompt for an API key and store it in the OS keychain.
 #[must_use]
 pub fn login() -> ExitCode {
     if !std::io::stdin().is_terminal() {
@@ -89,6 +148,31 @@ pub fn login() -> ExitCode {
         }
         Err(e) => {
             eprintln!("could not store key: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `grokforge login --subscription` — sign in with SuperGrok / X Premium+ via OAuth and store
+/// the resulting tokens in the OS keychain. Usage then bills against the subscription.
+pub async fn login_subscription() -> ExitCode {
+    eprintln!(
+        "Note: xAI currently limits subscription (OAuth) API access to the SuperGrok Heavy tier."
+    );
+    eprintln!("Standard SuperGrok / X Premium+ may be refused with a 403 until xAI lifts that.\n");
+    match oauth::login().await {
+        Ok(tokens) => match store_oauth(&tokens) {
+            Ok(()) => {
+                println!("✓ signed in — subscription tokens stored in your OS keychain.");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("signed in, but could not store tokens: {e}");
+                ExitCode::from(1)
+            }
+        },
+        Err(e) => {
+            eprintln!("sign-in failed: {e}");
             ExitCode::from(1)
         }
     }

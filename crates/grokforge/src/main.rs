@@ -65,8 +65,13 @@ enum Command {
     },
     /// List and search past sessions.
     Sessions,
-    /// Store or replace the xAI API key in the OS keyring.
-    Login,
+    /// Store credentials in the OS keychain: an API key (default), or sign in with your
+    /// SuperGrok / X Premium+ subscription via `--subscription`.
+    Login {
+        /// Sign in with your Grok subscription (OAuth) instead of pasting an API key.
+        #[arg(long)]
+        subscription: bool,
+    },
     /// Report toolchain, sandbox capability, and configuration health.
     Doctor,
     /// Print the shell completion script.
@@ -245,7 +250,13 @@ async fn main() -> std::process::ExitCode {
         Some(Command::Doctor) => doctor::run(),
         Some(Command::Resume { id }) => sessions::resume(id).await,
         Some(Command::Sessions) => sessions::list().await,
-        Some(Command::Login) => credentials::login(),
+        Some(Command::Login { subscription }) => {
+            if subscription {
+                credentials::login_subscription().await
+            } else {
+                credentials::login()
+            }
+        }
         Some(Command::Completions { .. }) => milestone("completions", "M11"),
         Some(Command::Debug {
             cmd: DebugCommand::Api { prompt, model },

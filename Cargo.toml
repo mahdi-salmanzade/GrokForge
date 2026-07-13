@@ -61,6 +61,10 @@ directories = "5"
 keyring = "3"
 rpassword = "7"
 
+# --- crypto (PKCE for xAI OAuth) ---
+sha2 = "0.10"
+base64 = "0.22"
+
 # --- ids / time ---
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["formatting", "macros"] }

@@ -16,6 +16,7 @@ mod client;
 mod error;
 mod event;
 mod model;
+pub mod oauth;
 mod request;
 mod stream;
 
@@ -23,6 +24,7 @@ pub use client::{RequestAttempt, RetryConfig, XaiClient};
 pub use error::XaiError;
 pub use event::{EncryptedReasoning, StopReason, StreamEvent, ToolCall, Usage};
 pub use model::ModelInfo;
+pub use oauth::{OAuthError, OAuthTokens};
 pub use request::{
     ContentPart, Effort, FunctionTool, InputItem, Reasoning, ResponsesRequest, Role, ToolDef,
 };

@@ -31,17 +31,20 @@ pub fn run() -> ExitCode {
         Err(error) => println!("git: unavailable ({error}; auto-commit/undo disabled)"),
     }
 
-    // API key presence (never the value): from the env var or the OS keychain.
+    // Credential presence (never the value): env var, stored API key, or subscription OAuth.
     let from_env = std::env::var("XAI_API_KEY").is_ok_and(|k| !k.trim().is_empty());
     let from_keychain = crate::credentials::load_stored().is_some();
+    let from_oauth = crate::credentials::has_oauth();
     let key_status = if from_env {
-        "set (XAI_API_KEY env)"
+        "API key (XAI_API_KEY env)"
     } else if from_keychain {
-        "set (OS keychain)"
+        "API key (OS keychain)"
+    } else if from_oauth {
+        "subscription OAuth (OS keychain)"
     } else {
-        "not set — run `grokforge login`, or export XAI_API_KEY"
+        "none — run `grokforge login` (API key) or `grokforge login --subscription` (SuperGrok)"
     };
-    println!("API key: {key_status}");
+    println!("credential: {key_status}");
     let base = std::env::var("XAI_BASE_URL").unwrap_or_else(|_| "https://api.x.ai".to_string());
     let endpoint = crate::sanitize_terminal_line(&base);
     // This only parses and validates the URL; no request is made and the placeholder is never

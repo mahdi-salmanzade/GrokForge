@@ -15,7 +15,7 @@ pub async fn launch() -> ExitCode {
         }
     };
     // Interactive: resolve env → keychain → hidden prompt (and save to keychain).
-    let Some(api_key) = crate::credentials::resolve(true) else {
+    let Some(api_key) = crate::credentials::resolve(true).await else {
         return ExitCode::from(3);
     };
     let base_url = std::env::var("XAI_BASE_URL").unwrap_or_else(|_| "https://api.x.ai".to_string());
