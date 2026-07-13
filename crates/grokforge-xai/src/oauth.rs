@@ -210,44 +210,76 @@ async fn parse_token_response(resp: reqwest::Response) -> Result<OAuthTokens, OA
     Ok(tokens_from(parsed))
 }
 
-/// Accept one loopback request and pull `code` + `state` from its query string.
+/// Wait for the loopback redirect carrying `code` + `state`. Browsers (Safari especially) open
+/// speculative/preconnect and favicon connections that arrive *before* the real redirect and
+/// carry no `code`; we must answer and ignore those, and keep accepting until the real one
+/// arrives — otherwise the listener closes and the redirect hits a dead port.
 async fn accept_callback(
     listener: tokio::net::TcpListener,
 ) -> Result<(String, String), OAuthError> {
-    let (mut sock, _) = listener.accept().await?;
+    loop {
+        let (mut sock, _) = listener.accept().await?;
+        let request = read_request_head(&mut sock).await;
+        let target = request
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("")
+            .to_string();
+        let (code, state, error) =
+            parse_callback_query(target.split_once('?').map_or("", |(_, q)| q));
+
+        let done = code.is_some() || error.is_some();
+        let heading = if error.is_some() {
+            "Sign-in was cancelled. You can close this tab."
+        } else if done {
+            "GrokForge is signed in. You can close this tab and return to the terminal."
+        } else {
+            "Waiting for GrokForge sign-in…"
+        };
+        let body = format!(
+            "<html><body style=\"font-family:sans-serif\"><h3>{heading}</h3></body></html>"
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = sock.write_all(response.as_bytes()).await;
+        let _ = sock.shutdown().await;
+
+        if let Some(err) = error {
+            return Err(OAuthError::Denied(err));
+        }
+        if let (Some(c), Some(s)) = (code, state) {
+            return Ok((c, s));
+        }
+        // Non-callback connection (preconnect / favicon / no code) — keep waiting.
+    }
+}
+
+/// Read an HTTP request head (up to the blank line), tolerating idle/speculative connections
+/// via a short per-connection read timeout so a silent preconnect can't stall the flow.
+async fn read_request_head(sock: &mut tokio::net::TcpStream) -> String {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 2048];
-    // Read until we have the request line (blank line terminates headers).
     loop {
-        let n = sock.read(&mut tmp).await?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 8192 {
-            break;
+        match tokio::time::timeout(Duration::from_secs(5), sock.read(&mut tmp)).await {
+            Ok(Ok(n)) if n > 0 => {
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 8192 {
+                    break;
+                }
+            }
+            // EOF, read error, or idle-connection timeout — stop reading this connection.
+            _ => break,
         }
     }
-    let request = String::from_utf8_lossy(&buf);
-    let target = request
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("");
+    String::from_utf8_lossy(&buf).into_owned()
+}
 
-    let body = "<html><body style=\"font-family:sans-serif\"><h3>GrokForge is signed in.</h3><p>You can close this tab and return to the terminal.</p></body></html>";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = sock.write_all(response.as_bytes()).await;
-    let _ = sock.shutdown().await;
-
-    // Parse the query string of the request target.
-    let query = target.split_once('?').map_or("", |(_, q)| q);
-    let mut code = None;
-    let mut state = None;
-    let mut error = None;
+/// Extract `(code, state, error)` from a callback query string.
+fn parse_callback_query(query: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let (mut code, mut state, mut error) = (None, None, None);
     for pair in query.split('&') {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         let v = percent_decode(v);
@@ -258,15 +290,7 @@ async fn accept_callback(
             _ => {}
         }
     }
-    if let Some(err) = error {
-        return Err(OAuthError::Denied(err));
-    }
-    match (code, state) {
-        (Some(c), Some(s)) => Ok((c, s)),
-        _ => Err(OAuthError::Denied(
-            "callback missing code/state".to_string(),
-        )),
-    }
+    (code, state, error)
 }
 
 fn percent_decode(s: &str) -> String {
@@ -330,5 +354,20 @@ mod tests {
     fn percent_decode_handles_encodings() {
         assert_eq!(percent_decode("a%2Fb%20c"), "a/b c");
         assert_eq!(percent_decode("plain"), "plain");
+    }
+
+    #[test]
+    fn parses_callback_and_ignores_non_callbacks() {
+        let (code, state, error) = parse_callback_query("state=abc&code=xyz");
+        assert_eq!(code.as_deref(), Some("xyz"));
+        assert_eq!(state.as_deref(), Some("abc"));
+        assert!(error.is_none());
+
+        // A preconnect / favicon request has no code -> caller keeps waiting.
+        let (code, _, _) = parse_callback_query("");
+        assert!(code.is_none());
+
+        let (_, _, error) = parse_callback_query("error=access_denied");
+        assert_eq!(error.as_deref(), Some("access_denied"));
     }
 }
