@@ -59,6 +59,7 @@ clap = { version = "4", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 directories = "5"
 keyring = "3"
+rpassword = "7"
 
 # --- ids / time ---
 uuid = { version = "1", features = ["v4", "serde"] }

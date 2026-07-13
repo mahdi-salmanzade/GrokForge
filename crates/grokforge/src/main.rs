@@ -3,6 +3,7 @@
 //! Default invocation launches the interactive TUI (M3). `exec` runs headless (M2).
 //! The other subcommands are scaffolded here and implemented at their milestones.
 
+mod credentials;
 mod debug;
 mod doctor;
 mod headless;
@@ -136,13 +137,33 @@ pub(crate) async fn validate_model_startup(
             Err(std::process::ExitCode::from(3))
         }
         Ok(Err(error @ grokforge_xai::XaiError::Auth { .. })) => {
-            // Authentication has already been checked without sending any project context.
-            // Do not continue into the first full prompt request with credentials the endpoint
-            // has explicitly rejected.
+            // The credential itself was rejected — do not proceed to a full prompt request.
             eprintln!(
-                "model validation failed: {}",
+                "authentication failed — check your API key: {}",
                 sanitize_terminal(&error.to_string())
             );
+            Err(std::process::ExitCode::from(3))
+        }
+        Ok(Err(error @ grokforge_xai::XaiError::AccessDenied { .. })) => {
+            // The key is valid, but the account/team can't run the request (no credits/license).
+            // This is a billing/permissions problem, not an auth failure.
+            if error.is_billing() {
+                eprintln!(
+                    "xAI denied the request — your account/team has no credits or license yet."
+                );
+                match error.console_url() {
+                    Some(url) => eprintln!(
+                        "Add credits or a license, then re-run:\n  {}",
+                        sanitize_terminal(&url)
+                    ),
+                    None => eprintln!("Add credits/billing at https://console.x.ai, then re-run."),
+                }
+            } else {
+                eprintln!(
+                    "access denied (check model/endpoint permissions): {}",
+                    sanitize_terminal(&error.to_string())
+                );
+            }
             Err(std::process::ExitCode::from(3))
         }
         Ok(Err(error)) => {
@@ -224,7 +245,7 @@ async fn main() -> std::process::ExitCode {
         Some(Command::Doctor) => doctor::run(),
         Some(Command::Resume { id }) => sessions::resume(id).await,
         Some(Command::Sessions) => sessions::list().await,
-        Some(Command::Login) => milestone("keyring login", "M8+"),
+        Some(Command::Login) => credentials::login(),
         Some(Command::Completions { .. }) => milestone("completions", "M11"),
         Some(Command::Debug {
             cmd: DebugCommand::Api { prompt, model },

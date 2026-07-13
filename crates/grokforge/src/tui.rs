@@ -14,8 +14,8 @@ pub async fn launch() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let Ok(api_key) = std::env::var("XAI_API_KEY") else {
-        eprintln!("XAI_API_KEY is not set. Export it, or run `grokforge login` (lands in M8).");
+    // Interactive: resolve env → keychain → hidden prompt (and save to keychain).
+    let Some(api_key) = crate::credentials::resolve(true) else {
         return ExitCode::from(3);
     };
     let base_url = std::env::var("XAI_BASE_URL").unwrap_or_else(|_| "https://api.x.ai".to_string());

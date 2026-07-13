@@ -17,9 +17,15 @@ pub enum XaiError {
     #[error("request transport error: {0}")]
     Transport(#[source] reqwest::Error),
 
-    /// 401/403 — the API key is missing, invalid, or lacks access.
+    /// 401 — the API key is missing or invalid (the credential itself failed).
     #[error("authentication failed ({status}): {message}")]
     Auth { status: u16, message: String },
+
+    /// 402/403 — the key authenticated, but the account/team lacks access: no credits, no
+    /// license, or the model/endpoint isn't permitted. Distinct from [`Auth`] because the fix
+    /// is billing/permissions, not the key.
+    #[error("access denied ({status}): {message}")]
+    AccessDenied { status: u16, message: String },
 
     /// 429 — rate limited. `retry_after` carries the server's hint when present.
     #[error("rate limited ({status}); retry after {retry_after:?}: {message}")]
@@ -54,6 +60,10 @@ pub enum XaiError {
     #[error("decode error: {0}")]
     Decode(#[source] serde_json::Error),
 
+    /// A configured API key could not be found (env or keychain) — the caller should prompt.
+    #[error("no xAI API key configured")]
+    NoApiKey,
+
     /// The fully serialized request would exceed the local egress/memory safety limit.
     #[error("request body exceeds the {max}-byte safety limit")]
     RequestTooLarge { max: usize },
@@ -84,6 +94,42 @@ impl XaiError {
             _ => None,
         }
     }
+
+    /// Whether this denial is a billing/credits/license problem (the key is fine, the account
+    /// can't pay), as opposed to a bad credential.
+    #[must_use]
+    pub fn is_billing(&self) -> bool {
+        match self {
+            XaiError::AccessDenied { message, .. } | XaiError::RateLimited { message, .. } => {
+                let m = message.to_lowercase();
+                m.contains("credit")
+                    || m.contains("license")
+                    || m.contains("purchase")
+                    || m.contains("billing")
+                    || m.contains("spending limit")
+            }
+            _ => false,
+        }
+    }
+
+    /// The first `https://` URL mentioned in the provider message (e.g. the billing console link).
+    #[must_use]
+    pub fn console_url(&self) -> Option<String> {
+        let (XaiError::AccessDenied { message, .. }
+        | XaiError::Auth { message, .. }
+        | XaiError::Api { message, .. }
+        | XaiError::RateLimited { message, .. }) = self
+        else {
+            return None;
+        };
+        message
+            .split_whitespace()
+            .find(|t| t.starts_with("https://"))
+            .map(|s| {
+                s.trim_end_matches(['.', ',', '"', ')', '\'', '}', ']', '>', ';'])
+                    .to_string()
+            })
+    }
 }
 
 impl From<serde_json::Error> for XaiError {
@@ -104,5 +150,32 @@ mod tests {
             message: "monthly spending limit reached".into(),
         };
         assert!(error.to_string().contains("monthly spending limit reached"));
+    }
+
+    #[test]
+    fn access_denied_is_billing_and_extracts_url() {
+        let error = XaiError::AccessDenied {
+            status: 403,
+            message:
+                "Your team doesn't have any credits yet. Purchase at https://console.x.ai/team/abc."
+                    .into(),
+        };
+        assert!(error.is_billing(), "credits message should be billing");
+        assert_eq!(
+            error.console_url().as_deref(),
+            Some("https://console.x.ai/team/abc")
+        );
+        // And it must NOT display as an authentication failure.
+        assert!(!error.to_string().contains("authentication failed"));
+        assert!(error.to_string().contains("access denied"));
+    }
+
+    #[test]
+    fn plain_auth_failure_is_not_billing() {
+        let error = XaiError::Auth {
+            status: 401,
+            message: "invalid api key".into(),
+        };
+        assert!(!error.is_billing());
     }
 }

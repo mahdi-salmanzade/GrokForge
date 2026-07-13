@@ -9,8 +9,7 @@ use grokforge_protocol::ResponseItem;
 use grokforge_xai::{StreamEvent, XaiClient};
 
 pub async fn run_api(prompt: &str, model: &str) -> std::process::ExitCode {
-    let Ok(api_key) = std::env::var("XAI_API_KEY") else {
-        eprintln!("XAI_API_KEY is not set");
+    let Some(api_key) = crate::credentials::resolve(false) else {
         return std::process::ExitCode::from(3);
     };
     let base_url = std::env::var("XAI_BASE_URL").unwrap_or_else(|_| "https://api.x.ai".to_string());

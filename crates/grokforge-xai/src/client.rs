@@ -370,7 +370,10 @@ async fn error_from_response(resp: reqwest::Response, body_timeout: Duration) ->
     };
 
     match status {
-        401 | 403 => XaiError::Auth { status, message },
+        // 401 = bad/missing credential; 402/403 = key is fine but the account lacks
+        // access (no credits/license) — a billing/permissions problem, not an auth one.
+        401 => XaiError::Auth { status, message },
+        402 | 403 => XaiError::AccessDenied { status, message },
         429 => XaiError::RateLimited {
             status,
             retry_after,
@@ -453,6 +456,8 @@ fn extract_message(body: &str) -> String {
                 .and_then(|e| e.get("message"))
                 .and_then(|m| m.as_str())
                 .map(String::from)
+                // xAI often returns `{"code": "...", "error": "message text"}` — a plain string.
+                .or_else(|| v.get("error").and_then(|e| e.as_str()).map(String::from))
                 .or_else(|| v.get("message").and_then(|m| m.as_str()).map(String::from))
         })
         .unwrap_or_else(|| {
