@@ -247,6 +247,30 @@ pub enum ToolDef {
     Server(serde_json::Value),
 }
 
+/// Grok-native tools executed by xAI rather than by the local agent.
+///
+/// This closed enum is intentionally separate from [`ToolDef::Server`]: session and CLI
+/// configuration can opt into known, separately metered capabilities without accepting an
+/// arbitrary provider-tool JSON object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ServerTool {
+    WebSearch,
+    XSearch,
+    CodeInterpreter,
+}
+
+impl ServerTool {
+    /// Convert this opt-in capability to its Responses API tool definition.
+    #[must_use]
+    pub fn definition(self) -> ToolDef {
+        match self {
+            Self::WebSearch => ToolDef::web_search(),
+            Self::XSearch => ToolDef::x_search(),
+            Self::CodeInterpreter => ToolDef::code_interpreter(),
+        }
+    }
+}
+
 impl ToolDef {
     #[must_use]
     pub fn function(
@@ -279,6 +303,11 @@ impl ToolDef {
     #[must_use]
     pub fn x_search() -> Self {
         ToolDef::Server(serde_json::json!({ "type": "x_search" }))
+    }
+
+    #[must_use]
+    pub fn code_interpreter() -> Self {
+        ToolDef::Server(serde_json::json!({ "type": "code_interpreter" }))
     }
 }
 
@@ -339,12 +368,16 @@ mod tests {
                 "read a file",
                 serde_json::json!({"type":"object"}),
             ),
-            ToolDef::web_search(),
+            ServerTool::WebSearch.definition(),
+            ServerTool::XSearch.definition(),
+            ServerTool::CodeInterpreter.definition(),
         ]);
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["tools"][0]["type"], "function");
         assert_eq!(v["tools"][0]["name"], "read_file");
         assert_eq!(v["tools"][1]["type"], "web_search");
+        assert_eq!(v["tools"][2]["type"], "x_search");
+        assert_eq!(v["tools"][3]["type"], "code_interpreter");
     }
 
     #[test]

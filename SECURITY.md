@@ -8,7 +8,8 @@ limits are.
 
 The built-in model client sends requests only to the API endpoint you configure with
 `XAI_BASE_URL` (default `https://api.x.ai`). GrokForge has no telemetry code path. You provide the
-API key with `XAI_API_KEY`; keyring login is not implemented yet.
+API key with `XAI_API_KEY`, stores an API key in the OS keychain, or obtains a subscription token
+through the browser-based OAuth flow.
 
 Each first-party model request body is assembled through the context-ledger path. The ledger
 reconciles its source entries to the byte length of the exact serialized JSON body and records
@@ -22,6 +23,11 @@ project context and has no request body to include in the context ledger.
 Run `grokforge doctor` to see the configured model endpoint, the selected sandbox backend, and
 whether OS enforcement is active.
 
+Grok-hosted web search, X search, and code interpreter are disabled by default. Enabling one sends
+the model request to xAI with that hosted capability available; provider-side retrieval or code
+execution is outside GrokForge's local command sandbox and context ledger. Treat returned content
+as untrusted model input and review resulting actions.
+
 ## What leaves your machine
 
 Model context is redacted before the request body is serialized:
@@ -34,6 +40,11 @@ Model context is redacted before the request body is serialized:
   `*.pem`, `*.key`, and common credential files. The command sandbox also tries to enforce these
   rules: Seatbelt combines read/write profile rules with bounded physical-target discovery, while
   bubblewrap masks only existing matches found during a bounded workspace scan.
+- **Project skill catalogs are automatic context.** For each safely discovered
+  `.grokforge/skills/*/SKILL.md`, GrokForge sends the bounded skill name, relative path, and
+  frontmatter description through the redaction and ledger path. The instruction body remains
+  local unless Grok deliberately reads that file with `read_file`. A project slash-command
+  template is sent as ordinary redacted user input only when you invoke that command.
 - These controls are defense in depth, not a proof that secrets cannot be read or disclosed.
   Pattern matching can miss unusual formats, bubblewrap masking is partial, and the `yolo`
   preset removes the default secret globs. Explicitly trusted external processes are outside
@@ -42,12 +53,12 @@ Model context is redacted before the request body is serialized:
 ## MCP and external-process trust
 
 A project `.grokforge/mcp.json` file can name arbitrary executables, so GrokForge treats it as
-executable code. The current TUI and headless frontends do **not** start project MCP servers by
-default and do not yet expose the explicit-trust flow required to enable them. If a future
-frontend starts a configuration after explicit trust, the MCP server runs as a separate process;
-its filesystem access, network activity, and logs are outside the model-request ledger. Tool
-output is accounted if it is later included in a model request, but that does not account for the
-external process's own activity or egress. Treat MCP output as untrusted model input.
+executable code. The TUI, headless, and resume frontends do **not** start project MCP servers by
+default. Pass `--trust-project-mcp` on that invocation only after reviewing the project config and
+the commands it names. An explicitly trusted MCP server runs as a separate process; its filesystem
+access, network activity, and logs are outside the model-request ledger. Tool output is accounted
+if it is later included in a model request, but that does not account for the external process's
+own activity or egress. Treat MCP output as untrusted model input.
 
 ## Command sandboxing
 

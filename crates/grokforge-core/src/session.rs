@@ -1,9 +1,10 @@
 //! Session configuration and in-memory conversation state.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use grokforge_protocol::{ApprovalPolicy, NetworkMode, ResponseItem, SandboxMode, SessionId};
-use grokforge_xai::Effort;
+use grokforge_xai::{Effort, ServerTool};
 
 /// The default system prompt. Kept small on purpose (a bloated prompt burns tokens and cache).
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
@@ -21,6 +22,10 @@ pub struct SessionConfig {
     /// Network capability granted to sandboxed commands for this session.
     pub network: NetworkMode,
     pub effort: Option<Effort>,
+    /// Explicitly enabled Grok-native server tools. These are separately metered by xAI and are
+    /// therefore off by default. The closed enum prevents arbitrary provider JSON from entering
+    /// session configuration.
+    pub enabled_server_tools: BTreeSet<ServerTool>,
     pub system_prompt: String,
     /// Hard cap on tool-call iterations within one turn.
     pub max_iterations: u32,
@@ -51,6 +56,7 @@ impl SessionConfig {
             sandbox_mode: SandboxMode::WorkspaceWrite,
             network: NetworkMode::Isolated,
             effort: None,
+            enabled_server_tools: BTreeSet::new(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             max_iterations: 32,
             auto_commit: true,
@@ -71,6 +77,13 @@ impl SessionConfig {
         } else {
             NetworkMode::Isolated
         };
+        self
+    }
+
+    /// Enable one known, separately metered Grok-native server tool for this session.
+    #[must_use]
+    pub fn with_server_tool(mut self, tool: ServerTool) -> Self {
+        self.enabled_server_tools.insert(tool);
         self
     }
 }
@@ -136,5 +149,27 @@ mod tests {
         .unwrap();
         assert_eq!(session.id, original);
         assert_eq!(session.history.len(), 1);
+    }
+
+    #[test]
+    fn server_tools_are_opt_in_and_deduplicated() {
+        let default = SessionConfig::new(PathBuf::from("/tmp"), "m");
+        assert!(default.enabled_server_tools.is_empty());
+
+        let configured = default
+            .with_server_tool(ServerTool::WebSearch)
+            .with_server_tool(ServerTool::WebSearch)
+            .with_server_tool(ServerTool::CodeInterpreter);
+        assert_eq!(configured.enabled_server_tools.len(), 2);
+        assert!(
+            configured
+                .enabled_server_tools
+                .contains(&ServerTool::WebSearch)
+        );
+        assert!(
+            configured
+                .enabled_server_tools
+                .contains(&ServerTool::CodeInterpreter)
+        );
     }
 }

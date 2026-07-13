@@ -259,6 +259,71 @@ impl Git {
             .collect())
     }
 
+    /// Repository-relative paths present in a tracked-file diff.
+    ///
+    /// Rename detection is disabled deliberately: callers can apply path-level disclosure rules
+    /// to both the old and new names independently before asking for the corresponding content.
+    pub fn diff_changed_paths(&self, staged: bool) -> Result<Vec<PathBuf>, GitError> {
+        let mut command = self.repo_command()?;
+        command.args([
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--name-only",
+            "-z",
+        ]);
+        if staged {
+            command.arg("--cached");
+        }
+        command.current_dir(&self.root);
+        let out = execute_git_command(&mut command)?;
+        if !out.status.success() {
+            return Err(GitError::Command(
+                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            ));
+        }
+        let raw = std::str::from_utf8(&out.stdout)
+            .map_err(|_| GitError::Command("git diff returned a non-UTF-8 path".to_string()))?;
+        let mut paths = raw
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    /// Diff exact repository paths after validating that every path stays within this worktree.
+    /// An empty path list returns an empty diff rather than accidentally widening to the whole
+    /// repository.
+    pub fn diff_paths(&self, paths: &[PathBuf], staged: bool) -> Result<String, GitError> {
+        if paths.is_empty() {
+            return Ok(String::new());
+        }
+        let relative = paths
+            .iter()
+            .map(|path| self.repo_relative(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let path_strs = relative
+            .iter()
+            .map(|path| {
+                path.to_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| GitError::NonUtf8Path(path.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "--no-renames"];
+        if staged {
+            args.push("--cached");
+        }
+        args.push("--");
+        args.extend(path_strs.iter().map(String::as_str));
+        self.run(&args)
+    }
+
     /// Absolute paths changed in the worktree/index, including both sides of renames/copies.
     /// Intended for a clean-at-turn-start auto-commit flow so shell-created files and deletions
     /// are not missed by tool-local touched-path tracking.
@@ -368,6 +433,12 @@ impl Git {
     }
 
     fn repo_relative(&self, path: &Path) -> Result<PathBuf, GitError> {
+        if path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(GitError::OutsideRepo(path.to_path_buf()));
+        }
         let candidate = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -778,6 +849,54 @@ mod tests {
         let (_d, git) = init_repo();
         assert!(git.current_branch().is_ok());
         assert!(!git.is_dirty().unwrap());
+    }
+
+    #[test]
+    fn diff_reads_are_scoped_to_validated_paths_and_stage() {
+        let (dir, git) = init_repo();
+        std::fs::write(dir.path().join("README"), "unstaged\n").unwrap();
+        std::fs::write(dir.path().join("staged.txt"), "staged\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "staged.txt"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert_eq!(
+            git.diff_changed_paths(false).unwrap(),
+            vec![PathBuf::from("README")]
+        );
+        assert_eq!(
+            git.diff_changed_paths(true).unwrap(),
+            vec![PathBuf::from("staged.txt")]
+        );
+
+        let unstaged = git.diff_paths(&[PathBuf::from("README")], false).unwrap();
+        assert!(unstaged.contains("+unstaged"));
+        assert!(!unstaged.contains("staged.txt"));
+        let staged = git
+            .diff_paths(&[dir.path().join("staged.txt")], true)
+            .unwrap();
+        assert!(staged.contains("+staged"));
+        assert!(!staged.contains("README"));
+        assert_eq!(git.diff_paths(&[], false).unwrap(), "");
+    }
+
+    #[test]
+    fn diff_paths_rejects_paths_outside_the_repository() {
+        let (dir, git) = init_repo();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let error = git
+            .diff_paths(&[outside.path().to_path_buf()], false)
+            .unwrap_err();
+        assert!(matches!(error, GitError::OutsideRepo(_)));
+        let escape = PathBuf::from("missing/../../outside.txt");
+        let error = git.diff_paths(&[escape], false).unwrap_err();
+        assert!(matches!(error, GitError::OutsideRepo(_)));
+        assert!(!dir.path().join("missing").exists());
     }
 
     #[test]

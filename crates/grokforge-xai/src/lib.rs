@@ -26,6 +26,7 @@ pub use event::{EncryptedReasoning, StopReason, StreamEvent, ToolCall, Usage};
 pub use model::ModelInfo;
 pub use oauth::{OAuthError, OAuthTokens};
 pub use request::{
-    ContentPart, Effort, FunctionTool, InputItem, Reasoning, ResponsesRequest, Role, ToolDef,
+    ContentPart, Effort, FunctionTool, InputItem, Reasoning, ResponsesRequest, Role, ServerTool,
+    ToolDef,
 };
 pub use stream::ResponseStream;

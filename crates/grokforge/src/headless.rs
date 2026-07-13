@@ -12,11 +12,12 @@ use grokforge_core::{
 };
 use grokforge_protocol::{ApprovalPolicy, EventMsg, NetworkMode, SandboxMode, StopReason};
 use grokforge_sandbox::default_runner;
-use grokforge_xai::{Effort, XaiClient};
+use grokforge_xai::{Effort, ServerTool, XaiClient};
 use tokio::sync::mpsc;
 
 /// Parsed `exec` options.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)] // Independent CLI opt-ins; grouping them would obscure flag provenance.
 pub struct ExecArgs {
     pub prompt: String,
     pub preset: String,
@@ -26,7 +27,11 @@ pub struct ExecArgs {
     pub allow: Vec<String>,
     pub effort: Option<String>,
     pub plan: bool,
+    pub web_search: bool,
+    pub x_search: bool,
+    pub code_interpreter: bool,
     pub max_iterations: u32,
+    pub trust_project_mcp: bool,
 }
 
 fn preset_policy(preset: &str) -> Option<(ApprovalPolicy, SandboxMode)> {
@@ -158,6 +163,17 @@ pub async fn run(args: ExecArgs) -> ExitCode {
     }
     config.max_iterations = args.max_iterations;
     config.effort = effort;
+    if args.web_search {
+        config.enabled_server_tools.insert(ServerTool::WebSearch);
+    }
+    if args.x_search {
+        config.enabled_server_tools.insert(ServerTool::XSearch);
+    }
+    if args.code_interpreter {
+        config
+            .enabled_server_tools
+            .insert(ServerTool::CodeInterpreter);
+    }
     protect_user_changes(&mut config);
     let mut session = Session::new(config);
 
@@ -189,8 +205,12 @@ pub async fn run(args: ExecArgs) -> ExitCode {
 
     // Only start configured MCP subprocesses after the canonical recovery record is durable.
     let mut registry = ToolRegistry::with_builtins();
-    let connected =
-        grokforge_core::mcp_config::connect_and_register(&workspace, &mut registry).await;
+    let connected = if args.trust_project_mcp {
+        eprintln!("{}", grokforge_core::mcp_config::PROJECT_MCP_TRUST_WARNING);
+        grokforge_core::mcp_config::connect_and_register_trusted(&workspace, &mut registry).await
+    } else {
+        grokforge_core::mcp_config::connect_and_register(&workspace, &mut registry).await
+    };
     if !connected.is_empty() {
         eprintln!(
             "mcp: connected {}",

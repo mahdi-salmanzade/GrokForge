@@ -132,7 +132,10 @@ async fn onboard_interactive() -> Option<String> {
         let key = prompt_hidden()?;
         match store(&key) {
             Ok(()) => eprintln!("✓ saved to keychain"),
-            Err(e) => eprintln!("warning: couldn't save to keychain ({e}); using for this session"),
+            Err(e) => eprintln!(
+                "warning: couldn't save to keychain ({}); using for this session",
+                crate::sanitize_terminal_line(&e)
+            ),
         }
         Some(key)
     } else {
@@ -142,14 +145,20 @@ async fn onboard_interactive() -> Option<String> {
             Ok(tokens) => {
                 let token = tokens.access_token.clone();
                 if let Err(e) = store_oauth(&tokens) {
-                    eprintln!("signed in, but couldn't store tokens ({e}); using for this session");
+                    eprintln!(
+                        "signed in, but couldn't store tokens ({}); using for this session",
+                        crate::sanitize_terminal_line(&e)
+                    );
                 } else {
                     eprintln!("✓ signed in — starting GrokForge…");
                 }
                 Some(token)
             }
             Err(e) => {
-                eprintln!("sign-in failed: {e}");
+                eprintln!(
+                    "sign-in failed: {}",
+                    crate::sanitize_terminal_line(&e.to_string())
+                );
                 None
             }
         }
@@ -176,7 +185,7 @@ pub fn login() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("could not store key: {e}");
+            eprintln!("could not store key: {}", crate::sanitize_terminal_line(&e));
             ExitCode::from(1)
         }
     }
@@ -196,12 +205,18 @@ pub async fn login_subscription() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("signed in, but could not store tokens: {e}");
+                eprintln!(
+                    "signed in, but could not store tokens: {}",
+                    crate::sanitize_terminal_line(&e)
+                );
                 ExitCode::from(1)
             }
         },
         Err(e) => {
-            eprintln!("sign-in failed: {e}");
+            eprintln!(
+                "sign-in failed: {}",
+                crate::sanitize_terminal_line(&e.to_string())
+            );
             ExitCode::from(1)
         }
     }

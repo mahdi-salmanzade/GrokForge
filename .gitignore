@@ -8,4 +8,11 @@
 .DS_Store
 
 # GrokForge local state written into a working repo during dogfooding
-/.grokforge/
+/.grokforge/*
+!/.grokforge/skills/
+/.grokforge/skills/*
+!/.grokforge/skills/grokforge-development/
+!/.grokforge/skills/grokforge-development/SKILL.md
+!/.grokforge/commands/
+/.grokforge/commands/*
+!/.grokforge/commands/verify.md

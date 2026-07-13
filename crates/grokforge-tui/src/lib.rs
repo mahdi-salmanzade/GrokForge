@@ -30,8 +30,15 @@ pub async fn run(
     client: XaiClient,
     config: SessionConfig,
     status_preset: String,
+    trust_project_mcp: bool,
 ) -> io::Result<()> {
-    run_session(client, Session::new(config), status_preset).await
+    run_session(
+        client,
+        Session::new(config),
+        status_preset,
+        trust_project_mcp,
+    )
+    .await
 }
 
 /// Launch the interactive TUI for a (possibly resumed) session. Creates a rollout writer and
@@ -40,6 +47,7 @@ pub async fn run_session(
     client: XaiClient,
     mut session: Session,
     status_preset: String,
+    trust_project_mcp: bool,
 ) -> io::Result<()> {
     // Acquire the session's lifetime lock and refresh persisted history before repository checks,
     // MCP process startup, or any other preflight side effect. A second resume fails here.
@@ -68,6 +76,7 @@ pub async fn run_session(
         status_preset,
         metadata_exists,
         dir,
+        trust_project_mcp,
     )
     .await
 }
@@ -79,6 +88,7 @@ pub async fn run_locked_session(
     session: Session,
     rollout: RolloutWriter,
     status_preset: String,
+    trust_project_mcp: bool,
 ) -> io::Result<()> {
     let dir = sessions_dir()?;
     let metadata_path = dir.join(format!("rollout-{}.meta.json", session.id.as_uuid()));
@@ -90,6 +100,7 @@ pub async fn run_locked_session(
         status_preset,
         metadata_exists,
         dir,
+        trust_project_mcp,
     )
     .await
 }
@@ -101,6 +112,7 @@ async fn run_session_ready(
     status_preset: String,
     metadata_exists: bool,
     dir: std::path::PathBuf,
+    trust_project_mcp: bool,
 ) -> io::Result<()> {
     let model = session.config.model.clone();
     let workspace = session.config.workspace_root.clone();
@@ -122,7 +134,12 @@ async fn run_session_ready(
     let (approver, approvals_rx) = ChannelApprover::new();
 
     let mut registry = ToolRegistry::with_builtins();
-    grokforge_core::mcp_config::connect_and_register(&workspace, &mut registry).await;
+    if trust_project_mcp {
+        eprintln!("{}", grokforge_core::mcp_config::PROJECT_MCP_TRUST_WARNING);
+        grokforge_core::mcp_config::connect_and_register_trusted(&workspace, &mut registry).await;
+    } else {
+        grokforge_core::mcp_config::connect_and_register(&workspace, &mut registry).await;
+    }
 
     let agent = Arc::new(
         Agent::new(

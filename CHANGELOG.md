@@ -7,6 +7,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- A complete GrokForge visual refresh: an adaptive branded TUI with a calm high-contrast palette,
+  compact welcome state, human-readable tool and Git activity, live reasoning/retry/usage/privacy
+  status, discoverable capabilities, and a responsive approval sheet that keeps the safe denial
+  action visible on narrow terminals.
+- A self-contained branded OAuth callback experience for success, cancellation, and waiting states.
+  Callback state is validated before accepting a code, success is shown only after token exchange,
+  and all terminal-facing authentication errors are sanitized to one line.
+- Local project workflows: bounded, deterministic discovery of
+  `.grokforge/skills/*/SKILL.md` guidance and `.grokforge/commands/*.md` slash commands. Skill
+  descriptions are catalogued up front while full instructions remain local until Grok reads the
+  selected file through the normal ledgered tool path.
+- Safe read-only `git_status` and `git_diff` tools run from the trusted host Git boundary, with
+  repository confinement, output caps, and protections against symlink, hard-link, filter, and
+  text-conversion surprises.
+- Explicit, default-off Grok-hosted web search, X search, and code interpreter tools. Headless runs
+  use `--web-search`, `--x-search`, and `--code-interpreter`; the TUI exposes `/tools` status and
+  per-session toggles.
 - M0 scaffold: Cargo workspace with 12 crates, MIT licensing,
   `cargo-deny` license gate, CI matrix (Linux/macOS/Windows), and the design record
   under `docs/design/` and `docs/decisions/`.
@@ -92,9 +109,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   client behind an internal `McpConnection` trait (chosen over pinning an unverified `rmcp`
   version). `initialize` handshake, `tools/list`, `tools/call`. Core `McpToolAdapter` exposes each
   server tool as a `mcp__<server>__<tool>` GrokForge tool that is **always approval-gated** (its
-  side effects are outside our sandbox). A `.grokforge/mcp.json` loader connects declared servers
-  at session start and registers their tools; wired into both frontends. Verified end-to-end: a
-  configured mock MCP server's tool is called through the full agent loop.
+  side effects are outside our sandbox). After the explicit `--trust-project-mcp` opt-in, a
+  `.grokforge/mcp.json` loader connects declared servers at session start and registers their
+  tools; wired into both frontends and resume. The default refuses to execute project config.
+  Verified end-to-end: a configured mock MCP server's tool is called through the full agent loop.
 - M10 subagents: a `spawn_task` tool (intercepted by the runtime) runs a self-contained subtask
   in an **isolated git worktree** on a `gf/agent/<id>` branch, via a fresh sibling agent with
   subagent-spawning disabled (depth cap 1). The subagent's edits auto-commit in the worktree; the

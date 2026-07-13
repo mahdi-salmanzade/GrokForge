@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use globset::{Glob, GlobBuilder, GlobSetBuilder};
+use grokforge_git::Git;
 use grokforge_protocol::ApprovalKind;
 use grokforge_sandbox::CommandSpec;
 use serde_json::json;
@@ -21,7 +22,16 @@ pub const SPAWN_TASK: &str = "spawn_task";
 pub(crate) fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "read_file" | "write_file" | "edit" | "shell" | "list" | "glob" | "grep" | SPAWN_TASK
+        "read_file"
+            | "write_file"
+            | "edit"
+            | "shell"
+            | "list"
+            | "glob"
+            | "grep"
+            | "git_status"
+            | "git_diff"
+            | SPAWN_TASK
     )
 }
 
@@ -33,6 +43,7 @@ const MAX_GREP_LINE_CHARS: usize = 2_000;
 const MAX_WALK_ENTRIES: usize = 50_000;
 const MAX_GLOB_HITS: usize = 500;
 const MAX_GREP_HITS: usize = 200;
+const MAX_GIT_TOOL_BYTES: usize = 256 * 1024;
 
 /// Every built-in tool, ready to register.
 #[must_use]
@@ -45,6 +56,8 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(ListDir),
         Arc::new(Glob_),
         Arc::new(Grep),
+        Arc::new(GitStatus),
+        Arc::new(GitDiff),
         Arc::new(SpawnTask),
     ]
 }
@@ -91,6 +104,65 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
         truncated.push('…');
         truncated
     }
+}
+
+fn truncate_utf8_bytes(mut text: String, max_bytes: usize, marker: &str) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut boundary = max_bytes;
+    while !text.is_char_boundary(boundary) {
+        boundary = boundary.saturating_sub(1);
+    }
+    text.truncate(boundary);
+    text.push_str(marker);
+    text
+}
+
+fn git_for_workspace(ctx: &TurnContext) -> Result<Git, String> {
+    let workspace = canonical_read_path(ctx, &ctx.workspace_root)
+        .map_err(|error| format!("cannot access workspace repository: {error}"))?;
+    let git =
+        Git::discover(&workspace).ok_or_else(|| "workspace is not a Git repository".to_string())?;
+    // Host-side Git commands run at the repository root. Refuse a containing repository rather
+    // than exposing names or content outside the workspace selected for this session.
+    if git.root() != workspace {
+        return Err(
+            "workspace must be the Git repository root; refusing to inspect a containing repository"
+                .to_string(),
+        );
+    }
+    Ok(git)
+}
+
+fn git_diff_path_is_blocked(ctx: &TurnContext, path: &Path) -> bool {
+    if is_blocked(ctx, path) {
+        return true;
+    }
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => {
+            if canonical_read_path(ctx, &canonical).is_err() || is_blocked(ctx, &canonical) {
+                return true;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Deleted paths are sourced from Git objects, not the filesystem.
+        }
+        Err(_) => return true,
+    }
+    // Git itself opens worktree files after this policy check. Reject multiply-linked regular
+    // files so a workspace hard link cannot disclose an inode owned outside the workspace.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.nlink() > 1)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn write_failure(path: &str, action: &str, error: &PathSafetyError) -> ToolOutput {
@@ -467,6 +539,146 @@ impl Tool for ListDir {
     }
 }
 
+// ---------- git_status ----------
+
+#[derive(Debug)]
+struct GitStatus;
+
+#[async_trait]
+impl Tool for GitStatus {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_status".into(),
+            description: "Show the workspace Git status without changing the repository.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            mutating: false,
+            parallel_safe: true,
+        }
+    }
+
+    fn approval(&self, _args: &serde_json::Value, _ctx: &TurnContext) -> ApprovalNeed {
+        ApprovalNeed::None
+    }
+
+    async fn invoke(&self, inv: ToolInvocation<'_>) -> ToolOutput {
+        let ctx = inv.ctx.clone();
+        match tokio::task::spawn_blocking(move || {
+            let git = git_for_workspace(&ctx)?;
+            git.status_porcelain().map_err(|error| error.to_string())
+        })
+        .await
+        {
+            Ok(Ok(entries)) if entries.is_empty() => ToolOutput::success("(clean)"),
+            Ok(Ok(entries)) => ToolOutput::success(truncate_utf8_bytes(
+                entries.join("\n"),
+                MAX_GIT_TOOL_BYTES,
+                "\n… [status truncated] …",
+            )),
+            Ok(Err(error)) => ToolOutput::failure(format!("cannot read Git status: {error}")),
+            Err(error) => ToolOutput::failure(format!("Git status task failed: {error}")),
+        }
+    }
+}
+
+// ---------- git_diff ----------
+
+#[derive(Debug)]
+struct GitDiff;
+
+#[async_trait]
+impl Tool for GitDiff {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_diff".into(),
+            description: "Show tracked-file changes in the workspace without changing the repository. By default shows unstaged changes; set staged=true for the index.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "staged": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Show staged changes instead of unstaged changes."
+                    }
+                },
+                "additionalProperties": false
+            }),
+            mutating: false,
+            parallel_safe: true,
+        }
+    }
+
+    fn approval(&self, _args: &serde_json::Value, _ctx: &TurnContext) -> ApprovalNeed {
+        ApprovalNeed::None
+    }
+
+    async fn invoke(&self, inv: ToolInvocation<'_>) -> ToolOutput {
+        let staged = inv
+            .args
+            .get("staged")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let ctx = inv.ctx.clone();
+        match tokio::task::spawn_blocking(move || {
+            let git = git_for_workspace(&ctx)?;
+            let relative_paths = git
+                .diff_changed_paths(staged)
+                .map_err(|error| error.to_string())?;
+            let mut allowed = Vec::new();
+            let mut omitted = 0usize;
+            for relative in relative_paths {
+                if relative.is_absolute()
+                    || relative
+                        .components()
+                        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                {
+                    return Err("Git returned a path outside the workspace".to_string());
+                }
+                let path = git.root().join(&relative);
+                if git_diff_path_is_blocked(&ctx, &path) {
+                    omitted = omitted.saturating_add(1);
+                } else {
+                    allowed.push(relative);
+                }
+            }
+            let diff = git
+                .diff_paths(&allowed, staged)
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((diff, omitted))
+        })
+        .await
+        {
+            Ok(Ok((diff, omitted))) => {
+                let change_kind = if staged { "staged" } else { "unstaged" };
+                let mut content = if omitted > 0 {
+                    format!("[{omitted} {change_kind} path(s) omitted by read/path safety rules]\n")
+                } else {
+                    String::new()
+                };
+                if diff.trim().is_empty() {
+                    content.push_str(if staged {
+                        "(no staged tracked-file changes)"
+                    } else {
+                        "(no unstaged tracked-file changes)"
+                    });
+                } else {
+                    content.push_str(&diff);
+                }
+                ToolOutput::success(truncate_utf8_bytes(
+                    content,
+                    MAX_GIT_TOOL_BYTES,
+                    "\n… [diff truncated] …",
+                ))
+            }
+            Ok(Err(error)) => ToolOutput::failure(format!("cannot read Git diff: {error}")),
+            Err(error) => ToolOutput::failure(format!("Git diff task failed: {error}")),
+        }
+    }
+}
+
 // ---------- glob ----------
 
 #[derive(Debug)]
@@ -729,6 +941,9 @@ fn grep_walk(
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    #[cfg(unix)]
+    use std::process::Command;
+
     use grokforge_protocol::{SandboxMode, SandboxPolicy, ToolCallId};
     use grokforge_sandbox::{
         CommandSpec, ExecError, ExecOutput, PassthroughRunner, SandboxCapability, SandboxRunner,
@@ -750,6 +965,29 @@ mod tests {
             bound_write_targets: Vec::new(),
             cancellation: crate::TurnCancellation::new(),
         }
+    }
+
+    #[cfg(unix)]
+    fn init_git_repo() -> tempfile::TempDir {
+        let workspace = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(workspace.path())
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@grokforge.dev"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(workspace.path().join("README"), "start\n").unwrap();
+        run(&["add", "README"]);
+        run(&["commit", "-q", "-m", "init"]);
+        workspace
     }
 
     #[tokio::test]
@@ -919,6 +1157,127 @@ mod tests {
         let (hits, truncated) = glob_walk(workspace.path(), &matcher, 3, 500);
         assert!(hits.is_empty());
         assert!(truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_status_and_diff_report_unstaged_and_staged_changes() {
+        let workspace = init_git_repo();
+        std::fs::write(workspace.path().join("README"), "changed\n").unwrap();
+        let ctx = context(workspace.path(), SandboxMode::WorkspaceWrite);
+
+        let status = GitStatus
+            .invoke(ToolInvocation {
+                call_id: ToolCallId::new(),
+                args: json!({}),
+                ctx: &ctx,
+            })
+            .await;
+        assert!(!status.is_error());
+        assert!(status.content().contains("README"));
+
+        let unstaged = GitDiff
+            .invoke(ToolInvocation {
+                call_id: ToolCallId::new(),
+                args: json!({}),
+                ctx: &ctx,
+            })
+            .await;
+        assert!(!unstaged.is_error());
+        assert!(unstaged.content().contains("+changed"));
+
+        assert!(
+            Command::new("git")
+                .args(["add", "README"])
+                .current_dir(workspace.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let staged = GitDiff
+            .invoke(ToolInvocation {
+                call_id: ToolCallId::new(),
+                args: json!({"staged": true}),
+                ctx: &ctx,
+            })
+            .await;
+        assert!(!staged.is_error());
+        assert!(staged.content().contains("+changed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_diff_omits_secret_and_hard_link_content() {
+        let workspace = init_git_repo();
+        std::fs::write(workspace.path().join(".env"), "old secret\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", ".env"])
+                .current_dir(workspace.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-q", "-m", "track fixture"])
+                .current_dir(workspace.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(workspace.path().join(".env"), "UNUSUAL_SECRET_VALUE\n").unwrap();
+        std::fs::write(workspace.path().join("README"), "safe change\n").unwrap();
+        let ctx = context(workspace.path(), SandboxMode::WorkspaceWrite);
+
+        let secret_filtered = GitDiff
+            .invoke(ToolInvocation {
+                call_id: ToolCallId::new(),
+                args: json!({}),
+                ctx: &ctx,
+            })
+            .await;
+        assert!(!secret_filtered.is_error());
+        assert!(secret_filtered.content().contains("+safe change"));
+        assert!(secret_filtered.content().contains("omitted"));
+        assert!(!secret_filtered.content().contains("UNUSUAL_SECRET_VALUE"));
+
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "OUTSIDE_HARD_LINK_SECRET\n").unwrap();
+        std::fs::remove_file(workspace.path().join("README")).unwrap();
+        std::fs::hard_link(outside.path(), workspace.path().join("README")).unwrap();
+        let hard_link_filtered = GitDiff
+            .invoke(ToolInvocation {
+                call_id: ToolCallId::new(),
+                args: json!({}),
+                ctx: &ctx,
+            })
+            .await;
+        assert!(!hard_link_filtered.is_error());
+        assert!(hard_link_filtered.content().contains("omitted"));
+        assert!(
+            !hard_link_filtered
+                .content()
+                .contains("OUTSIDE_HARD_LINK_SECRET")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_tools_refuse_a_repository_outside_the_workspace_root() {
+        let repository = init_git_repo();
+        let nested = repository.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let ctx = context(&nested, SandboxMode::WorkspaceWrite);
+        let output = GitStatus
+            .invoke(ToolInvocation {
+                call_id: ToolCallId::new(),
+                args: json!({}),
+                ctx: &ctx,
+            })
+            .await;
+        assert!(output.is_error());
+        assert!(output.content().contains("repository root"));
     }
 
     #[tokio::test]

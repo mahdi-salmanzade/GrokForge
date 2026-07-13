@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en" data-state="__STATE__">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#08090b">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <title>__TITLE__ · GrokForge</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg viewBox='0 0 32 32' xmlns='http://www.w3.org/2000/svg'%3E%3Crect width='32' height='32' rx='8' fill='%230b0b0d'/%3E%3Cpath d='M5 23 19 13c1-.7 2 .1 2 1.1.6 4.7-3 9.1-7.7 9.6-2 .2-3.8-.3-5.3-1.3L3 25c5 4.4 12.7 3.9 17.2-.9 4-4.3 3.3-8.4 3.6-11.1.3-2.8 1.7-5 5.2-9.8L5 23Z' fill='%23ff5a1f'/%3E%3C/svg%3E">
+  <style>
+    :root {
+      --ink: #f8f7f4;
+      --muted: #9b9aa2;
+      --line: rgba(255, 255, 255, .105);
+      --panel: rgba(16, 16, 19, .78);
+      --orange: #ff5a1f;
+      --orange-hot: #ff7b3f;
+      --state: #76e4b8;
+      --state-rgb: 118, 228, 184;
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-synthesis: none;
+    }
+
+    html[data-state="denied"] {
+      --state: #ff7082;
+      --state-rgb: 255, 112, 130;
+    }
+
+    html[data-state="waiting"] {
+      --state: #f5c966;
+      --state-rgb: 245, 201, 102;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body { min-height: 100%; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 50% -15%, rgba(255, 90, 31, .19), transparent 42%),
+        radial-gradient(circle at 88% 85%, rgba(var(--state-rgb), .075), transparent 34%),
+        #08090b;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    body::before {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      content: "";
+      opacity: .22;
+      background-image:
+        linear-gradient(rgba(255, 255, 255, .045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, .045) 1px, transparent 1px);
+      background-size: 48px 48px;
+      -webkit-mask-image: linear-gradient(to bottom, black, transparent 90%);
+      mask-image: linear-gradient(to bottom, black, transparent 90%);
+    }
+
+    body::after {
+      position: fixed;
+      top: -18rem;
+      left: 50%;
+      width: 38rem;
+      height: 38rem;
+      z-index: -1;
+      content: "";
+      border: 1px solid rgba(255, 255, 255, .055);
+      border-radius: 50%;
+      transform: translateX(-50%);
+      box-shadow: 0 0 0 7rem rgba(255, 255, 255, .012), 0 0 0 14rem rgba(255, 255, 255, .008);
+    }
+
+    main {
+      min-height: 100svh;
+      display: grid;
+      place-items: center;
+      padding: clamp(1.25rem, 4vw, 3.5rem);
+    }
+
+    .shell {
+      width: min(100%, 920px);
+      animation: arrive .7s cubic-bezier(.2, .8, .2, 1) both;
+    }
+
+    .brandbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      margin: 0 .35rem 1rem;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: .8rem;
+    }
+
+    .brandmark {
+      display: grid;
+      width: 2.8rem;
+      height: 2.8rem;
+      place-items: center;
+      border: 1px solid rgba(255, 255, 255, .11);
+      border-radius: 14px;
+      background: rgba(16, 16, 19, .72);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .07), 0 12px 34px rgba(0, 0, 0, .24);
+    }
+
+    .brandmark svg { width: 1.55rem; height: 1.8rem; }
+
+    .wordmark strong {
+      display: block;
+      font-size: 1rem;
+      letter-spacing: -.025em;
+    }
+
+    .wordmark span {
+      display: block;
+      margin-top: .15rem;
+      color: #8c8b94;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: .66rem;
+      letter-spacing: .09em;
+      text-transform: uppercase;
+    }
+
+    .local-badge {
+      display: flex;
+      align-items: center;
+      gap: .45rem;
+      padding: .45rem .7rem;
+      color: #a5a4aa;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(13, 13, 16, .65);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: .65rem;
+      letter-spacing: .055em;
+      text-transform: uppercase;
+    }
+
+    .local-badge::before {
+      width: .38rem;
+      height: .38rem;
+      content: "";
+      border-radius: 50%;
+      background: var(--state);
+      box-shadow: 0 0 0 4px rgba(var(--state-rgb), .1), 0 0 14px rgba(var(--state-rgb), .55);
+    }
+
+    .card {
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(17rem, .85fr);
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 30px;
+      background: var(--panel);
+      box-shadow: 0 32px 90px rgba(0, 0, 0, .48), inset 0 1px 0 rgba(255, 255, 255, .055);
+      -webkit-backdrop-filter: blur(24px);
+      backdrop-filter: blur(24px);
+    }
+
+    .card::before {
+      position: absolute;
+      inset: 0 18% auto;
+      height: 1px;
+      content: "";
+      background: linear-gradient(90deg, transparent, rgba(255, 132, 76, .85), transparent);
+      box-shadow: 0 0 22px rgba(255, 90, 31, .65);
+    }
+
+    .copy {
+      display: flex;
+      min-height: 30rem;
+      flex-direction: column;
+      justify-content: center;
+      padding: clamp(2.2rem, 6vw, 4.6rem);
+    }
+
+    .eyebrow {
+      display: flex;
+      align-items: center;
+      gap: .65rem;
+      margin: 0 0 1.2rem;
+      color: var(--state);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: .7rem;
+      font-weight: 700;
+      letter-spacing: .13em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      width: 1.7rem;
+      height: 1px;
+      content: "";
+      background: currentColor;
+      box-shadow: 0 0 10px currentColor;
+    }
+
+    h1 {
+      max-width: 10ch;
+      margin: 0;
+      font-size: clamp(3rem, 7vw, 5.25rem);
+      font-weight: 650;
+      letter-spacing: -.07em;
+      line-height: .96;
+    }
+
+    .message {
+      max-width: 34rem;
+      margin: 1.45rem 0 0;
+      color: var(--muted);
+      font-size: clamp(.98rem, 2vw, 1.08rem);
+      line-height: 1.72;
+    }
+
+    .message strong { color: #dedde1; font-weight: 550; }
+
+    .handoff {
+      display: flex;
+      align-items: center;
+      gap: .8rem;
+      margin-top: 2rem;
+      padding-top: 1.45rem;
+      border-top: 1px solid rgba(255, 255, 255, .075);
+      color: #92919a;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: .7rem;
+      line-height: 1.5;
+    }
+
+    .key {
+      display: inline-grid;
+      min-width: 2.1rem;
+      height: 1.65rem;
+      place-items: center;
+      padding: 0 .4rem;
+      color: #b9b8be;
+      border: 1px solid rgba(255, 255, 255, .13);
+      border-bottom-color: rgba(255, 255, 255, .2);
+      border-radius: 7px;
+      background: rgba(255, 255, 255, .045);
+      box-shadow: 0 2px 0 rgba(0, 0, 0, .5);
+    }
+
+    .visual {
+      position: relative;
+      display: grid;
+      min-height: 30rem;
+      place-items: center;
+      overflow: hidden;
+      border-left: 1px solid rgba(255, 255, 255, .075);
+      background:
+        radial-gradient(circle at 50% 42%, rgba(255, 90, 31, .17), transparent 43%),
+        linear-gradient(135deg, rgba(255, 255, 255, .025), transparent 60%);
+    }
+
+    .visual::before,
+    .visual::after {
+      position: absolute;
+      width: 22rem;
+      height: 22rem;
+      content: "";
+      border: 1px solid rgba(255, 255, 255, .065);
+      border-radius: 50%;
+    }
+
+    .visual::after {
+      width: 14rem;
+      height: 14rem;
+      border-style: dashed;
+      animation: spin 28s linear infinite;
+    }
+
+    .forge {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      width: 8.3rem;
+      height: 8.3rem;
+      place-items: center;
+      border: 1px solid rgba(255, 255, 255, .12);
+      border-radius: 34px;
+      background: linear-gradient(145deg, rgba(28, 28, 33, .95), rgba(10, 10, 12, .97));
+      box-shadow:
+        0 30px 60px rgba(0, 0, 0, .5),
+        0 0 70px rgba(255, 90, 31, .16),
+        inset 0 1px 0 rgba(255, 255, 255, .09);
+      animation: float 5s ease-in-out infinite;
+    }
+
+    .forge > svg { width: 4.1rem; height: 4.8rem; filter: drop-shadow(0 12px 22px rgba(255, 90, 31, .25)); }
+
+    .state-dot {
+      position: absolute;
+      right: -.7rem;
+      bottom: -.7rem;
+      display: grid;
+      width: 3rem;
+      height: 3rem;
+      place-items: center;
+      border: 6px solid #0c0c0f;
+      border-radius: 50%;
+      background: var(--state);
+      box-shadow: 0 0 28px rgba(var(--state-rgb), .4);
+    }
+
+    .state-dot svg { display: none; width: 1.15rem; color: #07120e; }
+    html[data-state="success"] .icon-success,
+    html[data-state="denied"] .icon-denied,
+    html[data-state="waiting"] .icon-waiting { display: block; }
+
+    .terminal {
+      position: absolute;
+      right: 1.25rem;
+      bottom: 1.25rem;
+      left: 1.25rem;
+      z-index: 2;
+      padding: .85rem 1rem;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, .09);
+      border-radius: 13px;
+      background: rgba(6, 6, 8, .78);
+      box-shadow: 0 12px 34px rgba(0, 0, 0, .3);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: .68rem;
+      line-height: 1.7;
+    }
+
+    .terminal::before {
+      position: absolute;
+      inset: 0;
+      content: "";
+      pointer-events: none;
+      background: linear-gradient(transparent 50%, rgba(255, 255, 255, .018) 50%);
+      background-size: 100% 4px;
+    }
+
+    .prompt { color: var(--orange-hot); }
+    .ok { color: var(--state); }
+    .dim { color: #8c8b94; }
+    .cursor {
+      display: inline-block;
+      width: .42rem;
+      height: .8rem;
+      margin-left: .25rem;
+      vertical-align: -.12rem;
+      background: var(--state);
+      animation: blink 1.15s steps(1) infinite;
+    }
+
+    .privacy {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: .5rem;
+      margin-top: 1rem;
+      color: #898891;
+      font-size: .7rem;
+      letter-spacing: .015em;
+      text-align: center;
+    }
+
+    .privacy svg { width: .8rem; color: #83828a; }
+
+    @keyframes arrive {
+      from { opacity: 0; transform: translateY(14px) scale(.99); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    @keyframes float {
+      0%, 100% { transform: translateY(0) rotate(-1deg); }
+      50% { transform: translateY(-9px) rotate(1deg); }
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes blink { 0%, 52% { opacity: 1; } 53%, 100% { opacity: 0; } }
+
+    @media (max-width: 720px) {
+      main { place-items: start center; }
+      .card { grid-template-columns: 1fr; }
+      .copy { min-height: auto; padding: 2.6rem 2rem 2.3rem; }
+      .visual { min-height: 20rem; border-top: 1px solid rgba(255, 255, 255, .075); border-left: 0; }
+      .forge { margin-top: -2rem; }
+      h1 { max-width: none; font-size: clamp(3rem, 14vw, 4.5rem); }
+    }
+
+    @media (max-width: 440px) {
+      main { padding: 1rem; }
+      .brandbar { margin-bottom: .8rem; }
+      .local-badge { padding: .4rem; }
+      .local-badge span { display: none; }
+      .card { border-radius: 24px; }
+      .copy { padding: 2.35rem 1.45rem 2rem; }
+      .visual { min-height: 18rem; }
+      .terminal { right: .8rem; bottom: .8rem; left: .8rem; }
+      .privacy { padding: 0 1rem; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        scroll-behavior: auto !important;
+        animation-duration: .001ms !important;
+        animation-iteration-count: 1 !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="shell">
+      <header class="brandbar">
+        <div class="brand" aria-label="GrokForge">
+          <span class="brandmark" aria-hidden="true">
+            <svg viewBox="0 0 26.78 31.35" role="img">
+              <path d="M3.42 22.43 16.07 13.49c.62-.44 1.51-.27 1.8.41 1.56 3.59.86 7.91-2.23 10.87-3.1 2.96-7.4 3.61-11.34 2.13L0 28.81c6.17 4.04 13.66 3.04 18.34-1.45 3.71-3.55 4.86-8.4 3.79-12.77-1.56-6.41.38-8.98 4.36-14.22l.28-.38-5.24 5.01v-.02L3.41 22.43" fill="#ff5a1f"/>
+              <path d="M10.73 15.44c-2.7-2.58-2-6.34.3-8.64 1.7-1.7 4.49-2.4 6.92-1.38l2.61-1.21c-.47-.34-1.07-.71-1.77-.96-3.13-1.29-6.88-.65-9.42 1.9-2.45 2.45-3.22 6.22-1.9 9.43.99 2.4-.63 4.1-2.26 5.82-.58.61-1.16 1.22-1.62 1.86l7.13-6.82" fill="#fff"/>
+              <path d="M14.59 7.77H12.3v-.65h2.94v2.94h-.65V7.77ZM24.26 12.36l-7 5.89-.79-.94 7-5.89.79.94Z" fill="#fff"/>
+            </svg>
+          </span>
+          <span class="wordmark"><strong>GrokForge</strong><span>Terminal intelligence</span></span>
+        </div>
+        <div class="local-badge"><span>Local callback</span></div>
+      </header>
+
+      <section class="card" aria-labelledby="status-title">
+        <div class="copy">
+          <p class="eyebrow">__EYEBROW__</p>
+          <h1 id="status-title">__HEADING__</h1>
+          <p class="message">__MESSAGE__</p>
+          <div class="handoff"><span class="key">⌘/Ctrl W</span><span>Close this tab, then continue where you left off.</span></div>
+        </div>
+
+        <div class="visual" aria-hidden="true">
+          <div class="forge">
+            <svg viewBox="0 0 26.78 31.35">
+              <path d="M3.42 22.43 16.07 13.49c.62-.44 1.51-.27 1.8.41 1.56 3.59.86 7.91-2.23 10.87-3.1 2.96-7.4 3.61-11.34 2.13L0 28.81c6.17 4.04 13.66 3.04 18.34-1.45 3.71-3.55 4.86-8.4 3.79-12.77-1.56-6.41.38-8.98 4.36-14.22l.28-.38-5.24 5.01v-.02L3.41 22.43" fill="#ff5a1f"/>
+              <path d="M10.73 15.44c-2.7-2.58-2-6.34.3-8.64 1.7-1.7 4.49-2.4 6.92-1.38l2.61-1.21c-.47-.34-1.07-.71-1.77-.96-3.13-1.29-6.88-.65-9.42 1.9-2.45 2.45-3.22 6.22-1.9 9.43.99 2.4-.63 4.1-2.26 5.82-.58.61-1.16 1.22-1.62 1.86l7.13-6.82" fill="#fff"/>
+              <path d="M14.59 7.77H12.3v-.65h2.94v2.94h-.65V7.77ZM24.26 12.36l-7 5.89-.79-.94 7-5.89.79.94Z" fill="#fff"/>
+            </svg>
+            <span class="state-dot">
+              <svg class="icon-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4 4L19 6"/></svg>
+              <svg class="icon-denied" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="m7 7 10 10M17 7 7 17"/></svg>
+              <svg class="icon-waiting" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+            </span>
+          </div>
+          <div class="terminal">
+            <div><span class="prompt">forge</span><span class="dim"> / auth</span></div>
+            <div><span class="ok">__TERMINAL_ICON__</span> __TERMINAL_LINE__</div>
+            <div><span class="dim">❯ __TERMINAL_STATE__</span><span class="cursor"></span></div>
+          </div>
+        </div>
+      </section>
+
+      <footer class="privacy">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+        This private callback is served from your device and is never indexed.
+      </footer>
+    </div>
+  </main>
+</body>
+</html>

@@ -12,12 +12,14 @@
 pub mod agents_md;
 pub mod approvals;
 mod cancellation;
+pub mod commands;
 pub mod compaction;
 pub mod context;
 pub mod mcp_config;
 mod path_safety;
 pub mod redaction;
 pub mod session;
+pub mod skills;
 pub mod store;
 pub mod tools;
 pub mod turn;

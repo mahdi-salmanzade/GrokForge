@@ -6,16 +6,19 @@
 
 GrokForge exists because using Grok from a terminal should feel like a serious development tool, not a chat window wired to `sh`.
 
-Today it can read and edit project files, run commands, keep a session going, and hand isolated work to a subagent. When a command needs to cross a safety boundary, GrokForge stops and asks.
+Today it can read and edit project files, inspect Git state, run commands, keep a session going, use project-defined workflows, and hand isolated work to a subagent. When an action needs to cross a safety boundary, GrokForge stops and asks.
 
-This is a pre-release project. The execution and safety paths are in place; rendering, automatic context selection, and distribution still need work.
+This is a pre-release project. The execution and safety paths are in place, and the adaptive TUI now exposes tool activity, approvals, reasoning, retries, token use, and privacy accounting. Automatic context selection, richer rendering, and distribution still need work.
 
 ## What works today
 
-- Streaming conversations in a native Rust TUI
+- An adaptive, branded native Rust TUI with streaming conversations and human-readable tool activity
 - Headless runs for scripts and CI
-- File read, write, edit, list, glob, and grep tools
+- File read, write, edit, list, glob, and grep tools, plus safe read-only Git status and diff
 - Sandboxed shell commands with approval controls
+- Project skills in `.grokforge/skills/*/SKILL.md` and reusable slash commands in `.grokforge/commands/*.md`
+- Explicit opt-ins for Grok web search, X search, and code interpreter tools
+- Approval-gated MCP tools from reviewed project configuration via `--trust-project-mcp`
 - Read-only plan mode
 - Persistent sessions with resume support
 - Isolated subagent worktrees with scoped commits
@@ -71,6 +74,17 @@ Run one task without opening the TUI:
 ./target/release/grokforge exec -p "find the bug and explain the fix"
 ```
 
+Enable Grok-hosted tools only when a task needs them. They are off by default and may be billed separately:
+
+```sh
+grokforge exec --web-search --x-search -p "research this dependency change"
+grokforge exec --code-interpreter -p "analyze these benchmark results"
+```
+
+Inside the TUI, use `/help` to discover commands, `/skills` to inspect project guidance, and
+`/tools` to view or toggle hosted tools for the current session. A project command such as
+`.grokforge/commands/verify.md` becomes `/verify`.
+
 Useful commands:
 
 ```sh
@@ -78,6 +92,8 @@ grokforge doctor
 grokforge sessions
 grokforge resume
 grokforge exec --plan -p "plan the refactor"
+# After reviewing .grokforge/mcp.json in a trusted project:
+grokforge --trust-project-mcp
 ```
 
 ## Safety
@@ -92,7 +108,6 @@ Commands start with a stripped-down environment, Git metadata stays protected, c
 - The repository map and smarter automatic context selection
 - Foreground auto-commit and a practical undo workflow
 - Full session search
-- A user-facing trust flow for MCP servers
 - Native Windows enforcement
 - Signed installers and package-manager releases
 

@@ -14,14 +14,17 @@ use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::{FutureExt, StreamExt};
+use grokforge_core::commands::{self, CommandDoc};
+use grokforge_core::skills::{self, SkillDoc};
 use grokforge_core::{Agent, RolloutWriter, Session, TurnCancellation};
-use grokforge_protocol::{Decision, EventMsg, ResponseItem};
+use grokforge_protocol::{Decision, DenialClass, EventMsg, ResponseItem, Usage};
+use grokforge_xai::ServerTool;
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use unicode_width::UnicodeWidthChar;
@@ -37,13 +40,84 @@ const MAX_RENDER_TRANSCRIPT_BYTES: usize = 48 * 1024;
 const APPROVAL_PAGE_BYTES: usize = 8 * 1024;
 const REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 
+// GrokForge's UI palette. Explicit colors make the product identity consistent across terminal
+// themes; every foreground/background pair is intentionally high-contrast. The interface still
+// makes sense without color because state and ownership always have a text label or glyph too.
+const CANVAS: Color = Color::Rgb(8, 10, 15);
+const SURFACE: Color = Color::Rgb(16, 19, 26);
+const SURFACE_RAISED: Color = Color::Rgb(23, 27, 36);
+// Borders are UI structure, not decoration: this clears the 3:1 non-text contrast threshold
+// against `SURFACE` while remaining quieter than body text.
+const BORDER: Color = Color::Rgb(96, 104, 126);
+const TEXT: Color = Color::Rgb(232, 235, 241);
+const MUTED: Color = Color::Rgb(137, 144, 160);
+const FAINT: Color = Color::Rgb(124, 131, 149);
+const ACCENT: Color = Color::Rgb(255, 90, 31);
+const ACCENT_SOFT: Color = Color::Rgb(255, 139, 92);
+const USER: Color = Color::Rgb(79, 199, 255);
+const SUCCESS: Color = Color::Rgb(73, 211, 142);
+const WARNING: Color = Color::Rgb(246, 197, 93);
+const DANGER: Color = Color::Rgb(255, 105, 120);
+const TOOL: Color = Color::Rgb(190, 148, 255);
+const GIT: Color = Color::Rgb(96, 165, 250);
+
+/// Presentation fallbacks for terminals that cannot reliably display the default palette or
+/// width-critical UI glyphs. `NO_COLOR` follows the ecosystem convention; `TERM=dumb` enables
+/// both fallbacks, and `GROKFORGE_ASCII` can request just the ASCII treatment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisplayMode {
+    color: bool,
+    ascii: bool,
+}
+
+impl DisplayMode {
+    fn from_environment() -> Self {
+        let dumb = std::env::var("TERM").is_ok_and(|term| term.eq_ignore_ascii_case("dumb"));
+        Self {
+            color: !dumb && !environment_flag("NO_COLOR"),
+            ascii: dumb || environment_flag("GROKFORGE_ASCII"),
+        }
+    }
+}
+
+fn environment_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty())
+}
+
 /// A finalized transcript entry.
 #[derive(Debug)]
 enum Entry {
     User(String),
     Assistant(String),
-    Tool(String),
-    ToolResult { ok: bool, text: String },
+    Reasoning(String),
+    Tool {
+        text: String,
+        sandboxed: Option<bool>,
+    },
+    ToolResult {
+        ok: bool,
+        text: String,
+        denial: Option<DenialClass>,
+    },
+    Approval {
+        summary: String,
+        decision: String,
+        approved: bool,
+        auto: bool,
+    },
+    Retry {
+        attempt: u32,
+        reason: String,
+    },
+    Skill {
+        name: String,
+        description: String,
+        path: String,
+    },
+    ServerTool {
+        name: String,
+        enabled: bool,
+    },
     Git(String),
     Error(String),
     Info(String),
@@ -210,6 +284,7 @@ pub struct App {
     transcript_bytes: usize,
     omitted_entries: usize,
     streaming: Option<String>,
+    reasoning: Option<String>,
     composer: String,
     scroll: u16,
     follow: bool,
@@ -221,6 +296,15 @@ pub struct App {
     shutdown: ShutdownState,
     status_model: String,
     status_preset: String,
+    active_tool: Option<String>,
+    stream_retry: Option<u32>,
+    usage: Usage,
+    ledger_bytes: usize,
+    ledger_sources: usize,
+    ledger_redactions: usize,
+    available_skills: Vec<SkillDoc>,
+    project_commands: Vec<CommandDoc>,
+    display_mode: DisplayMode,
 
     // The channel stays open for the app's lifetime because `agent` (Arc) holds the sender.
     events_rx: mpsc::UnboundedReceiver<EventMsg>,
@@ -261,9 +345,9 @@ impl App {
         status_preset: String,
     ) -> Self {
         let resumed = session.history.len();
-        let mut transcript = vec![Entry::Info(
-            "GrokForge — type a message and press Enter. Ctrl+C to quit.".to_string(),
-        )];
+        let available_skills = skills::discover(&session.config.workspace_root);
+        let project_commands = commands::discover(&session.config.workspace_root);
+        let mut transcript = Vec::new();
         let mut omitted_entries = 0;
         if resumed > 0 {
             transcript.push(Entry::Info(format!(
@@ -282,6 +366,7 @@ impl App {
             transcript_bytes,
             omitted_entries,
             streaming: None,
+            reasoning: None,
             composer: String::new(),
             scroll: 0,
             follow: true,
@@ -291,6 +376,15 @@ impl App {
             shutdown: ShutdownState::Active,
             status_model,
             status_preset,
+            active_tool: None,
+            stream_retry: None,
+            usage: Usage::default(),
+            ledger_bytes: 0,
+            ledger_sources: 0,
+            ledger_redactions: 0,
+            available_skills,
+            project_commands,
+            display_mode: DisplayMode::from_environment(),
             events_rx,
             approvals_rx,
             turn_handle: None,
@@ -553,12 +647,6 @@ impl App {
             && let Some(pending) = self.pending.take()
         {
             self.approval_detail = None;
-            let verb = if decision.is_approved() {
-                "approved"
-            } else {
-                "denied"
-            };
-            self.push_entry(Entry::Info(format!("approval {verb}")));
             let _ = pending.respond.send(decision);
         }
     }
@@ -586,6 +674,9 @@ impl App {
         let mut rollout = self.rollout.take();
         self.running = true;
         self.turn_complete_seen = false;
+        self.reasoning = None;
+        self.active_tool = None;
+        self.stream_retry = None;
         let cancellation = TurnCancellation::new();
         self.turn_cancellation = Some(cancellation.clone());
         let agent = Arc::clone(&self.agent);
@@ -616,8 +707,19 @@ impl App {
         match name {
             "help" | "?" => {
                 self.push_entry(Entry::Info(
-                    "commands: /plan <task>  ·  /undo  ·  /clear  ·  /help  ·  /quit".to_string(),
+                    "commands: /plan <task>  ·  /skills [name]  ·  /tools [web|x|code] [on|off]  ·  /undo  ·  /clear  ·  /quit".to_string(),
                 ));
+                if !self.project_commands.is_empty() {
+                    let commands = self
+                        .project_commands
+                        .iter()
+                        .map(|command| format!("/{}", command.name))
+                        .collect::<Vec<_>>()
+                        .join("  ·  ");
+                    self.push_entry(Entry::Info(format!(
+                        "project commands: {commands} · arguments are appended to the template"
+                    )));
+                }
             }
             "quit" | "exit" | "q" => self.request_quit(),
             "clear" => {
@@ -626,6 +728,8 @@ impl App {
                 self.omitted_entries = 0;
             }
             "undo" => self.undo(),
+            "skills" => self.show_skills(rest.trim()),
+            "tools" => self.handle_server_tools(rest.trim()),
             "plan" => {
                 let task = rest.trim();
                 if task.is_empty() {
@@ -637,10 +741,131 @@ impl App {
                 }
             }
             other => {
-                self.push_entry(Entry::Info(format!(
-                    "unknown command: /{other} (try /help)"
-                )));
+                if !self.run_project_command(other, rest) {
+                    self.push_entry(Entry::Info(format!(
+                        "unknown command: /{other} (try /help)"
+                    )));
+                }
             }
+        }
+    }
+
+    fn run_project_command(&mut self, name: &str, arguments: &str) -> bool {
+        let Some(command) = self
+            .project_commands
+            .iter()
+            .find(|command| command.name == name)
+            .cloned()
+        else {
+            return false;
+        };
+        let arguments = arguments.trim();
+        let display = if arguments.is_empty() {
+            format!("/{name}")
+        } else {
+            format!("/{name} {arguments}")
+        };
+        self.push_entry(Entry::User(display));
+        self.follow = true;
+        self.start_turn(commands::expand(&command, arguments), false);
+        true
+    }
+
+    fn handle_server_tools(&mut self, input: &str) {
+        let mut parts = input.split_whitespace();
+        let tool_name = parts.next();
+        let toggle = parts.next();
+        if parts.next().is_some() || tool_name.is_some() != toggle.is_some() {
+            self.push_entry(Entry::Info(
+                "usage: /tools  OR  /tools <web|x|code> <on|off>".to_string(),
+            ));
+            return;
+        }
+
+        let Some(tool_name) = tool_name else {
+            let enabled = self
+                .session
+                .as_ref()
+                .map(|session| session.config.enabled_server_tools.clone())
+                .unwrap_or_default();
+            self.push_entry(Entry::Info(
+                "xAI-HOSTED TOOLS · optional · metered separately by xAI".to_string(),
+            ));
+            for (name, tool) in server_tools() {
+                self.push_entry(Entry::ServerTool {
+                    name: name.to_string(),
+                    enabled: enabled.contains(&tool),
+                });
+            }
+            return;
+        };
+
+        let Some(tool) = parse_server_tool(tool_name) else {
+            self.push_entry(Entry::Info(format!(
+                "unknown xAI tool: {tool_name} · choose web, x, or code"
+            )));
+            return;
+        };
+        let enabled = match toggle {
+            Some("on" | "enable" | "enabled") => true,
+            Some("off" | "disable" | "disabled") => false,
+            _ => {
+                self.push_entry(Entry::Info(
+                    "tool state must be on or off · example: /tools web on".to_string(),
+                ));
+                return;
+            }
+        };
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        if enabled {
+            session.config.enabled_server_tools.insert(tool);
+        } else {
+            session.config.enabled_server_tools.remove(&tool);
+        }
+        self.push_entry(Entry::ServerTool {
+            name: server_tool_name(tool).to_string(),
+            enabled,
+        });
+        self.push_entry(Entry::Info(
+            "applies to the next turn · xAI-hosted calls are metered separately".to_string(),
+        ));
+    }
+
+    fn show_skills(&mut self, requested: &str) {
+        if self.available_skills.is_empty() {
+            self.push_entry(Entry::Info(
+                "No project skills found · add .grokforge/skills/<name>/SKILL.md".to_string(),
+            ));
+            return;
+        }
+
+        let matching: Vec<Entry> = self
+            .available_skills
+            .iter()
+            .filter(|skill| requested.is_empty() || skill.name == requested)
+            .map(|skill| Entry::Skill {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                path: format!(".grokforge/skills/{}/SKILL.md", skill.name),
+            })
+            .collect();
+        if matching.is_empty() {
+            self.push_entry(Entry::Info(format!(
+                "Unknown skill · {requested} · run /skills to list available workflows"
+            )));
+            return;
+        }
+
+        if requested.is_empty() {
+            self.push_entry(Entry::Info(format!(
+                "PROJECT SKILLS · {} available · /skills <name> inspects one",
+                matching.len()
+            )));
+        }
+        for entry in matching {
+            self.push_entry(entry);
         }
     }
 
@@ -667,9 +892,12 @@ impl App {
             ));
     }
 
+    #[allow(clippy::too_many_lines)]
     fn on_agent_event(&mut self, msg: EventMsg) {
         match msg {
             EventMsg::AgentMessageDelta { delta } => {
+                self.flush_reasoning();
+                self.stream_retry = None;
                 append_bounded(
                     self.streaming.get_or_insert_with(String::new),
                     &delta,
@@ -677,25 +905,93 @@ impl App {
                 );
             }
             EventMsg::AgentMessageDone { text } => {
+                self.flush_reasoning();
+                self.stream_retry = None;
                 self.streaming = None;
                 self.push_entry(Entry::Assistant(text));
             }
-            EventMsg::ToolCallBegin {
-                name, args_preview, ..
-            } => {
-                self.push_entry(Entry::Tool(format!("{name} {args_preview}")));
+            EventMsg::ReasoningDelta { delta } => {
+                append_bounded(
+                    self.reasoning.get_or_insert_with(String::new),
+                    &delta,
+                    MAX_ENTRY_BYTES,
+                );
             }
-            EventMsg::ToolCallEnd { ok, summary, .. } => {
-                self.push_entry(Entry::ToolResult { ok, text: summary });
+            EventMsg::ToolCallBegin {
+                name,
+                args_preview,
+                sandboxed,
+                ..
+            } => {
+                self.flush_reasoning();
+                self.stream_retry = None;
+                let text = humanize_tool_call(&name, &args_preview);
+                self.active_tool = text
+                    .split_whitespace()
+                    .next()
+                    .map(|name| bounded_text(&safe_terminal_line(name), 48));
+                self.push_entry(Entry::Tool {
+                    text,
+                    sandboxed: Some(sandboxed),
+                });
+            }
+            EventMsg::ToolCallEnd {
+                ok,
+                summary,
+                denial,
+                ..
+            } => {
+                self.active_tool = None;
+                self.push_entry(Entry::ToolResult {
+                    ok,
+                    text: summary,
+                    denial,
+                });
+            }
+            EventMsg::ApprovalResolved {
+                summary,
+                decision,
+                auto,
+            } => {
+                let approved = decision.starts_with("Approve");
+                self.push_entry(Entry::Approval {
+                    summary,
+                    decision,
+                    approved,
+                    auto,
+                });
+            }
+            EventMsg::LedgerAppended(entry) => {
+                self.ledger_sources = self.ledger_sources.saturating_add(1);
+                self.ledger_bytes = self.ledger_bytes.saturating_add(entry.bytes);
+                self.ledger_redactions = self.ledger_redactions.saturating_add(entry.redactions);
+                if entry.redactions > 0 {
+                    self.push_entry(Entry::Info(format!(
+                        "privacy · {} secret(s) redacted from {}",
+                        entry.redactions, entry.source
+                    )));
+                }
+            }
+            EventMsg::TokenUsage { usage } => {
+                self.usage.add(usage);
+            }
+            EventMsg::StreamRetrying { attempt, reason } => {
+                self.stream_retry = Some(attempt);
+                self.push_entry(Entry::Retry { attempt, reason });
             }
             EventMsg::Committed { sha, message } => {
                 let short = &sha[..sha.len().min(8)];
                 self.push_entry(Entry::Git(format!("committed {short}  {message}")));
             }
             EventMsg::Error { message, .. } => {
+                self.active_tool = None;
+                self.stream_retry = None;
                 self.push_entry(Entry::Error(message));
             }
             EventMsg::TurnComplete { .. } => {
+                self.flush_reasoning();
+                self.active_tool = None;
+                self.stream_retry = None;
                 // All earlier events from this turn are ahead of TurnComplete in the FIFO. Only
                 // advertise idle after both this marker and the task join have been observed.
                 self.turn_complete_seen = true;
@@ -705,7 +1001,19 @@ impl App {
                     self.finish_quit_if_quiescent();
                 }
             }
-            _ => {}
+            EventMsg::SessionConfigured { .. }
+            | EventMsg::TurnStarted { .. }
+            | EventMsg::ToolOutputDelta { .. }
+            | EventMsg::ApprovalRequested(_)
+            | EventMsg::ShutdownComplete => {}
+        }
+    }
+
+    fn flush_reasoning(&mut self) {
+        if let Some(reasoning) = self.reasoning.take()
+            && !reasoning.trim().is_empty()
+        {
+            self.push_entry(Entry::Reasoning(reasoning));
         }
     }
 
@@ -755,31 +1063,193 @@ impl App {
 
     fn render(&self, f: &mut ratatui::Frame) {
         let area = f.area();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        f.render_widget(
+            Block::default().style(Style::default().bg(CANVAS).fg(TEXT)),
+            area,
+        );
+
+        // The spacious layout carries product identity and context. As height disappears, chrome
+        // drops away before transcript/composer space does, so even a split-pane terminal remains
+        // usable rather than becoming a stack of borders.
+        let header_height = if area.height >= 16 && area.width >= 48 {
+            3
+        } else {
+            u16::from(area.height >= 8)
+        };
+        let status_height = u16::from(area.height >= 5);
+        let remaining = area
+            .height
+            .saturating_sub(header_height)
+            .saturating_sub(status_height);
+        let composer_height = if remaining >= 4 {
+            3
+        } else {
+            u16::from(remaining >= 2)
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(3),
-                Constraint::Length(1),
-                Constraint::Length(3),
+                Constraint::Length(header_height),
+                Constraint::Min(0),
+                Constraint::Length(composer_height),
+                Constraint::Length(status_height),
             ])
             .split(area);
 
-        self.render_transcript(chunks[0], f);
-        self.render_status(chunks[1], f);
+        self.render_header(chunks[0], f);
+        self.render_transcript(chunks[1], f);
         self.render_composer(chunks[2], f);
+        self.render_status(chunks[3], f);
 
         if let (Some(pending), Some(detail)) = (&self.pending, &self.approval_detail) {
             render_approval_modal(area, f, pending, detail);
         }
+        apply_display_fallback(f, area, self.display_mode);
+    }
+
+    fn activity_state(&self) -> (String, Color) {
+        if self.pending.is_some() {
+            ("● APPROVAL".to_string(), WARNING)
+        } else if let Some(attempt) = self.stream_retry {
+            (format!("↻ RETRY {attempt}"), WARNING)
+        } else if let Some(tool) = &self.active_tool {
+            (format!("● {}", compact_preview(tool, 18)), TOOL)
+        } else if self.reasoning.is_some() {
+            ("◇ THINKING".to_string(), MUTED)
+        } else if self.running {
+            ("● WORKING".to_string(), ACCENT)
+        } else {
+            ("● READY".to_string(), SUCCESS)
+        }
+    }
+
+    fn render_header(&self, area: Rect, f: &mut ratatui::Frame) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let mut block = Block::default().style(Style::default().bg(SURFACE).fg(TEXT));
+        if area.height > 1 {
+            block = block
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(BORDER));
+        }
+        f.render_widget(block, area);
+
+        let content = horizontal_inset(area, u16::from(area.width >= 24));
+        let brand = Line::from(vec![
+            Span::styled(
+                "◢ ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "GROKFORGE",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(brand.clone()), first_row(content));
+
+        let state = self.activity_state();
+        let right = if area.height > 1 {
+            Line::from(vec![
+                Span::styled("GROK  /  ", Style::default().fg(FAINT)),
+                Span::styled(
+                    safe_terminal_line(&self.status_model),
+                    Style::default().fg(MUTED),
+                ),
+                Span::raw("  "),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(state.0.clone(), Style::default().fg(state.1)),
+                Span::raw(" "),
+            ])
+        };
+        if content.width
+            >= u16::try_from(
+                brand
+                    .width()
+                    .saturating_add(right.width())
+                    .saturating_add(4),
+            )
+            .unwrap_or(u16::MAX)
+        {
+            f.render_widget(
+                Paragraph::new(right).alignment(Alignment::Right),
+                first_row(content),
+            );
+        }
+
+        if area.height > 2 {
+            let tagline = Line::from(vec![
+                Span::styled(
+                    "Make Grok great in the terminal.",
+                    Style::default().fg(MUTED),
+                ),
+                Span::styled("  ·  ", Style::default().fg(FAINT)),
+                Span::styled("forge boldly", Style::default().fg(ACCENT_SOFT)),
+            ]);
+            let row = Rect::new(content.x, content.y.saturating_add(1), content.width, 1);
+            f.render_widget(Paragraph::new(tagline.clone()), row);
+            let state_line = Line::from(vec![
+                Span::styled(state.0, Style::default().fg(state.1)),
+                Span::raw("  "),
+            ]);
+            if content.width
+                >= u16::try_from(
+                    tagline
+                        .width()
+                        .saturating_add(state_line.width())
+                        .saturating_add(4),
+                )
+                .unwrap_or(u16::MAX)
+            {
+                f.render_widget(Paragraph::new(state_line).alignment(Alignment::Right), row);
+            }
+        }
     }
 
     fn render_transcript(&self, area: Rect, f: &mut ratatui::Frame) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        f.render_widget(
+            Block::default().style(Style::default().bg(CANVAS).fg(TEXT)),
+            area,
+        );
+
+        let gutter = if area.width >= 72 {
+            4
+        } else {
+            u16::from(area.width >= 28)
+        };
+        let content_area = horizontal_inset(area, gutter);
+        let content_width = content_area.width.max(1);
+        if self.transcript.is_empty() && self.streaming.is_none() && self.reasoning.is_none() {
+            render_welcome(content_area, f);
+            return;
+        }
+
         let mut lines: Vec<Line<'static>> = Vec::new();
         // Keep redraw work and Paragraph's u16 scroll range bounded even when the retained
         // transcript is several MiB. The durable rollout still contains the complete history.
-        let streaming_bytes = self.streaming.as_ref().map_or(0, String::len);
-        let mut byte_budget = MAX_RENDER_TRANSCRIPT_BYTES
-            .saturating_sub(streaming_bytes.min(MAX_RENDER_TRANSCRIPT_BYTES));
+        // Only the short reasoning preview below is rendered live. Reserving the whole reasoning
+        // buffer could evict the entire transcript even though almost none of it reaches screen.
+        let live_bytes = self
+            .streaming
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_add(
+                self.reasoning
+                    .as_deref()
+                    .map_or(0, |reasoning| compact_preview(reasoning, 240).len()),
+            );
+        let mut byte_budget =
+            MAX_RENDER_TRANSCRIPT_BYTES.saturating_sub(live_bytes.min(MAX_RENDER_TRANSCRIPT_BYTES));
         let mut visible_start = self.transcript.len();
         let mut visible_entries = 0usize;
         while visible_start > 0 && visible_entries < MAX_RENDER_TRANSCRIPT_ENTRIES {
@@ -799,26 +1269,26 @@ impl App {
                 &Entry::Info(format!(
                     "… {render_omitted} earlier transcript item(s) omitted from this view; full history remains in the session rollout …"
                 )),
+                content_width,
             );
         }
         for entry in &self.transcript[visible_start..] {
-            push_entry_lines(&mut lines, entry);
+            push_entry_lines(&mut lines, entry, content_width);
+        }
+        if let Some(reasoning) = &self.reasoning {
+            lines.push(Line::from(vec![
+                Span::styled("◇  THINKING  ", Style::default().fg(FAINT)),
+                Span::styled(compact_preview(reasoning, 240), Style::default().fg(MUTED)),
+                Span::styled("  ●", Style::default().fg(ACCENT)),
+            ]));
         }
         if let Some(streaming) = &self.streaming {
-            lines.push(Line::from(Span::styled(
-                "grok",
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            )));
+            push_role_header(&mut lines, "◆", "GROK", ACCENT, Some("● GENERATING"));
             let streaming = safe_terminal_text(streaming);
-            for l in streaming.lines() {
-                lines.push(Line::from(l.to_string()));
-            }
+            push_body(&mut lines, &streaming, TEXT, content_width);
         }
 
-        let viewport = area.height.saturating_sub(2);
-        let content_width = area.width.saturating_sub(2).max(1);
+        let viewport = content_area.height;
         let para = Paragraph::new(lines).wrap(Wrap { trim: false });
         let total = u16::try_from(para.line_count(content_width)).unwrap_or(u16::MAX);
         let max_scroll = total.saturating_sub(viewport);
@@ -828,63 +1298,201 @@ impl App {
             max_scroll.saturating_sub(self.scroll)
         };
 
-        let para = para
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" conversation "),
-            )
-            .scroll((scroll, 0));
-        f.render_widget(para, area);
+        f.render_widget(para.scroll((scroll, 0)), content_area);
+
+        if !self.follow && area.width >= 28 {
+            let label = format!(" ↑ {}  ·  End: latest ", self.scroll);
+            let width = u16::try_from(Line::from(label.as_str()).width())
+                .unwrap_or(area.width)
+                .min(area.width);
+            let badge = Rect::new(area.right().saturating_sub(width), area.y, width, 1);
+            f.render_widget(
+                Paragraph::new(label).style(Style::default().fg(MUTED).bg(SURFACE_RAISED)),
+                badge,
+            );
+        }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_status(&self, area: Rect, f: &mut ratatui::Frame) {
-        let indicator = if self.running {
-            "● working"
-        } else {
-            "○ idle"
-        };
-        let hidden = if self.omitted_entries > 0 {
-            format!("  ·  {} history item(s) hidden", self.omitted_entries)
-        } else {
-            String::new()
-        };
-        let text = format!(
-            " {}  ·  {}  ·  {indicator}{hidden}  ·  Ctrl+C quit ",
-            safe_terminal_line(&self.status_model),
-            safe_terminal_line(&self.status_preset)
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        f.render_widget(
+            Block::default().style(Style::default().bg(SURFACE_RAISED).fg(TEXT)),
+            area,
         );
-        let para = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
-        f.render_widget(para, area);
+
+        let (indicator, state_color) = self.activity_state();
+        let mut spans = vec![
+            Span::raw(" "),
+            Span::styled(
+                indicator,
+                Style::default()
+                    .fg(state_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if area.width >= 24 {
+            spans.extend([
+                Span::styled("  │  ", Style::default().fg(FAINT)),
+                Span::styled(
+                    safe_terminal_line(&self.status_model),
+                    Style::default().fg(TEXT),
+                ),
+            ]);
+        }
+        if area.width >= 46 {
+            spans.extend([
+                Span::styled("  ·  ", Style::default().fg(FAINT)),
+                Span::styled(
+                    safe_terminal_line(&self.status_preset).to_uppercase(),
+                    Style::default().fg(MUTED),
+                ),
+            ]);
+        }
+        let used_tokens = self
+            .usage
+            .input_tokens
+            .saturating_add(self.usage.output_tokens);
+        if used_tokens > 0 && area.width >= 70 {
+            spans.extend([
+                Span::styled("  ·  ", Style::default().fg(FAINT)),
+                Span::styled(
+                    format!(
+                        "tok {} · cache {}%",
+                        compact_count(used_tokens),
+                        cache_percent(self.usage)
+                    ),
+                    Style::default().fg(MUTED),
+                ),
+            ]);
+        }
+        if self.ledger_sources > 0 && area.width >= 96 {
+            let redactions = if self.ledger_redactions > 0 {
+                format!("/{}r", self.ledger_redactions)
+            } else {
+                String::new()
+            };
+            spans.extend([
+                Span::styled("  ·  ", Style::default().fg(FAINT)),
+                Span::styled(
+                    format!(
+                        "↑{}/{}{}",
+                        self.ledger_sources,
+                        compact_bytes(self.ledger_bytes),
+                        redactions
+                    ),
+                    Style::default().fg(USER),
+                ),
+            ]);
+        }
+        if !self.available_skills.is_empty() && area.width >= 116 {
+            spans.extend([
+                Span::styled("  ·  ", Style::default().fg(FAINT)),
+                Span::styled(
+                    format!("✦ {} skills", self.available_skills.len()),
+                    Style::default().fg(ACCENT_SOFT),
+                ),
+            ]);
+        }
+        if self.omitted_entries > 0 && (area.width >= 136 || (area.width >= 72 && used_tokens == 0))
+        {
+            spans.extend([
+                Span::styled("  ·  ", Style::default().fg(FAINT)),
+                Span::styled(
+                    format!("{} history hidden", self.omitted_entries),
+                    Style::default().fg(MUTED),
+                ),
+            ]);
+        }
+        let status = Line::from(spans);
+        let status_width = status.width();
+        f.render_widget(Paragraph::new(status), area);
+
+        if area.width >= 94 {
+            let hints = Line::from(vec![
+                Span::styled("↵", Style::default().fg(ACCENT_SOFT)),
+                Span::styled(" send   ", Style::default().fg(MUTED)),
+                Span::styled("↑↓", Style::default().fg(TEXT)),
+                Span::styled(" scroll   ", Style::default().fg(MUTED)),
+                Span::styled("/help", Style::default().fg(TEXT)),
+                Span::styled("   Ctrl+C quit  ", Style::default().fg(MUTED)),
+            ]);
+            if usize::from(area.width)
+                >= status_width.saturating_add(hints.width()).saturating_add(2)
+            {
+                f.render_widget(Paragraph::new(hints).alignment(Alignment::Right), area);
+            }
+        }
     }
 
     fn render_composer(&self, area: Rect, f: &mut ratatui::Frame) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let compact = area.height < 3;
+        let prefix = if compact { " › " } else { " ›  " };
+        let prefix_width = u16::try_from(Line::from(prefix).width()).unwrap_or(0);
+        let border_width = if compact { 0 } else { 2 };
+        let available = area
+            .width
+            .saturating_sub(border_width)
+            .saturating_sub(prefix_width);
+        let display = composer_tail(&safe_terminal_text(&self.composer), usize::from(available));
         let content = if self.composer.is_empty() {
             Span::styled(
-                "Ask Grok…",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
+                if self.running {
+                    "Grok is working · draft your next message…"
+                } else {
+                    "Ask Grok · describe a change, paste an error, or type /help"
+                },
+                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
             )
         } else {
-            Span::raw(self.composer.as_str())
+            Span::styled(display.as_str(), Style::default().fg(TEXT))
         };
-        let para = Paragraph::new(Line::from(vec![Span::raw("› "), content]))
-            .block(Block::default().borders(Borders::ALL))
-            .wrap(Wrap { trim: false });
+        let mut block = Block::default().style(Style::default().bg(SURFACE).fg(TEXT));
+        if !compact {
+            let border_color = if self.pending.is_some() {
+                WARNING
+            } else {
+                ACCENT
+            };
+            block = block
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(border_color))
+                .title(Line::from(Span::styled(
+                    " PROMPT ",
+                    Style::default()
+                        .fg(ACCENT_SOFT)
+                        .add_modifier(Modifier::BOLD),
+                )));
+        }
+        let para = Paragraph::new(Line::from(vec![
+            Span::styled(
+                prefix,
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            content,
+        ]))
+        .block(block);
         f.render_widget(para, area);
-        if self.pending.is_none() && area.width > 2 && area.height > 2 {
-            let prefix_width = 2u16;
-            let composer_width =
-                u16::try_from(Line::from(self.composer.as_str()).width()).unwrap_or(u16::MAX);
-            let max_x = area.right().saturating_sub(2);
+        if self.pending.is_none() && area.width > border_width {
+            let composer_width = u16::try_from(Line::from(display.as_str()).width())
+                .unwrap_or(u16::MAX)
+                .min(available);
+            let max_x = area.right().saturating_sub(u16::from(!compact));
             let x = area
                 .x
-                .saturating_add(1)
+                .saturating_add(u16::from(!compact))
                 .saturating_add(prefix_width)
                 .saturating_add(composer_width)
                 .min(max_x);
-            f.set_cursor_position((x, area.y.saturating_add(1)));
+            let y = area.y.saturating_add(u16::from(!compact));
+            f.set_cursor_position((x, y.min(area.bottom().saturating_sub(1))));
         }
     }
 }
@@ -948,11 +1556,25 @@ fn entry_bytes(entry: &Entry) -> usize {
     match entry {
         Entry::User(text)
         | Entry::Assistant(text)
-        | Entry::Tool(text)
+        | Entry::Reasoning(text)
+        | Entry::Tool { text, .. }
+        | Entry::ToolResult { text, .. }
         | Entry::Git(text)
         | Entry::Error(text)
-        | Entry::Info(text)
-        | Entry::ToolResult { text, .. } => text.len(),
+        | Entry::Info(text) => text.len(),
+        Entry::Approval {
+            summary, decision, ..
+        } => summary.len().saturating_add(decision.len()),
+        Entry::Retry { reason, .. } => reason.len(),
+        Entry::Skill {
+            name,
+            description,
+            path,
+        } => name
+            .len()
+            .saturating_add(description.len())
+            .saturating_add(path.len()),
+        Entry::ServerTool { name, .. } => name.len(),
     }
 }
 
@@ -960,10 +1582,43 @@ fn bounded_entry(entry: Entry) -> Entry {
     match entry {
         Entry::User(text) => Entry::User(bounded_text(&text, MAX_ENTRY_BYTES)),
         Entry::Assistant(text) => Entry::Assistant(bounded_text(&text, MAX_ENTRY_BYTES)),
-        Entry::Tool(text) => Entry::Tool(bounded_text(&text, MAX_ENTRY_BYTES)),
-        Entry::ToolResult { ok, text } => Entry::ToolResult {
+        Entry::Reasoning(text) => Entry::Reasoning(bounded_text(&text, MAX_ENTRY_BYTES)),
+        Entry::Tool { text, sandboxed } => Entry::Tool {
+            text: bounded_text(&text, MAX_ENTRY_BYTES),
+            sandboxed,
+        },
+        Entry::ToolResult { ok, text, denial } => Entry::ToolResult {
             ok,
             text: bounded_text(&text, MAX_ENTRY_BYTES),
+            denial,
+        },
+        Entry::Approval {
+            summary,
+            decision,
+            approved,
+            auto,
+        } => Entry::Approval {
+            summary: bounded_text(&summary, MAX_ENTRY_BYTES / 2),
+            decision: bounded_text(&decision, MAX_ENTRY_BYTES / 2),
+            approved,
+            auto,
+        },
+        Entry::Retry { attempt, reason } => Entry::Retry {
+            attempt,
+            reason: bounded_text(&reason, MAX_ENTRY_BYTES),
+        },
+        Entry::Skill {
+            name,
+            description,
+            path,
+        } => Entry::Skill {
+            name: bounded_text(&name, 1_024),
+            description: bounded_text(&description, MAX_ENTRY_BYTES.saturating_sub(5_120)),
+            path: bounded_text(&path, 4_096),
+        },
+        Entry::ServerTool { name, enabled } => Entry::ServerTool {
+            name: bounded_text(&name, 1_024),
+            enabled,
         },
         Entry::Git(text) => Entry::Git(bounded_text(&text, MAX_ENTRY_BYTES)),
         Entry::Error(text) => Entry::Error(bounded_text(&text, MAX_ENTRY_BYTES)),
@@ -1013,22 +1668,21 @@ fn entry_from_history(item: &ResponseItem) -> Option<Entry> {
         ResponseItem::AssistantMessage { text } => {
             Some(Entry::Assistant(bounded_text(text, MAX_ENTRY_BYTES)))
         }
-        ResponseItem::Reasoning { text } => Some(Entry::Info(format!(
-            "thinking: {}",
-            bounded_text(text, MAX_ENTRY_BYTES.saturating_sub(10))
-        ))),
+        ResponseItem::Reasoning { text } => {
+            Some(Entry::Reasoning(bounded_text(text, MAX_ENTRY_BYTES)))
+        }
         ResponseItem::ToolCall {
             name, arguments, ..
-        } => Some(Entry::Tool(format!(
-            "{} {}",
-            bounded_text(name, 1_024),
-            bounded_text(arguments, MAX_ENTRY_BYTES.saturating_sub(1_025))
-        ))),
+        } => Some(Entry::Tool {
+            text: humanize_tool_call(name, arguments),
+            sandboxed: None,
+        }),
         ResponseItem::ToolResult {
             content, is_error, ..
         } => Some(Entry::ToolResult {
             ok: !is_error,
             text: bounded_text(content, MAX_ENTRY_BYTES),
+            denial: None,
         }),
         ResponseItem::CompactionSummary { text, .. } => Some(Entry::Info(format!(
             "compacted history: {}",
@@ -1067,110 +1721,636 @@ fn entry_from_provider_output(item: &serde_json::Value) -> Option<Entry> {
                 .get("arguments")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("{}");
-            Some(Entry::Tool(format!(
-                "{} {}",
-                bounded_text(name, 1_024),
-                bounded_text(arguments, MAX_ENTRY_BYTES.saturating_sub(1_025))
-            )))
+            Some(Entry::Tool {
+                text: humanize_tool_call(name, arguments),
+                sandboxed: None,
+            })
         }
-        Some(kind) if kind.ends_with("_call") => Some(Entry::Tool(format!(
-            "{kind} [provider details retained in rollout]"
-        ))),
+        Some(kind) if kind.ends_with("_call") => Some(Entry::Tool {
+            text: format!("{kind} [provider details retained in rollout]"),
+            sandboxed: None,
+        }),
         _ => None,
     }
 }
 
-fn push_entry_lines(lines: &mut Vec<Line<'static>>, entry: &Entry) {
-    match entry {
-        Entry::User(text) => {
-            lines.push(Line::from(Span::styled(
-                "you",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            let text = safe_terminal_text(text);
-            for l in text.lines() {
-                lines.push(Line::from(l.to_string()));
-            }
-        }
-        Entry::Assistant(text) => {
-            lines.push(Line::from(Span::styled(
-                "grok",
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            let text = safe_terminal_text(text);
-            for l in text.lines() {
-                lines.push(Line::from(l.to_string()));
-            }
-        }
-        Entry::Tool(text) => {
-            lines.push(Line::from(Span::styled(
-                format!("⚙ {}", safe_terminal_text(text)),
-                Style::default().fg(Color::Yellow),
-            )));
-        }
-        Entry::ToolResult { ok, text } => {
-            let (glyph, color) = if *ok {
-                ("✓", Color::Green)
-            } else {
-                ("✗", Color::Red)
-            };
-            lines.push(Line::from(Span::styled(
-                format!("  {glyph} {}", safe_terminal_text(text)),
-                Style::default().fg(color),
-            )));
-        }
-        Entry::Git(text) => {
-            lines.push(Line::from(Span::styled(
-                format!("⎿ {}", safe_terminal_text(text)),
-                Style::default().fg(Color::Blue),
-            )));
-        }
-        Entry::Error(text) => {
-            lines.push(Line::from(Span::styled(
-                format!("error: {}", safe_terminal_text(text)),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            )));
-        }
-        Entry::Info(text) => {
-            lines.push(Line::from(Span::styled(
-                safe_terminal_text(text),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-    }
-    lines.push(Line::from(""));
+fn horizontal_inset(area: Rect, amount: u16) -> Rect {
+    let inset = amount.min(area.width / 2);
+    Rect::new(
+        area.x.saturating_add(inset),
+        area.y,
+        area.width.saturating_sub(inset.saturating_mul(2)),
+        area.height,
+    )
 }
 
+fn first_row(area: Rect) -> Rect {
+    Rect::new(area.x, area.y, area.width, u16::from(area.height > 0))
+}
+
+fn centered_fixed(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    )
+}
+
+fn apply_display_fallback(f: &mut ratatui::Frame, area: Rect, mode: DisplayMode) {
+    if mode.color && !mode.ascii {
+        return;
+    }
+    let buffer = f.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let Some(cell) = buffer.cell_mut((x, y)) else {
+                continue;
+            };
+            if !mode.color {
+                cell.set_fg(Color::Reset).set_bg(Color::Reset);
+            }
+            if mode.ascii
+                && let Some(replacement) = ascii_ui_symbol(cell.symbol())
+            {
+                cell.set_symbol(replacement);
+            }
+        }
+    }
+}
+
+fn ascii_ui_symbol(symbol: &str) -> Option<&'static str> {
+    match symbol {
+        "╭" | "╮" | "╰" | "╯" | "└" | "✓" => Some("+"),
+        "─" => Some("-"),
+        "│" => Some("|"),
+        "◢" => Some("#"),
+        "◆" | "◇" | "●" | "✦" | "⚙" => Some("*"),
+        "○" => Some("o"),
+        "▲" => Some("!"),
+        "✗" | "×" => Some("x"),
+        "↻" => Some("~"),
+        "☁" => Some("@"),
+        "⎇" => Some("G"),
+        "›" | "↵" | "⇥" => Some(">"),
+        "↑" => Some("^"),
+        "↓" => Some("v"),
+        "·" | "…" => Some("."),
+        _ => None,
+    }
+}
+
+fn render_welcome(area: Rect, f: &mut ratatui::Frame) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    if area.width >= 58 && area.height >= 12 {
+        let card = centered_fixed(
+            area,
+            area.width.saturating_sub(4).min(76),
+            10.min(area.height.saturating_sub(2)),
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(SURFACE).fg(TEXT))
+            .title(Line::from(vec![
+                Span::styled(" ◆ ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    "READY TO FORGE ",
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        let inner = horizontal_inset(block.inner(card), 2);
+        f.render_widget(block, card);
+        let lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("GrokForge is ready", Style::default().fg(TEXT)),
+                Span::styled(
+                    " and grounded in this workspace.",
+                    Style::default().fg(MUTED),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Start with a question, a bug, or a change you want shipped.",
+                Style::default().fg(TEXT),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("›  ", Style::default().fg(USER)),
+                Span::styled(
+                    "Explain how this repository fits together",
+                    Style::default().fg(MUTED),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("›  ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    "/plan a safe, reviewable change",
+                    Style::default().fg(MUTED),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("ENTER", Style::default().fg(ACCENT_SOFT)),
+                Span::styled(" send   ·   ", Style::default().fg(FAINT)),
+                Span::styled("/help", Style::default().fg(TEXT)),
+                Span::styled(" commands", Style::default().fg(FAINT)),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    let compact = centered_fixed(area, area.width.min(40), area.height.min(4));
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "◆ ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "GROKFORGE",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled("Ready to build.", Style::default().fg(MUTED))),
+        Line::from(Span::styled(
+            "Ask Grok about this workspace.",
+            Style::default().fg(TEXT),
+        )),
+        Line::from(Span::styled(
+            "Enter sends  ·  /help",
+            Style::default().fg(FAINT),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), compact);
+}
+
+fn push_role_header(
+    lines: &mut Vec<Line<'static>>,
+    glyph: &'static str,
+    role: &'static str,
+    color: Color,
+    badge: Option<&'static str>,
+) {
+    let mut spans = vec![
+        Span::styled(
+            format!("{glyph} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            role,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(badge) = badge {
+        spans.extend([
+            Span::raw("  "),
+            Span::styled(badge, Style::default().fg(MUTED)),
+        ]);
+    }
+    lines.push(Line::from(spans));
+}
+
+fn push_body(lines: &mut Vec<Line<'static>>, text: &str, color: Color, width: u16) {
+    let indent = " ".repeat(usize::from(width).saturating_sub(1).min(3));
+    let body_width = usize::from(width).saturating_sub(indent.len()).max(1);
+    for logical_line in text.split('\n') {
+        for visual_line in hard_wrap_display_line(logical_line, body_width) {
+            // Pre-wrapping gives every continuation the same hanging indent. Leaving this to
+            // `Paragraph::wrap` would put continuation rows back at column zero.
+            lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::styled(visual_line, Style::default().fg(color)),
+            ]));
+        }
+    }
+}
+
+fn hard_wrap_display_line(line: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_width = 0usize;
+    for ch in line.chars() {
+        // Ratatui does not assign tabs a reliable cell width. Expand them before measuring so a
+        // tab cannot make a manually wrapped continuation drift back into the gutter.
+        let expanded = if ch == '\t' { "    " } else { "" };
+        if expanded.is_empty() {
+            push_wrapped_char(&mut rows, &mut row, &mut row_width, ch, width);
+        } else {
+            for space in expanded.chars() {
+                push_wrapped_char(&mut rows, &mut row, &mut row_width, space, width);
+            }
+        }
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+fn push_wrapped_char(
+    rows: &mut Vec<String>,
+    row: &mut String,
+    row_width: &mut usize,
+    ch: char,
+    width: usize,
+) {
+    let ch_width = ch.width().unwrap_or(0);
+    if !row.is_empty() && row_width.saturating_add(ch_width) > width {
+        rows.push(std::mem::take(row));
+        *row_width = 0;
+    }
+    row.push(ch);
+    *row_width = row_width.saturating_add(ch_width);
+}
+
+#[allow(clippy::too_many_lines)]
+fn push_entry_lines(lines: &mut Vec<Line<'static>>, entry: &Entry, width: u16) {
+    match entry {
+        Entry::User(text) => {
+            push_role_header(lines, "›", "YOU", USER, None);
+            let text = safe_terminal_text(text);
+            push_body(lines, &text, TEXT, width);
+        }
+        Entry::Assistant(text) => {
+            push_role_header(lines, "◆", "GROK", ACCENT, None);
+            let text = safe_terminal_text(text);
+            push_body(lines, &text, TEXT, width);
+        }
+        Entry::Reasoning(text) => {
+            lines.push(Line::from(vec![
+                Span::styled("◇  THINKING  ", Style::default().fg(FAINT)),
+                Span::styled(compact_preview(text, 240), Style::default().fg(MUTED)),
+            ]));
+        }
+        Entry::Tool { text, sandboxed } => {
+            let text = safe_terminal_text(text);
+            let (name, detail) = text.split_once(' ').unwrap_or((&text, ""));
+            let detail = detail.trim_start();
+            let mut spans = vec![
+                Span::styled("⚙  ", Style::default().fg(TOOL)),
+                Span::styled(
+                    name.to_string(),
+                    Style::default().fg(TOOL).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            match sandboxed {
+                Some(true) => {
+                    spans.push(Span::styled("  ● sandboxed", Style::default().fg(SUCCESS)));
+                }
+                Some(false) => {
+                    spans.push(Span::styled("  ▲ host", Style::default().fg(WARNING)));
+                }
+                None => {}
+            }
+            spans.push(Span::styled(
+                format!("  {detail}"),
+                Style::default().fg(MUTED),
+            ));
+            lines.push(Line::from(spans));
+        }
+        Entry::ToolResult { ok, text, denial } => {
+            let (glyph, color) = if *ok {
+                ("✓", SUCCESS)
+            } else {
+                ("✗", DANGER)
+            };
+            let text = safe_terminal_text(text);
+            let mut body = text.split('\n');
+            let mut spans = vec![
+                Span::styled("└─ ", Style::default().fg(FAINT)),
+                Span::styled(format!("{glyph} "), Style::default().fg(color)),
+                Span::styled(
+                    body.next().unwrap_or_default().to_string(),
+                    Style::default().fg(MUTED),
+                ),
+            ];
+            if let Some(denial) = denial {
+                spans.extend([
+                    Span::styled("  ·  BLOCKED ", Style::default().fg(DANGER)),
+                    Span::styled(denial_label(*denial), Style::default().fg(DANGER)),
+                ]);
+            }
+            lines.push(Line::from(spans));
+            let remaining = body.collect::<Vec<_>>().join("\n");
+            if !remaining.is_empty() {
+                push_body(lines, &remaining, MUTED, width);
+            }
+        }
+        Entry::Approval {
+            summary,
+            decision,
+            approved,
+            auto,
+        } => {
+            let (glyph, color) = if *approved {
+                ("✓", SUCCESS)
+            } else {
+                ("×", DANGER)
+            };
+            let mut spans = vec![
+                Span::styled(format!("{glyph}  APPROVAL  "), Style::default().fg(color)),
+                Span::styled(safe_terminal_line(decision), Style::default().fg(TEXT)),
+                Span::styled("  ·  ", Style::default().fg(FAINT)),
+                Span::styled(safe_terminal_line(summary), Style::default().fg(MUTED)),
+            ];
+            if *auto {
+                spans.push(Span::styled("  AUTO", Style::default().fg(WARNING)));
+            }
+            lines.push(Line::from(spans));
+        }
+        Entry::Retry { attempt, reason } => {
+            lines.push(Line::from(vec![
+                Span::styled("↻  RETRY  ", Style::default().fg(WARNING)),
+                Span::styled(format!("attempt {attempt}"), Style::default().fg(TEXT)),
+                Span::styled("  ·  ", Style::default().fg(FAINT)),
+                Span::styled(compact_preview(reason, 240), Style::default().fg(MUTED)),
+            ]));
+        }
+        Entry::Skill {
+            name,
+            description,
+            path,
+        } => {
+            lines.push(Line::from(vec![
+                Span::styled("✦  SKILL  ", Style::default().fg(ACCENT_SOFT)),
+                Span::styled(
+                    safe_terminal_line(name),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            push_body(lines, &safe_terminal_text(description), MUTED, width);
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(safe_terminal_line(path), Style::default().fg(FAINT)),
+            ]));
+        }
+        Entry::ServerTool { name, enabled } => {
+            let (state, color) = if *enabled {
+                ("● ON", SUCCESS)
+            } else {
+                ("○ OFF", MUTED)
+            };
+            lines.push(Line::from(vec![
+                Span::styled("☁  xAI TOOL  ", Style::default().fg(USER)),
+                Span::styled(
+                    safe_terminal_line(name),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {state}"), Style::default().fg(color)),
+                Span::styled("  ·  metered", Style::default().fg(WARNING)),
+            ]));
+        }
+        Entry::Git(text) => {
+            lines.push(Line::from(vec![
+                Span::styled("⎇  ", Style::default().fg(GIT)),
+                Span::styled(
+                    safe_terminal_text(text),
+                    Style::default().fg(GIT).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+        Entry::Error(text) => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "!  ERROR  ",
+                    Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(safe_terminal_text(text), Style::default().fg(TEXT)),
+            ]));
+        }
+        Entry::Info(text) => {
+            lines.push(Line::from(vec![
+                Span::styled("·  ", Style::default().fg(FAINT)),
+                Span::styled(safe_terminal_text(text), Style::default().fg(MUTED)),
+            ]));
+        }
+    }
+    if !matches!(entry, Entry::Tool { .. }) {
+        lines.push(Line::from(""));
+    }
+}
+
+fn denial_label(denial: DenialClass) -> &'static str {
+    match denial {
+        DenialClass::FsWrite => "filesystem write",
+        DenialClass::FsRead => "filesystem read",
+        DenialClass::Network => "network",
+        DenialClass::Signal => "signal",
+    }
+}
+
+fn compact_preview(value: &str, max_chars: usize) -> String {
+    let value = safe_terminal_line(value);
+    let mut output: String = value.chars().take(max_chars).collect();
+    if value.chars().count() > max_chars {
+        output.push('…');
+    }
+    output
+}
+
+fn humanize_tool_call(name: &str, arguments: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(arguments).ok();
+    let arg = |key: &str| {
+        parsed
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(|value| compact_preview(value, 320))
+    };
+    let path = || arg("path").unwrap_or_else(|| ".".to_string());
+    match name {
+        "read_file" => format!("read  {}", path()),
+        "write_file" => format!("write  {}", path()),
+        "edit" => format!("edit  {}", path()),
+        "list" => format!("list  {}", path()),
+        "glob" => format!(
+            "glob  {}",
+            arg("pattern").unwrap_or_else(|| "<pattern>".to_string())
+        ),
+        "grep" => format!(
+            "search  /{}/  in {}",
+            arg("pattern").unwrap_or_else(|| "<pattern>".to_string()),
+            path()
+        ),
+        "shell" => format!(
+            "shell  $ {}",
+            arg("command").unwrap_or_else(|| "<command>".to_string())
+        ),
+        "git_status" => "git  status".to_string(),
+        "git_diff" => {
+            let staged = parsed
+                .as_ref()
+                .and_then(|value| value.get("staged"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            format!("git  diff · {}", if staged { "staged" } else { "unstaged" })
+        }
+        "spawn_task" => format!(
+            "agent  {}",
+            arg("prompt").unwrap_or_else(|| "isolated subtask".to_string())
+        ),
+        _ => {
+            let name = compact_preview(name, 64);
+            let arguments = compact_preview(arguments, 360);
+            if arguments.is_empty() || arguments == "{}" {
+                name
+            } else {
+                format!("{name}  {arguments}")
+            }
+        }
+    }
+}
+
+fn compact_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        compact_scaled(value, 1_000_000, "m")
+    } else if value >= 1_000 {
+        compact_scaled(value, 1_000, "k")
+    } else {
+        value.to_string()
+    }
+}
+
+fn compact_bytes(value: usize) -> String {
+    let value = u64::try_from(value).unwrap_or(u64::MAX);
+    if value >= 1024 * 1024 {
+        compact_scaled(value, 1024 * 1024, "MB")
+    } else if value >= 1024 {
+        compact_scaled(value, 1024, "KB")
+    } else {
+        format!("{value}B")
+    }
+}
+
+fn compact_scaled(value: u64, unit: u64, suffix: &str) -> String {
+    let whole = value / unit;
+    let tenth = value % unit / (unit / 10).max(1);
+    if whole < 10 && tenth > 0 {
+        format!("{whole}.{tenth}{suffix}")
+    } else {
+        format!("{whole}{suffix}")
+    }
+}
+
+fn cache_percent(usage: Usage) -> u64 {
+    if usage.input_tokens == 0 {
+        return 0;
+    }
+    let percent = u128::from(usage.cached_tokens)
+        .saturating_mul(100)
+        .checked_div(u128::from(usage.input_tokens))
+        .unwrap_or(0)
+        .min(100);
+    u64::try_from(percent).unwrap_or(100)
+}
+
+fn server_tools() -> [(&'static str, ServerTool); 3] {
+    [
+        ("web search", ServerTool::WebSearch),
+        ("X search", ServerTool::XSearch),
+        ("code interpreter", ServerTool::CodeInterpreter),
+    ]
+}
+
+fn parse_server_tool(name: &str) -> Option<ServerTool> {
+    match name {
+        "web" | "web_search" | "web-search" => Some(ServerTool::WebSearch),
+        "x" | "x_search" | "x-search" => Some(ServerTool::XSearch),
+        "code" | "code_interpreter" | "code-interpreter" => Some(ServerTool::CodeInterpreter),
+        _ => None,
+    }
+}
+
+fn server_tool_name(tool: ServerTool) -> &'static str {
+    match tool {
+        ServerTool::WebSearch => "web search",
+        ServerTool::XSearch => "X search",
+        ServerTool::CodeInterpreter => "code interpreter",
+    }
+}
+
+fn composer_tail(value: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let normalized = value.replace('\n', " ↵ ").replace('\t', " ⇥ ");
+    if Line::from(normalized.as_str()).width() <= max_width {
+        return normalized;
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let mut reversed = Vec::new();
+    let mut width = 1usize;
+    for ch in normalized.chars().rev() {
+        let char_width = ch.width().unwrap_or(0);
+        if width.saturating_add(char_width) > max_width {
+            break;
+        }
+        reversed.push(ch);
+        width = width.saturating_add(char_width);
+    }
+    reversed.reverse();
+    format!("…{}", reversed.into_iter().collect::<String>())
+}
+
+#[allow(clippy::too_many_lines)]
 fn render_approval_modal(
     area: Rect,
     f: &mut ratatui::Frame,
     pending: &PendingApproval,
     detail: &ApprovalDetail,
 ) {
-    let modal = centered_rect(70, 40, area);
+    let modal = approval_sheet_rect(area);
+    let backdrop = Rect::new(area.x, modal.y, area.width, modal.height);
+    f.render_widget(Clear, backdrop);
+    f.render_widget(
+        Block::default().style(Style::default().bg(CANVAS).fg(TEXT)),
+        backdrop,
+    );
     f.render_widget(Clear, modal);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" approval required ")
-        .border_style(Style::default().fg(Color::Yellow));
-    let inner = block.inner(modal);
+        .border_type(BorderType::Rounded)
+        .title(Line::from(vec![
+            Span::styled(
+                " ▲ ",
+                Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "APPROVAL REQUIRED ",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .border_style(Style::default().fg(WARNING))
+        .style(Style::default().bg(SURFACE).fg(TEXT));
+    let inner = horizontal_inset(block.inner(modal), u16::from(modal.width >= 12));
     f.render_widget(block, modal);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
 
+    let reason_height = if inner.height >= 8 { 2 } else { 1 };
+    let metadata_height = u16::from(inner.height >= 5);
+    let controls_height = if inner.height >= 7 { 2 } else { 1 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(reason_height),
+            Constraint::Length(metadata_height),
             Constraint::Min(1),
-            Constraint::Length(2),
+            Constraint::Length(controls_height),
         ])
         .split(inner);
     let detail_rows = chunks[2].height.max(1);
@@ -1179,28 +2359,104 @@ fn render_approval_modal(
         .total
         .map_or_else(|| "?".to_string(), |total| total.to_string());
 
-    let reason = Paragraph::new(Line::from(Span::styled(
-        format!("approval — {}", safe_terminal_line(&pending.request.reason)),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
+    let reason = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("WHY  ", Style::default().fg(WARNING)),
+            Span::styled(
+                safe_terminal_line(&pending.request.reason),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "GrokForge paused before crossing a safety boundary.",
+            Style::default().fg(MUTED),
+        )),
+    ])
+    .wrap(Wrap { trim: true });
     f.render_widget(reason, chunks[0]);
 
-    let status = Paragraph::new(format!(
-        "detail page {}/{total} · bytes {}..{} / {}",
-        page.number, page.start, page.end, page.bytes
-    ))
-    .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(status, chunks[1]);
+    if chunks[1].height > 0 {
+        let status = Paragraph::new(Line::from(vec![
+            Span::styled("REQUEST  ", Style::default().fg(TOOL)),
+            Span::styled(
+                format!(
+                    "page {}/{total}  ·  bytes {}..{} / {}",
+                    page.number, page.start, page.end, page.bytes
+                ),
+                Style::default().fg(MUTED),
+            ),
+        ]));
+        f.render_widget(status, chunks[1]);
+    }
 
-    let body = Paragraph::new(page.body).wrap(Wrap { trim: false });
+    let body = Paragraph::new(page.body)
+        .style(Style::default().fg(TEXT).bg(SURFACE_RAISED))
+        .wrap(Wrap { trim: false });
     f.render_widget(body, chunks[2]);
 
-    let controls = Paragraph::new(vec![
-        Line::from("↑/↓ page · PgUp/PgDn ×10 · Home/End"),
-        Line::from("y approve · a approve for session · d/Esc deny"),
-    ])
-    .style(Style::default().fg(Color::Yellow));
+    let controls = if chunks[3].width >= 58 && chunks[3].height >= 2 {
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(" Esc ", Style::default().fg(TEXT).bg(DANGER)),
+                Span::styled(" deny   ", Style::default().fg(MUTED)),
+                Span::styled(" y ", Style::default().fg(CANVAS).bg(SUCCESS)),
+                Span::styled(" approve once   ", Style::default().fg(MUTED)),
+                Span::styled(" a ", Style::default().fg(CANVAS).bg(WARNING)),
+                Span::styled(" approve for session", Style::default().fg(MUTED)),
+            ]),
+            Line::from(vec![
+                Span::styled("↑↓", Style::default().fg(TEXT)),
+                Span::styled(" page   ", Style::default().fg(MUTED)),
+                Span::styled("PgUp/PgDn", Style::default().fg(TEXT)),
+                Span::styled(" ×10   ", Style::default().fg(MUTED)),
+                Span::styled("Home/End", Style::default().fg(TEXT)),
+                Span::styled(" jump   ·   Esc denies", Style::default().fg(MUTED)),
+            ]),
+        ])
+    } else if chunks[3].height >= 2 {
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Esc deny", Style::default().fg(DANGER)),
+                Span::styled("  ·  ", Style::default().fg(FAINT)),
+                Span::styled("y approve", Style::default().fg(SUCCESS)),
+            ]),
+            Line::from(vec![
+                Span::styled("a session", Style::default().fg(WARNING)),
+                Span::styled("  ·  ↑↓ page", Style::default().fg(MUTED)),
+            ]),
+        ])
+    } else {
+        Paragraph::new(Line::from(vec![
+            Span::styled("Esc deny", Style::default().fg(DANGER)),
+            Span::styled("  ·  ", Style::default().fg(FAINT)),
+            Span::styled("y yes", Style::default().fg(SUCCESS)),
+            Span::styled("  ·  ", Style::default().fg(FAINT)),
+            Span::styled("a all", Style::default().fg(WARNING)),
+        ]))
+    };
     f.render_widget(controls, chunks[3]);
+}
+
+fn approval_sheet_rect(area: Rect) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    let side_margin: u16 = if area.width >= 48 { 2 } else { 0 };
+    let width = area
+        .width
+        .saturating_sub(side_margin.saturating_mul(2))
+        .min(104);
+    let available_height = area.height.saturating_sub(u16::from(area.height > 2));
+    let target_height = area.height.saturating_mul(3) / 5;
+    let height = target_height.clamp(8.min(available_height), 28.min(available_height));
+    Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.bottom()
+            .saturating_sub(height)
+            .saturating_sub(u16::from(area.height > height)),
+        width,
+        height,
+    )
 }
 
 /// Returns an exclusive UTF-8 byte boundary for one viewport-sized page.
@@ -1291,25 +2547,6 @@ fn approval_char_width(ch: char) -> usize {
     }
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
-}
-
 fn safe_terminal_text(value: &str) -> String {
     value
         .chars()
@@ -1339,18 +2576,20 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use std::fmt::Write as _;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use grokforge_core::{Agent, Session, SessionConfig, ToolRegistry};
-    use grokforge_protocol::{Decision, EventMsg, ResponseItem};
+    use grokforge_protocol::{Decision, DenialClass, EventMsg, LedgerEntry, ResponseItem, Usage};
     use grokforge_sandbox::PassthroughRunner;
-    use grokforge_xai::XaiClient;
+    use grokforge_xai::{ServerTool, XaiClient};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
     use ratatui::text::Line;
     use tokio::sync::mpsc;
 
-    use super::{App, ApprovalDetail, Entry, MAX_COMPOSER_BYTES, TurnOutcome};
+    use super::{App, ApprovalDetail, DisplayMode, Entry, MAX_COMPOSER_BYTES, TurnOutcome};
     use crate::approver::ChannelApprover;
 
     fn test_app() -> App {
@@ -1358,6 +2597,10 @@ mod tests {
     }
 
     fn test_app_with_history(history: Vec<ResponseItem>) -> App {
+        test_app_in(PathBuf::from("/tmp"), history)
+    }
+
+    fn test_app_in(workspace: PathBuf, history: Vec<ResponseItem>) -> App {
         let client = XaiClient::new("http://127.0.0.1:1", "k").unwrap();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (approver, approvals_rx) = ChannelApprover::new();
@@ -1369,8 +2612,8 @@ mod tests {
             events_tx,
         ));
         let session =
-            Session::with_history(SessionConfig::new("/tmp".into(), "grok-build-0.1"), history);
-        App::new(
+            Session::with_history(SessionConfig::new(workspace, "grok-build-0.1"), history);
+        let mut app = App::new(
             agent,
             session,
             None,
@@ -1378,24 +2621,258 @@ mod tests {
             approvals_rx,
             "grok-build-0.1".to_string(),
             "auto".to_string(),
-        )
+        );
+        // Unit tests assert the default rich presentation independently of the process that runs
+        // them (CI commonly exports `TERM=dumb`). Fallback behavior has a dedicated test below.
+        app.display_mode = DisplayMode {
+            color: true,
+            ascii: false,
+        };
+        app
     }
 
     fn buffer_text(app: &App, w: u16, h: u16) -> String {
+        buffer_frame(app, w, h).replace('\n', "")
+    }
+
+    fn render_buffer(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| app.render(f)).unwrap();
-        let buf = terminal.backend().buffer().clone();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_frame(app: &App, w: u16, h: u16) -> String {
+        let buf = render_buffer(app, w, h);
         buf.content()
+            .chunks(usize::from(w))
+            .map(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn wrapped_body_continuations_keep_the_hanging_indent() {
+        let mut lines = Vec::new();
+        super::push_body(&mut lines, "abcdefghijklmnop", super::TEXT, 10);
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rendered, ["   abcdefg", "   hijklmn", "   op"]);
+        assert!(lines.iter().all(|line| line.width() <= 10));
+    }
+
+    #[test]
+    fn live_reasoning_reserves_only_its_visible_preview() {
+        let mut app = test_app();
+        app.transcript.push(Entry::Assistant(
+            "TRANSCRIPT-MARKER remains visible while Grok thinks".to_string(),
+        ));
+        app.reasoning = Some("r".repeat(super::MAX_ENTRY_BYTES));
+
+        let frame = buffer_frame(&app, 80, 24);
+        assert!(frame.contains("TRANSCRIPT-MARKER"), "{frame}");
+        assert!(frame.contains("THINKING"));
+    }
+
+    #[test]
+    fn welcome_does_not_claim_an_unverified_network_connection() {
+        let frame = buffer_frame(&test_app(), 80, 24);
+        assert!(frame.contains("GrokForge is ready"));
+        assert!(!frame.to_lowercase().contains("connected"));
+    }
+
+    #[test]
+    fn structural_border_meets_non_text_contrast_target() {
+        fn channel(value: u8) -> f64 {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(color: Color) -> f64 {
+            let Color::Rgb(red, green, blue) = color else {
+                panic!("expected RGB test color");
+            };
+            0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+        }
+        let lighter = luminance(super::BORDER);
+        let darker = luminance(super::SURFACE);
+        let ratio = (lighter + 0.05) / (darker + 0.05);
+        assert!(ratio >= 3.0, "border contrast was only {ratio:.2}:1");
+    }
+
+    #[test]
+    fn plain_display_mode_uses_ascii_and_resets_every_color() {
+        let mut app = test_app();
+        app.display_mode = DisplayMode {
+            color: false,
+            ascii: true,
+        };
+        let buffer = render_buffer(&app, 80, 24);
+        let frame = buffer
+            .content()
             .iter()
             .map(ratatui::buffer::Cell::symbol)
-            .collect()
+            .collect::<String>();
+        assert!(
+            frame.is_ascii(),
+            "plain frame contained non-ASCII UI: {frame}"
+        );
+        assert!(frame.contains("* READY TO FORGE"));
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset)
+        );
+    }
+
+    #[test]
+    fn wide_frames_preserve_the_visual_hierarchy() {
+        let mut app = test_app();
+        let welcome = buffer_frame(&app, 80, 24);
+        assert!(welcome.contains("◆ READY TO FORGE"));
+        assert!(welcome.contains("╭ PROMPT"));
+        assert_eq!(welcome.lines().count(), 24);
+
+        app.transcript.push(Entry::User(
+            "Fix the flaky retry test in net/backoff.rs".to_string(),
+        ));
+        app.transcript.push(Entry::Assistant(
+            "The flake comes from an unseeded RNG. I'll pin the seed and verify the suite."
+                .to_string(),
+        ));
+        app.transcript.push(Entry::Tool {
+            text: super::humanize_tool_call("edit", "{\"path\":\"net/backoff.rs\"}"),
+            sandboxed: Some(true),
+        });
+        app.transcript.push(Entry::ToolResult {
+            ok: true,
+            text: "updated net/backoff.rs (+9 -4)".to_string(),
+            denial: None,
+        });
+        app.transcript.push(Entry::Git(
+            "committed a1f3c92 fix(net): seed jitter RNG".to_string(),
+        ));
+        let chat = buffer_frame(&app, 80, 24);
+        assert!(chat.contains("› YOU"));
+        assert!(chat.contains("◆ GROK"));
+        assert!(chat.contains("⚙  edit  ● sandboxed  net/backoff.rs"));
+        assert!(!chat.contains("{\"path\""));
+
+        let (respond, _wait) = tokio::sync::oneshot::channel();
+        app.pending = Some(crate::approver::PendingApproval {
+            request: grokforge_protocol::ApprovalRequest {
+                id: grokforge_protocol::ApprovalId::new(),
+                call_id: None,
+                kind: grokforge_protocol::ApprovalKind::ExecCommand {
+                    command: vec!["cargo".into(), "test".into()],
+                    cwd: "/tmp".into(),
+                    sandbox: grokforge_protocol::SandboxMode::WorkspaceWrite,
+                    escalation_of: None,
+                },
+                reason: "run the project test suite".to_string(),
+            },
+            respond,
+        });
+        app.approval_detail = Some(ApprovalDetail::new(
+            "request: cargo test\ncwd: /tmp\nsandbox: workspace-write".to_string(),
+        ));
+        let approval = buffer_frame(&app, 80, 24);
+        assert!(approval.contains("▲ APPROVAL REQUIRED"));
+        assert!(approval.contains("GrokForge paused before crossing a safety boundary"));
+        assert!(
+            !approval.contains("╭ │"),
+            "composer border leaked into sheet"
+        );
+    }
+
+    #[test]
+    fn project_capabilities_are_discoverable_and_server_tools_are_explicit_opt_ins() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill = workspace.path().join(".grokforge/skills/review");
+        std::fs::create_dir_all(&skill).expect("skill directory");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\ndescription: Review changes carefully\n---\n# Review",
+        )
+        .expect("skill");
+        let commands = workspace.path().join(".grokforge/commands");
+        std::fs::create_dir_all(&commands).expect("commands directory");
+        std::fs::write(commands.join("review.md"), "Review the current diff.").expect("command");
+
+        let mut app = test_app_in(workspace.path().to_path_buf(), Vec::new());
+        assert_eq!(app.available_skills.len(), 1);
+        assert_eq!(app.project_commands.len(), 1);
+        app.handle_slash("help");
+        app.handle_slash("skills");
+        app.handle_slash("tools web on");
+        app.handle_slash("tools");
+
+        assert!(
+            app.session
+                .as_ref()
+                .expect("session")
+                .config
+                .enabled_server_tools
+                .contains(&ServerTool::WebSearch)
+        );
+        let frame = buffer_frame(&app, 120, 40);
+        assert!(frame.contains("project commands: /review"));
+        assert!(frame.contains("✦  SKILL  review"));
+        assert!(frame.contains("Review changes carefully"));
+        assert!(frame.contains("☁  xAI TOOL  web search  ● ON"));
+        assert!(frame.contains("metered"));
+    }
+
+    #[test]
+    fn common_tool_calls_are_humanized_without_leaking_payloads() {
+        assert_eq!(
+            super::humanize_tool_call("read_file", "{\"path\":\"src/lib.rs\"}"),
+            "read  src/lib.rs"
+        );
+        let write = super::humanize_tool_call(
+            "write_file",
+            "{\"path\":\"src/lib.rs\",\"content\":\"large private payload\"}",
+        );
+        assert_eq!(write, "write  src/lib.rs");
+        assert!(!write.contains("private payload"));
+        assert_eq!(
+            super::humanize_tool_call("list", "{\"path\":\"crates\"}"),
+            "list  crates"
+        );
+        assert_eq!(
+            super::humanize_tool_call("glob", "{\"pattern\":\"**/*.rs\"}"),
+            "glob  **/*.rs"
+        );
+        assert_eq!(
+            super::humanize_tool_call("grep", "{\"pattern\":\"TODO\",\"path\":\"src\"}"),
+            "search  /TODO/  in src"
+        );
+        assert_eq!(
+            super::humanize_tool_call("git_diff", "{\"staged\":true}"),
+            "git  diff · staged"
+        );
     }
 
     #[test]
     fn renders_without_panicking_and_shows_chrome() {
         let app = test_app();
         let text = buffer_text(&app, 80, 24);
-        assert!(text.contains("conversation"));
+        assert!(text.contains("GROKFORGE"));
+        assert!(text.contains("READY TO FORGE"));
         assert!(text.contains("grok-build-0.1"));
         assert!(text.contains("Ask Grok"));
     }
@@ -1409,6 +2886,60 @@ mod tests {
         let text = buffer_text(&app, 80, 24);
         assert!(text.contains("hello there"));
         assert!(text.contains("hi from grok"));
+    }
+
+    #[test]
+    fn protocol_activity_is_visible_in_transcript_and_status() {
+        let mut app = test_app();
+        app.running = true;
+        app.on_agent_event(EventMsg::ReasoningDelta {
+            delta: "Checking the retry path before editing.".to_string(),
+        });
+        assert!(buffer_text(&app, 100, 24).contains("THINKING"));
+
+        app.on_agent_event(EventMsg::ToolCallBegin {
+            call_id: grokforge_protocol::ToolCallId::new(),
+            name: "shell".to_string(),
+            args_preview: "{\"command\":\"cargo test retry\"}".to_string(),
+            sandboxed: true,
+        });
+        app.on_agent_event(EventMsg::ToolCallEnd {
+            call_id: grokforge_protocol::ToolCallId::new(),
+            ok: false,
+            summary: "network access denied".to_string(),
+            denial: Some(DenialClass::Network),
+        });
+        app.on_agent_event(EventMsg::TokenUsage {
+            usage: Usage {
+                input_tokens: 1_000,
+                cached_tokens: 500,
+                output_tokens: 200,
+                reasoning_tokens: 80,
+            },
+        });
+        app.on_agent_event(EventMsg::LedgerAppended(
+            LedgerEntry::new("src/retry.rs", 2_048, "tool read").with_redactions(1),
+        ));
+        app.on_agent_event(EventMsg::StreamRetrying {
+            attempt: 2,
+            reason: "upstream connection reset".to_string(),
+        });
+        app.on_agent_event(EventMsg::ApprovalResolved {
+            summary: "`shell`".to_string(),
+            decision: "Deny".to_string(),
+            auto: false,
+        });
+
+        let frame = buffer_frame(&app, 168, 40);
+        assert!(frame.contains("◇  THINKING"));
+        assert!(frame.contains("⚙  shell  ● sandboxed  $ cargo test retry"));
+        assert!(frame.contains("BLOCKED network"));
+        assert!(frame.contains("↻  RETRY  attempt 2"));
+        assert!(frame.contains("×  APPROVAL  Deny"));
+        assert!(frame.contains("tok 1.2k · cache 50%"));
+        assert!(frame.contains("↑1/2KB/1r"));
+        assert!(frame.contains("secret(s) redacted"));
+        assert!(!frame.contains("{\"command\""));
     }
 
     #[test]
@@ -1433,8 +2964,34 @@ mod tests {
             "reason: write a file\nrequest: WriteFile { path: /tmp/x }".to_string(),
         ));
         let text = buffer_text(&app, 80, 24);
-        assert!(text.contains("approval required"));
+        assert!(text.contains("APPROVAL REQUIRED"));
         assert!(text.contains("approve"));
+    }
+
+    #[test]
+    fn narrow_approval_always_keeps_the_safe_deny_action_visible() {
+        use grokforge_protocol::{ApprovalId, ApprovalKind, ApprovalRequest};
+        use tokio::sync::oneshot;
+
+        for width in [12, 20, 30] {
+            let mut app = test_app();
+            let (respond, _wait) = oneshot::channel();
+            app.pending = Some(crate::approver::PendingApproval {
+                request: ApprovalRequest {
+                    id: ApprovalId::new(),
+                    call_id: None,
+                    kind: ApprovalKind::WriteFile {
+                        path: "/tmp/x".into(),
+                    },
+                    reason: "write a file".to_string(),
+                },
+                respond,
+            });
+            app.approval_detail = Some(ApprovalDetail::new("request: write /tmp/x".to_string()));
+            let frame = buffer_frame(&app, width, 8);
+            assert!(frame.contains("Esc deny"), "{width}-column frame:\n{frame}");
+            assert_eq!(frame.lines().count(), 8);
+        }
     }
 
     #[test]
@@ -1516,7 +3073,7 @@ mod tests {
         assert!(text.contains("prior question"));
         assert!(text.contains("prior answer"));
         assert!(text.contains("raw assistant"));
-        assert!(text.contains("read_file"));
+        assert!(text.contains("read"));
     }
 
     #[test]

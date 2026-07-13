@@ -46,7 +46,7 @@ pub async fn run_api(prompt: &str, model: &str) -> std::process::ExitCode {
     session
         .history
         .push(ResponseItem::user_redacted(prompt.text, prompt.count));
-    let assembled = match grokforge_core::context::assemble(&session, &[], Vec::new()) {
+    let assembled = match grokforge_core::context::assemble(&session, &[], &[], Vec::new()) {
         Ok(assembled) => assembled,
         Err(error) => {
             eprintln!(

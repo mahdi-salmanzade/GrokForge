@@ -6,7 +6,7 @@ use grokforge_core::SessionConfig;
 use grokforge_protocol::{ApprovalPolicy, SandboxMode};
 use grokforge_xai::XaiClient;
 
-pub async fn launch() -> ExitCode {
+pub async fn launch(trust_project_mcp: bool) -> ExitCode {
     let workspace = match canonical_workspace() {
         Ok(workspace) => workspace,
         Err(error) => {
@@ -36,7 +36,7 @@ pub async fn launch() -> ExitCode {
         // Default `auto` preset: workspace-write, ask before exceeding the sandbox.
         .with_policy(ApprovalPolicy::OnRequest, SandboxMode::WorkspaceWrite);
 
-    match grokforge_tui::run(client, config, "auto".to_string()).await {
+    match grokforge_tui::run(client, config, "auto".to_string(), trust_project_mcp).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("tui error: {e}");

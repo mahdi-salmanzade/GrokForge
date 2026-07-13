@@ -12,7 +12,7 @@ use grokforge_protocol::{
     ResponseItem, SandboxMode, SandboxPolicy, StopReason, ToolCallId, TurnId, Usage,
 };
 use grokforge_sandbox::SandboxRunner;
-use grokforge_xai::{StreamEvent, XaiClient};
+use grokforge_xai::{ServerTool, StreamEvent, ToolDef, XaiClient};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agents_md;
@@ -22,8 +22,9 @@ use crate::compaction;
 use crate::context::{self, Assembled};
 use crate::redaction::Redactor;
 use crate::session::Session;
+use crate::skills;
 use crate::store::RolloutWriter;
-use crate::tools::{ToolInvocation, ToolOutput, ToolRegistry, TurnContext};
+use crate::tools::{MAX_TOOLS, ToolInvocation, ToolOutput, ToolRegistry, TurnContext};
 
 const MAX_SUBAGENTS_PER_TURN: usize = 8;
 /// Bound both retained transcript text and the amount of delta state a frontend may queue for a
@@ -45,6 +46,45 @@ const MAX_COMPACTION_TAIL_BYTES: usize = 7 * 1024 * 1024;
 // Rollout records are capped at 16 MiB; reserve a full MiB for serialization/newline overhead.
 const MAX_COMPACTION_CHECKPOINT_BYTES: usize = 15 * 1024 * 1024;
 const MAX_COMPACTION_TAIL_CANDIDATES: usize = 1_024;
+
+/// Add the explicitly enabled provider-executed tools while preserving the API's combined tool
+/// limit. Client definitions are already sorted with built-ins first, so any required truncation
+/// drops only the tail of the optional/MCP surface in practical registries.
+fn append_server_tools(tool_defs: &mut Vec<ToolDef>, enabled_server_tools: &BTreeSet<ServerTool>) {
+    let client_budget = MAX_TOOLS.saturating_sub(enabled_server_tools.len());
+    tool_defs.truncate(client_budget);
+    tool_defs.extend(
+        enabled_server_tools
+            .iter()
+            .copied()
+            .map(ServerTool::definition),
+    );
+}
+
+fn advertised_tool_defs(
+    registry: &ToolRegistry,
+    plan: bool,
+    allow_subagents: bool,
+    enabled_server_tools: &BTreeSet<ServerTool>,
+) -> Vec<ToolDef> {
+    let mut tool_defs = if plan {
+        registry.readonly_tool_defs()
+    } else {
+        registry.tool_defs()
+    };
+    // Subagents (and plan mode) do not offer the subagent-spawning tool.
+    if !allow_subagents || plan {
+        tool_defs.retain(|definition| {
+            definition.function_name() != Some(crate::tools::builtins::SPAWN_TASK)
+        });
+    }
+    // Server tools are separately metered and stay off unless session configuration opted in.
+    // Plan mode deliberately remains local/read-only and never advertises provider tools.
+    if !plan {
+        append_server_tools(&mut tool_defs, enabled_server_tools);
+    }
+    tool_defs
+}
 
 #[derive(Debug)]
 struct ConsumedResponse {
@@ -399,15 +439,12 @@ impl Agent {
         }
 
         // Plan mode enforces read-only tools and a read-only sandbox regardless of preset.
-        let mut tool_defs = if plan {
-            self.registry.readonly_tool_defs()
-        } else {
-            self.registry.tool_defs()
-        };
-        // Subagents (and plan mode) do not offer the subagent-spawning tool.
-        if !self.allow_subagents || plan {
-            tool_defs.retain(|d| d.function_name() != Some(crate::tools::builtins::SPAWN_TASK));
-        }
+        let tool_defs = advertised_tool_defs(
+            &self.registry,
+            plan,
+            self.allow_subagents,
+            &session.config.enabled_server_tools,
+        );
         let offered_tools: BTreeSet<String> = tool_defs
             .iter()
             .filter_map(|definition| definition.function_name().map(str::to_string))
@@ -432,6 +469,7 @@ impl Agent {
             }
         };
         let agents = agents_md::discover(&session.config.workspace_root);
+        let skills = skills::discover(&session.config.workspace_root);
 
         let mut iteration = 0u32;
         let mut spawned = 0usize;
@@ -480,7 +518,7 @@ impl Agent {
 
             let Assembled {
                 request, ledger, ..
-            } = match context::assemble(session, &agents, tool_defs.clone()) {
+            } = match context::assemble(session, &agents, &skills, tool_defs.clone()) {
                 Ok(a) => a,
                 Err(e) => {
                     self.emit(EventMsg::Error {
@@ -1198,6 +1236,9 @@ impl Agent {
                         SandboxMode::WorkspaceWrite,
                     );
             sub_config.effort = session.config.effort;
+            sub_config
+                .enabled_server_tools
+                .clone_from(&session.config.enabled_server_tools);
             sub_config
                 .system_prompt
                 .clone_from(&session.config.system_prompt);
@@ -2448,6 +2489,68 @@ fn summarize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_tools_are_appended_without_exceeding_the_request_cap() {
+        let mut definitions = (0..MAX_TOOLS)
+            .map(|index| {
+                ToolDef::function(
+                    format!("client_{index}"),
+                    "test",
+                    serde_json::json!({"type":"object"}),
+                )
+            })
+            .collect::<Vec<_>>();
+        let enabled = BTreeSet::from([
+            ServerTool::WebSearch,
+            ServerTool::XSearch,
+            ServerTool::CodeInterpreter,
+        ]);
+
+        append_server_tools(&mut definitions, &enabled);
+
+        assert_eq!(definitions.len(), MAX_TOOLS);
+        assert_eq!(
+            definitions
+                .iter()
+                .filter_map(ToolDef::function_name)
+                .count(),
+            MAX_TOOLS - enabled.len()
+        );
+        let wire = serde_json::to_value(&definitions).expect("serialize definitions");
+        assert_eq!(wire[MAX_TOOLS - 3]["type"], "web_search");
+        assert_eq!(wire[MAX_TOOLS - 2]["type"], "x_search");
+        assert_eq!(wire[MAX_TOOLS - 1]["type"], "code_interpreter");
+    }
+
+    #[test]
+    fn plan_mode_never_advertises_server_or_mutating_tools() {
+        let registry = ToolRegistry::with_builtins();
+        let enabled = BTreeSet::from([
+            ServerTool::WebSearch,
+            ServerTool::XSearch,
+            ServerTool::CodeInterpreter,
+        ]);
+
+        let definitions = advertised_tool_defs(&registry, true, true, &enabled);
+        let wire = serde_json::to_value(&definitions).expect("serialize definitions");
+        let kinds = wire
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .filter_map(|definition| definition.get("type"))
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(kinds.iter().all(|kind| *kind == "function"));
+        let names = definitions
+            .iter()
+            .filter_map(ToolDef::function_name)
+            .collect::<BTreeSet<_>>();
+        assert!(!names.contains("write_file"));
+        assert!(!names.contains("edit"));
+        assert!(!names.contains("shell"));
+        assert!(!names.contains(crate::tools::builtins::SPAWN_TASK));
+    }
 
     #[derive(Debug)]
     struct EnforcedRunner;

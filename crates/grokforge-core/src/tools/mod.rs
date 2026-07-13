@@ -286,6 +286,8 @@ mod tests {
             "list",
             "glob",
             "grep",
+            "git_status",
+            "git_diff",
             builtins::SPAWN_TASK,
         ] {
             assert!(names.contains(&builtin), "missing built-in {builtin}");

@@ -8,6 +8,7 @@ use grokforge_xai::{ContentPart, InputItem, ResponsesRequest, Role, XaiClient, X
 use crate::agents_md::AgentsDoc;
 use crate::redaction::Redactor;
 use crate::session::Session;
+use crate::skills::SkillDoc;
 
 /// A request plus its reconciled ledger.
 #[derive(Debug)]
@@ -24,6 +25,7 @@ pub struct Assembled {
 pub fn assemble(
     session: &Session,
     agents_md: &[AgentsDoc],
+    skills: &[SkillDoc],
     tool_defs: Vec<grokforge_xai::ToolDef>,
 ) -> Result<Assembled, XaiError> {
     let mut input: Vec<InputItem> = Vec::new();
@@ -57,6 +59,39 @@ pub fn assemble(
                 "auto-context",
             )
             .with_redactions(red.count.saturating_add(display_path.count)),
+        );
+        input.push(InputItem::text(Role::Developer, block));
+    }
+
+    // Advertise a compact skill catalog. Full SKILL.md bodies remain local until the model
+    // chooses a relevant workflow and reads it through the ordinary ledgered file tool.
+    for skill in skills {
+        let red = Redactor::apply(&skill.description);
+        let red_name = Redactor::apply(&skill.name);
+        let relative = skill
+            .path
+            .strip_prefix(&session.config.workspace_root)
+            .unwrap_or_else(|_| std::path::Path::new(".grokforge/skills/SKILL.md"));
+        let display_path = Redactor::apply(&relative.to_string_lossy());
+        let path_json = serde_json::to_string(&display_path.text)
+            .unwrap_or_else(|_| "\"<invalid path>\"".to_string());
+        let name_json = serde_json::to_string(&red_name.text)
+            .unwrap_or_else(|_| "\"<invalid name>\"".to_string());
+        let block = format!(
+            "<available_skill name={name_json}>\nPath: {path_json}\nDescription: {}\nRead this SKILL.md with read_file before applying it.\n</available_skill>",
+            red.text
+        );
+        ledger.push(
+            LedgerEntry::new(
+                format!("skill:{}", safe_label(&red_name.text)),
+                block.len(),
+                "auto-context",
+            )
+            .with_redactions(
+                red.count
+                    .saturating_add(red_name.count)
+                    .saturating_add(display_path.count),
+            ),
         );
         input.push(InputItem::text(Role::Developer, block));
     }
@@ -274,7 +309,7 @@ mod tests {
     fn ledger_reconciles_with_serialized_body() {
         let mut session = Session::new(SessionConfig::new(PathBuf::from("/tmp"), "grok-build-0.1"));
         session.history.push(ResponseItem::user("hello world"));
-        let assembled = assemble(&session, &[], vec![]).unwrap();
+        let assembled = assemble(&session, &[], &[], vec![]).unwrap();
         assert_eq!(assembled.ledger.total_bytes(), assembled.body_len);
     }
 
@@ -286,7 +321,7 @@ mod tests {
             path: workspace.join("AGENTS.md"),
             content: "deploy key: xai-ABCDEF0123456789ZZZ".to_string(),
         }];
-        let assembled = assemble(&session, &docs, vec![]).unwrap();
+        let assembled = assemble(&session, &docs, &[], vec![]).unwrap();
         let (body, _) = XaiClient::serialize_request(&assembled.request).unwrap();
         let body = String::from_utf8_lossy(&body);
         assert!(!body.contains("xai-ABCDEF0123456789ZZZ"));
@@ -304,11 +339,39 @@ mod tests {
     }
 
     #[test]
+    fn skill_is_redacted_ledgered_and_uses_a_relative_path() {
+        let workspace = PathBuf::from("/home/private-user/project");
+        let session = Session::new(SessionConfig::new(workspace.clone(), "m"));
+        let skills = vec![SkillDoc {
+            name: "release".to_string(),
+            path: workspace.join(".grokforge/skills/release/SKILL.md"),
+            description: "publish with xai-ABCDEF0123456789ZZZ".to_string(),
+        }];
+
+        let assembled = assemble(&session, &[], &skills, vec![]).unwrap();
+        let (body, _) = XaiClient::serialize_request(&assembled.request).unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("<available_skill name=\\\"release\\\">"));
+        assert!(body.contains(".grokforge/skills/release/SKILL.md"));
+        assert!(body.contains("Read this SKILL.md with read_file"));
+        assert!(!body.contains("xai-ABCDEF0123456789ZZZ"));
+        assert!(!body.contains("/home/private-user/project"));
+        assert!(
+            assembled
+                .ledger
+                .entries
+                .iter()
+                .any(|entry| { entry.source == "skill:release" && entry.redactions == 1 })
+        );
+        assert_eq!(assembled.ledger.total_bytes(), assembled.body_len);
+    }
+
+    #[test]
     fn system_prompt_is_redacted_and_session_cache_key_is_stable() {
         let mut config = SessionConfig::new(PathBuf::from("/tmp"), "m");
         config.system_prompt = "PASSWORD=very-secret-password-value".to_string();
         let session = Session::new(config);
-        let assembled = assemble(&session, &[], vec![]).unwrap();
+        let assembled = assemble(&session, &[], &[], vec![]).unwrap();
         let (body, _) = XaiClient::serialize_request(&assembled.request).unwrap();
         let body = String::from_utf8_lossy(&body);
         assert!(!body.contains("very-secret-password-value"));
@@ -341,7 +404,7 @@ mod tests {
             text: "prior summary".into(),
             redactions: 5,
         });
-        let assembled = assemble(&session, &[], vec![]).unwrap();
+        let assembled = assemble(&session, &[], &[], vec![]).unwrap();
         assert!(assembled.ledger.entries.iter().any(|entry| {
             entry.source == "tool_result:read_file:src/private.rs"
                 && entry.bytes == 8
@@ -367,7 +430,7 @@ mod tests {
             .history
             .push(ResponseItem::assistant("x".repeat(33 * 1024 * 1024)));
         assert!(matches!(
-            assemble(&session, &[], vec![]),
+            assemble(&session, &[], &[], vec![]),
             Err(XaiError::RequestTooLarge { .. })
         ));
     }

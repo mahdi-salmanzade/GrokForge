@@ -31,6 +31,9 @@ struct ServerSpec {
 const MAX_MCP_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_PROJECT_MCP_SERVERS: usize = 16;
 
+/// Displayed by frontends immediately before starting explicitly trusted project MCP servers.
+pub const PROJECT_MCP_TRUST_WARNING: &str = "warning: --trust-project-mcp allows .grokforge/mcp.json to execute local commands outside GrokForge's sandbox; only enable it for projects you trust";
+
 /// Project MCP configuration is executable code. This default entry point deliberately refuses
 /// to spawn it; a frontend must obtain explicit user trust and then call
 /// [`connect_and_register_trusted`].
@@ -112,6 +115,29 @@ mod tests {
 
     use super::*;
 
+    const MOCK_SERVER: &str = r#"
+import pathlib, sys, json
+pathlib.Path("trusted-mcp-started").touch()
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    message = json.loads(line)
+    request_id = message.get("id")
+    method = message.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":request_id,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}})
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":request_id,"result":{"tools":[{"name":"echo","description":"echo","inputSchema":{"type":"object"}}]}})
+"#;
+
+    fn python_available() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
     #[tokio::test]
     async fn untrusted_project_config_is_not_executed() {
         let workspace = tempfile::tempdir().unwrap();
@@ -138,6 +164,37 @@ mod tests {
                 .is_empty()
         );
         assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn explicitly_trusted_project_config_is_started_and_registered() {
+        if !python_available() {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = workspace.path().join(".grokforge");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("mcp.json"),
+            serde_json::json!({
+                "servers": {
+                    "trusted": {
+                        "command": "python3",
+                        "args": ["-c", MOCK_SERVER]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut registry = ToolRegistry::with_builtins();
+        let connected = connect_and_register_trusted(workspace.path(), &mut registry).await;
+
+        assert_eq!(connected, ["trusted"]);
+        assert!(workspace.path().join("trusted-mcp-started").exists());
+        assert!(registry.get("mcp__trusted__echo").is_some());
     }
 
     #[tokio::test]

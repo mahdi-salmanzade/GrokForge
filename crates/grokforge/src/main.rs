@@ -24,6 +24,10 @@ struct Cli {
     /// Headless: run a single prompt without the TUI (alias for `exec -p`).
     #[arg(short = 'p', long = "prompt", global = true)]
     prompt: Option<String>,
+
+    /// Trust `.grokforge/mcp.json` to execute local MCP server commands.
+    #[arg(long, global = true)]
+    trust_project_mcp: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -54,6 +58,15 @@ enum Command {
         /// Plan mode: read-only tools + sandbox, produce a plan without changing anything.
         #[arg(long)]
         plan: bool,
+        /// Enable xAI's separately metered web search server tool.
+        #[arg(long)]
+        web_search: bool,
+        /// Enable xAI's separately metered live X search server tool.
+        #[arg(long)]
+        x_search: bool,
+        /// Enable xAI's separately metered code interpreter server tool.
+        #[arg(long)]
+        code_interpreter: bool,
         /// Maximum tool-call iterations within the turn.
         #[arg(long, default_value_t = 32, value_parser = positive_u32)]
         max_iterations: u32,
@@ -214,11 +227,15 @@ async fn main() -> std::process::ExitCode {
                 allow: Vec::new(),
                 effort: None,
                 plan: false,
+                web_search: false,
+                x_search: false,
+                code_interpreter: false,
                 max_iterations: 32,
+                trust_project_mcp: cli.trust_project_mcp,
             })
             .await
         }
-        None => tui::launch().await,
+        None => tui::launch(cli.trust_project_mcp).await,
         Some(Command::Exec {
             prompt,
             preset,
@@ -228,6 +245,9 @@ async fn main() -> std::process::ExitCode {
             allow,
             effort,
             plan,
+            web_search,
+            x_search,
+            code_interpreter,
             max_iterations,
         }) => {
             let Some(prompt) = prompt.or(cli.prompt) else {
@@ -243,12 +263,16 @@ async fn main() -> std::process::ExitCode {
                 allow,
                 effort,
                 plan,
+                web_search,
+                x_search,
+                code_interpreter,
                 max_iterations,
+                trust_project_mcp: cli.trust_project_mcp,
             })
             .await
         }
         Some(Command::Doctor) => doctor::run(),
-        Some(Command::Resume { id }) => sessions::resume(id).await,
+        Some(Command::Resume { id }) => sessions::resume(id, cli.trust_project_mcp).await,
         Some(Command::Sessions) => sessions::list().await,
         Some(Command::Login { subscription }) => {
             if subscription {
@@ -292,6 +316,62 @@ mod tests {
             Cli::try_parse_from(["grokforge", "exec", "-p", "task", "--effort", "extreme"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn headless_server_tool_flags_are_explicit_opt_ins() {
+        let defaults = Cli::try_parse_from(["grokforge", "exec", "-p", "task"])
+            .expect("default exec arguments");
+        assert!(matches!(
+            defaults.command,
+            Some(Command::Exec {
+                web_search: false,
+                x_search: false,
+                code_interpreter: false,
+                ..
+            })
+        ));
+
+        let enabled = Cli::try_parse_from([
+            "grokforge",
+            "exec",
+            "-p",
+            "task",
+            "--web-search",
+            "--x-search",
+            "--code-interpreter",
+        ])
+        .expect("server-tool flags");
+        assert!(matches!(
+            enabled.command,
+            Some(Command::Exec {
+                web_search: true,
+                x_search: true,
+                code_interpreter: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn project_mcp_trust_is_an_explicit_opt_in_for_every_startup_form() {
+        let interactive = Cli::try_parse_from(["grokforge"]).expect("interactive defaults");
+        assert!(!interactive.trust_project_mcp);
+
+        let exec = Cli::try_parse_from(["grokforge", "exec", "-p", "task"]).expect("exec defaults");
+        assert!(!exec.trust_project_mcp);
+
+        let resume = Cli::try_parse_from(["grokforge", "resume"]).expect("resume defaults");
+        assert!(!resume.trust_project_mcp);
+
+        for args in [
+            vec!["grokforge", "--trust-project-mcp"],
+            vec!["grokforge", "exec", "-p", "task", "--trust-project-mcp"],
+            vec!["grokforge", "resume", "--trust-project-mcp"],
+        ] {
+            let parsed = Cli::try_parse_from(args).expect("trusted startup form");
+            assert!(parsed.trust_project_mcp);
+        }
     }
 
     #[test]

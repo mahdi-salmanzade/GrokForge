@@ -146,17 +146,22 @@ pub async fn login() -> Result<OAuthTokens, OAuthError> {
     open_browser(authorize.as_str());
 
     // Wait for the redirect (with a generous timeout).
-    let (code, got_state) =
-        tokio::time::timeout(Duration::from_secs(300), accept_callback(listener))
+    let mut callback =
+        tokio::time::timeout(Duration::from_secs(300), accept_callback(listener, &state))
             .await
             .map_err(|_| OAuthError::Timeout)??;
-    if got_state != state {
-        return Err(OAuthError::Denied(
-            "state mismatch (possible CSRF)".to_string(),
-        ));
-    }
 
-    exchange_code(&code, &redirect_uri, &pkce.verifier).await
+    // Only claim that GrokForge is signed in after the authorization code has actually become a
+    // usable token. Keep the browser connection open for this short exchange so a rejected code
+    // cannot produce a false-success page.
+    let tokens = exchange_code(&callback.code, &redirect_uri, &pkce.verifier).await;
+    let page = if tokens.is_ok() {
+        CallbackPage::Success
+    } else {
+        CallbackPage::Denied
+    };
+    write_callback_response(&mut callback.socket, page).await;
+    tokens
 }
 
 /// Exchange a refresh token for a fresh access token.
@@ -210,13 +215,15 @@ async fn parse_token_response(resp: reqwest::Response) -> Result<OAuthTokens, OA
     Ok(tokens_from(parsed))
 }
 
-/// Wait for the loopback redirect carrying `code` + `state`. Browsers (Safari especially) open
-/// speculative/preconnect and favicon connections that arrive *before* the real redirect and
-/// carry no `code`; we must answer and ignore those, and keep accepting until the real one
-/// arrives — otherwise the listener closes and the redirect hits a dead port.
+/// Wait for the loopback redirect carrying `code` + `state`. The success page is only shown when
+/// both values are present and the state matches. Browsers (Safari especially) open speculative
+/// or favicon connections that arrive *before* the real redirect and carry no `code`; we must
+/// answer and ignore those, and keep accepting until the real one arrives — otherwise the
+/// listener closes and the redirect hits a dead port.
 async fn accept_callback(
     listener: tokio::net::TcpListener,
-) -> Result<(String, String), OAuthError> {
+    expected_state: &str,
+) -> Result<AuthorizedCallback, OAuthError> {
     loop {
         let (mut sock, _) = listener.accept().await?;
         let request = read_request_head(&mut sock).await;
@@ -229,33 +236,167 @@ async fn accept_callback(
         let (code, state, error) =
             parse_callback_query(target.split_once('?').map_or("", |(_, q)| q));
 
-        let done = code.is_some() || error.is_some();
-        let heading = if error.is_some() {
-            "Sign-in was cancelled. You can close this tab."
-        } else if done {
-            "GrokForge is signed in. You can close this tab and return to the terminal."
-        } else {
-            "Waiting for GrokForge sign-in…"
-        };
-        let body = format!(
-            "<html><body style=\"font-family:sans-serif\"><h3>{heading}</h3></body></html>"
+        let page = callback_status_page(
+            code.as_deref(),
+            state.as_deref(),
+            error.as_deref(),
+            expected_state,
         );
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = sock.write_all(response.as_bytes()).await;
-        let _ = sock.shutdown().await;
 
+        // A browser or local process can connect to this loopback port. Only a callback carrying
+        // our unguessable OAuth state is terminal; unrelated errors/codes are answered but ignored
+        // so they cannot race and cancel the real sign-in flow.
+        if state.as_deref() != Some(expected_state) {
+            write_callback_response(&mut sock, page).await;
+            continue;
+        }
         if let Some(err) = error {
+            write_callback_response(&mut sock, CallbackPage::Denied).await;
             return Err(OAuthError::Denied(err));
         }
-        if let (Some(c), Some(s)) = (code, state) {
-            return Ok((c, s));
+        if let Some(c) = code {
+            return Ok(AuthorizedCallback {
+                code: c,
+                socket: sock,
+            });
         }
+        write_callback_response(&mut sock, page).await;
         // Non-callback connection (preconnect / favicon / no code) — keep waiting.
     }
 }
+
+struct AuthorizedCallback {
+    code: String,
+    socket: tokio::net::TcpStream,
+}
+
+async fn write_callback_response(socket: &mut tokio::net::TcpStream, page: CallbackPage) {
+    let response = callback_http_response(page);
+    let _ = socket.write_all(response.as_bytes()).await;
+    let _ = socket.shutdown().await;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CallbackPage {
+    Success,
+    Denied,
+    Waiting,
+}
+
+fn callback_status_page(
+    code: Option<&str>,
+    state: Option<&str>,
+    error: Option<&str>,
+    expected_state: &str,
+) -> CallbackPage {
+    if state != Some(expected_state) {
+        CallbackPage::Waiting
+    } else if error.is_some() {
+        CallbackPage::Denied
+    } else if code.is_some() {
+        CallbackPage::Success
+    } else {
+        CallbackPage::Waiting
+    }
+}
+
+impl CallbackPage {
+    fn copy(
+        self,
+    ) -> (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    ) {
+        match self {
+            Self::Success => (
+                "success",
+                "Signed in",
+                "Authentication complete",
+                "You're all set.",
+                "GrokForge is signed in and ready to build. You can close this tab and return to your terminal.",
+            ),
+            Self::Denied => (
+                "denied",
+                "Sign-in stopped",
+                "Authentication stopped",
+                "No changes made.",
+                "Sign-in was cancelled or could not be completed. Return to your terminal to try again whenever you're ready.",
+            ),
+            Self::Waiting => (
+                "waiting",
+                "Waiting for sign-in",
+                "Authorization pending",
+                "Almost there.",
+                "Complete sign-in in the xAI window. GrokForge is still waiting in your terminal.",
+            ),
+        }
+    }
+
+    fn terminal_line(self) -> &'static str {
+        match self {
+            Self::Success => "identity connected",
+            Self::Denied => "sign-in cancelled",
+            Self::Waiting => "awaiting authorization",
+        }
+    }
+
+    fn terminal_icon(self) -> &'static str {
+        match self {
+            Self::Success => "✓",
+            Self::Denied => "×",
+            Self::Waiting => "·",
+        }
+    }
+
+    fn terminal_state(self) -> &'static str {
+        match self {
+            Self::Success => "ready",
+            Self::Denied => "no changes made",
+            Self::Waiting => "listening on localhost",
+        }
+    }
+}
+
+fn callback_http_response(page: CallbackPage) -> String {
+    let body = callback_page(page);
+    format!(
+        concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n",
+            "Content-Length: {}\r\n",
+            "Cache-Control: no-store, max-age=0\r\n",
+            "Pragma: no-cache\r\n",
+            "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; ",
+            "img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n",
+            "Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n",
+            "Referrer-Policy: no-referrer\r\n",
+            "X-Content-Type-Options: nosniff\r\n",
+            "X-Frame-Options: DENY\r\n",
+            "Connection: close\r\n\r\n",
+            "{}"
+        ),
+        body.len(),
+        body
+    )
+}
+
+fn callback_page(page: CallbackPage) -> String {
+    let (state, title, eyebrow, heading, message) = page.copy();
+    CALLBACK_PAGE_TEMPLATE
+        .replace("__STATE__", state)
+        .replace("__TITLE__", title)
+        .replace("__EYEBROW__", eyebrow)
+        .replace("__HEADING__", heading)
+        .replace("__MESSAGE__", message)
+        .replace("__TERMINAL_ICON__", page.terminal_icon())
+        .replace("__TERMINAL_LINE__", page.terminal_line())
+        .replace("__TERMINAL_STATE__", page.terminal_state())
+}
+
+const CALLBACK_PAGE_TEMPLATE: &str = include_str!("oauth_callback.html");
 
 /// Read an HTTP request head (up to the blank line), tolerating idle/speculative connections
 /// via a short per-connection read timeout so a silent preconnect can't stall the flow.
@@ -369,5 +510,143 @@ mod tests {
 
         let (_, _, error) = parse_callback_query("error=access_denied");
         assert_eq!(error.as_deref(), Some("access_denied"));
+    }
+
+    #[test]
+    fn callback_pages_are_branded_and_state_specific() {
+        let success = callback_page(CallbackPage::Success);
+        assert!(success.starts_with("<!doctype html>"));
+        assert!(success.contains("data-state=\"success\""));
+        assert!(success.contains("GrokForge is signed in and ready to build"));
+        assert!(success.contains("identity connected"));
+        assert!(success.contains("fill=\"#ff5a1f\""));
+        assert!(success.contains("prefers-reduced-motion"));
+
+        let denied = callback_page(CallbackPage::Denied);
+        assert!(denied.contains("data-state=\"denied\""));
+        assert!(denied.contains("Sign-in was cancelled"));
+        assert!(denied.contains("no changes made"));
+
+        let waiting = callback_page(CallbackPage::Waiting);
+        assert!(waiting.contains("data-state=\"waiting\""));
+        assert!(waiting.contains("Complete sign-in in the xAI window"));
+        assert!(waiting.contains("listening on localhost"));
+
+        for page in [success, denied, waiting] {
+            assert!(
+                !page.contains("__"),
+                "callback page contains an unreplaced template sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_only_claims_success_for_matching_state() {
+        assert_eq!(
+            callback_status_page(Some("code"), Some("expected"), None, "expected"),
+            CallbackPage::Success
+        );
+        assert_eq!(
+            callback_status_page(Some("code"), Some("attacker"), None, "expected"),
+            CallbackPage::Waiting
+        );
+        assert_eq!(
+            callback_status_page(None, None, None, "expected"),
+            CallbackPage::Waiting
+        );
+        assert_eq!(
+            callback_status_page(None, None, Some("access_denied"), "expected"),
+            CallbackPage::Waiting
+        );
+        assert_eq!(
+            callback_status_page(None, Some("expected"), Some("access_denied"), "expected"),
+            CallbackPage::Denied
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_ignores_forged_state_and_defers_success_until_token_exchange() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind callback listener");
+        let address = listener.local_addr().expect("callback address");
+        let callback = tokio::spawn(async move { accept_callback(listener, "expected").await });
+
+        let mut forged = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect forged callback");
+        forged
+            .write_all(
+                b"GET /callback?error=access_denied&state=attacker HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .expect("write forged callback");
+        let mut forged_response = String::new();
+        forged
+            .read_to_string(&mut forged_response)
+            .await
+            .expect("read forged response");
+        assert!(forged_response.contains("data-state=\"waiting\""));
+        assert!(!callback.is_finished());
+
+        let mut browser = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect real callback");
+        browser
+            .write_all(
+                b"GET /callback?code=real-code&state=expected HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .expect("write real callback");
+        let mut authorized = callback
+            .await
+            .expect("callback task")
+            .expect("authorized callback");
+        assert_eq!(authorized.code, "real-code");
+
+        let mut first_byte = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), browser.read(&mut first_byte))
+                .await
+                .is_err(),
+            "success must wait until the caller completes token exchange"
+        );
+
+        write_callback_response(&mut authorized.socket, CallbackPage::Success).await;
+        let mut response = String::new();
+        browser
+            .read_to_string(&mut response)
+            .await
+            .expect("read success response");
+        assert!(response.contains("data-state=\"success\""));
+    }
+
+    #[test]
+    fn callback_page_is_self_contained_and_hardened() {
+        let response = callback_http_response(CallbackPage::Success);
+        let (headers, body) = response
+            .split_once("\r\n\r\n")
+            .expect("response has an HTTP header terminator");
+
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(headers.contains("Content-Type: text/html; charset=utf-8"));
+        assert!(headers.contains("Cache-Control: no-store"));
+        assert!(headers.contains("Content-Security-Policy: default-src 'none'"));
+        assert!(headers.contains("frame-ancestors 'none'"));
+        assert!(headers.contains("Referrer-Policy: no-referrer"));
+        assert!(headers.contains("X-Content-Type-Options: nosniff"));
+
+        let declared_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .expect("response declares a content length")
+            .parse::<usize>()
+            .expect("content length is numeric");
+        assert_eq!(declared_length, body.len());
+
+        assert!(!body.contains("<script"));
+        assert!(!body.contains("src=\"http"));
+        assert!(!body.contains("href=\"http"));
+        assert!(body.contains("href=\"data:image/svg+xml"));
     }
 }

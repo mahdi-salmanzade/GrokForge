@@ -45,7 +45,7 @@ pub async fn list() -> ExitCode {
 
 /// Resume a session: load its transcript and reopen the TUI continuing from it.
 #[allow(clippy::too_many_lines)]
-pub async fn resume(id: Option<String>) -> ExitCode {
+pub async fn resume(id: Option<String>, trust_project_mcp: bool) -> ExitCode {
     let dir = match sessions_dir() {
         Ok(dir) => dir,
         Err(error) => {
@@ -155,7 +155,15 @@ pub async fn resume(id: Option<String>) -> ExitCode {
         &meta.session_id[..8.min(meta.session_id.len())],
         session.history.len()
     );
-    match grokforge_tui::run_locked_session(client, session, rollout, "auto".to_string()).await {
+    match grokforge_tui::run_locked_session(
+        client,
+        session,
+        rollout,
+        "auto".to_string(),
+        trust_project_mcp,
+    )
+    .await
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("tui error: {e}");
