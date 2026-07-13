@@ -42,14 +42,30 @@ cd GrokForge
 cargo build --release
 ```
 
-Set your xAI key and start the TUI:
+## Signing in
+
+Just run it — GrokForge sets up credentials on first launch:
 
 ```sh
-export XAI_API_KEY=your_key_here
 ./target/release/grokforge
 ```
 
-Or run one task without opening the TUI:
+If you're not signed in yet, it asks how you want to connect:
+
+- **[1] Your Grok subscription** (SuperGrok / X Premium+) — signs in through your browser (OAuth); usage bills against your subscription, no API key needed. *xAI currently limits subscription API access to the SuperGrok **Heavy** tier; other tiers may get a 403 until xAI lifts that.*
+- **[2] An xAI API key** — paste a key from [console.x.ai](https://console.x.ai) (pay-as-you-go; new developer accounts also get free monthly credits via the data-sharing program).
+
+Either choice is saved to your OS keychain, so it's a one-time step. You can also set things up ahead of time:
+
+```sh
+grokforge login                 # store an xAI API key in the OS keychain
+grokforge login --subscription  # sign in with your SuperGrok / X Premium+ subscription
+export XAI_API_KEY=your_key     # or just use an environment variable (best for CI)
+```
+
+Resolution order is env var → stored API key → subscription token → interactive prompt. Run `grokforge doctor` to see which credential is active and whether the sandbox is enforced.
+
+Run one task without opening the TUI:
 
 ```sh
 ./target/release/grokforge exec -p "find the bug and explain the fix"
@@ -75,7 +91,7 @@ Commands start with a stripped-down environment, Git metadata stays protected, c
 - Rich Markdown and diff rendering
 - The repository map and smarter automatic context selection
 - Foreground auto-commit and a practical undo workflow
-- Keyring login and full session search
+- Full session search
 - A user-facing trust flow for MCP servers
 - Native Windows enforcement
 - Signed installers and package-manager releases
