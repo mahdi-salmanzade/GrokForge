@@ -4207,7 +4207,10 @@ mod tests {
     use grokforge_core::{Agent, Session, SessionConfig, ToolRegistry};
     use grokforge_protocol::{Decision, DenialClass, EventMsg, LedgerEntry, ResponseItem, Usage};
     use grokforge_sandbox::PassthroughRunner;
-    use grokforge_xai::{Effort, ModelInfo, ServerTool, XaiClient};
+    use grokforge_xai::{Effort, ModelInfo, XaiClient};
+    // `ServerTool` is only exercised by the Unix-gated project-capabilities test.
+    #[cfg(unix)]
+    use grokforge_xai::ServerTool;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
