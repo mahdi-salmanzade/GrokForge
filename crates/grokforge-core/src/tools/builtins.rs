@@ -59,6 +59,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(GitStatus),
         Arc::new(GitDiff),
         Arc::new(SpawnTask),
+        Arc::new(Remember),
     ]
 }
 
@@ -775,6 +776,63 @@ impl Tool for SpawnTask {
 
     async fn invoke(&self, _inv: ToolInvocation<'_>) -> ToolOutput {
         ToolOutput::failure("subagents cannot spawn further subagents")
+    }
+}
+
+// ---------- remember (persistent memory) ----------
+
+#[derive(Debug)]
+struct Remember;
+
+#[async_trait]
+impl Tool for Remember {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "remember".into(),
+            description: "Save a concise note to persistent memory (.grokforge/memory/) so it \
+                          survives across sessions. Use it for durable facts, user preferences, \
+                          and project conventions worth recalling later — not transient details. \
+                          Optionally group related notes under a `topic`."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "note": { "type": "string", "description": "The fact to remember, as one concise line." },
+                    "topic": { "type": "string", "description": "Optional topic to group the note under, e.g. \"build\" or \"user-preferences\"." }
+                },
+                "required": ["note"]
+            }),
+            mutating: true,
+            parallel_safe: false,
+        }
+    }
+
+    fn approval(&self, _args: &serde_json::Value, _ctx: &TurnContext) -> ApprovalNeed {
+        // Writes are confined to the dedicated `.grokforge/memory/` directory with a sanitized
+        // topic slug, so this does not need the general filesystem-write approval.
+        ApprovalNeed::None
+    }
+
+    async fn invoke(&self, inv: ToolInvocation<'_>) -> ToolOutput {
+        let note = match arg_str(&inv.args, "note") {
+            Ok(note) => note.to_string(),
+            Err(error) => return error,
+        };
+        let topic = inv
+            .args
+            .get("topic")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let workspace = inv.ctx.workspace_root.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::memory::remember(&workspace, &note, topic.as_deref())
+        })
+        .await
+        {
+            Ok(Ok(summary)) => ToolOutput::success(summary),
+            Ok(Err(error)) => ToolOutput::failure(error),
+            Err(error) => ToolOutput::failure(format!("remember task failed: {error}")),
+        }
     }
 }
 

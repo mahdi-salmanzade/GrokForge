@@ -25,6 +25,7 @@ pub struct Assembled {
 pub fn assemble(
     session: &Session,
     agents_md: &[AgentsDoc],
+    memory: &[crate::memory::MemoryDoc],
     skills: &[SkillDoc],
     tool_defs: Vec<grokforge_xai::ToolDef>,
 ) -> Result<Assembled, XaiError> {
@@ -55,6 +56,31 @@ pub fn assemble(
         ledger.push(
             LedgerEntry::new(
                 format!("agents_md:{}", display_path.text),
+                block.len(),
+                "auto-context",
+            )
+            .with_redactions(red.count.saturating_add(display_path.count)),
+        );
+        input.push(InputItem::text(Role::Developer, block));
+    }
+
+    // Persistent memory (the auto-loaded MEMORY.md index), redacted and counted as auto-context.
+    for doc in memory {
+        let red = Redactor::apply(&doc.content);
+        let relative = doc
+            .path
+            .strip_prefix(&session.config.workspace_root)
+            .unwrap_or_else(|_| std::path::Path::new(".grokforge/memory/MEMORY.md"));
+        let display_path = Redactor::apply(&relative.to_string_lossy());
+        let path_json = serde_json::to_string(&display_path.text)
+            .unwrap_or_else(|_| "\"<invalid path>\"".to_string());
+        let block = format!(
+            "<memory>\nYour persistent memory from earlier sessions (source: {path_json}). Trust and use it, and call the `remember` tool to save durable new facts.\n{}\n</memory>",
+            red.text
+        );
+        ledger.push(
+            LedgerEntry::new(
+                format!("memory:{}", display_path.text),
                 block.len(),
                 "auto-context",
             )
@@ -336,7 +362,7 @@ mod tests {
     fn ledger_reconciles_with_serialized_body() {
         let mut session = Session::new(SessionConfig::new(PathBuf::from("/tmp"), "grok-build-0.1"));
         session.history.push(ResponseItem::user("hello world"));
-        let assembled = assemble(&session, &[], &[], vec![]).unwrap();
+        let assembled = assemble(&session, &[], &[], &[], vec![]).unwrap();
         assert_eq!(assembled.ledger.total_bytes(), assembled.body_len);
     }
 
@@ -348,7 +374,7 @@ mod tests {
             path: workspace.join("AGENTS.md"),
             content: "deploy key: xai-ABCDEF0123456789ZZZ".to_string(),
         }];
-        let assembled = assemble(&session, &docs, &[], vec![]).unwrap();
+        let assembled = assemble(&session, &docs, &[], &[], vec![]).unwrap();
         let (body, _) = XaiClient::serialize_request(&assembled.request).unwrap();
         let body = String::from_utf8_lossy(&body);
         assert!(!body.contains("xai-ABCDEF0123456789ZZZ"));
@@ -375,7 +401,7 @@ mod tests {
             description: "publish with xai-ABCDEF0123456789ZZZ".to_string(),
         }];
 
-        let assembled = assemble(&session, &[], &skills, vec![]).unwrap();
+        let assembled = assemble(&session, &[], &[], &skills, vec![]).unwrap();
         let (body, _) = XaiClient::serialize_request(&assembled.request).unwrap();
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("<available_skill name=\\\"release\\\">"));
@@ -398,7 +424,7 @@ mod tests {
         let mut config = SessionConfig::new(PathBuf::from("/tmp"), "m");
         config.system_prompt = "PASSWORD=very-secret-password-value".to_string();
         let session = Session::new(config);
-        let assembled = assemble(&session, &[], &[], vec![]).unwrap();
+        let assembled = assemble(&session, &[], &[], &[], vec![]).unwrap();
         let (body, _) = XaiClient::serialize_request(&assembled.request).unwrap();
         let body = String::from_utf8_lossy(&body);
         assert!(!body.contains("very-secret-password-value"));
@@ -431,7 +457,7 @@ mod tests {
             text: "prior summary".into(),
             redactions: 5,
         });
-        let assembled = assemble(&session, &[], &[], vec![]).unwrap();
+        let assembled = assemble(&session, &[], &[], &[], vec![]).unwrap();
         assert!(assembled.ledger.entries.iter().any(|entry| {
             entry.source == "tool_result:read_file:src/private.rs"
                 && entry.bytes == 8
@@ -474,7 +500,7 @@ mod tests {
             redactions: 0,
         });
 
-        let assembled = assemble(&session, &[], &[], vec![]).unwrap();
+        let assembled = assemble(&session, &[], &[], &[], vec![]).unwrap();
         let (body, _) = XaiClient::serialize_request(&assembled.request).unwrap();
         let body = String::from_utf8_lossy(&body);
         assert!(!body.contains(secret));
@@ -503,7 +529,7 @@ mod tests {
             .history
             .push(ResponseItem::assistant("x".repeat(33 * 1024 * 1024)));
         assert!(matches!(
-            assemble(&session, &[], &[], vec![]),
+            assemble(&session, &[], &[], &[], vec![]),
             Err(XaiError::RequestTooLarge { .. })
         ));
     }

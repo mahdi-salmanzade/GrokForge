@@ -541,6 +541,7 @@ impl Agent {
         };
         let agents = agents_md::discover(&session.config.workspace_root);
         let skills = skills::discover(&session.config.workspace_root);
+        let memory = crate::memory::discover(&session.config.workspace_root);
 
         let mut iteration = 0u32;
         let mut spawned = 0usize;
@@ -601,16 +602,17 @@ impl Agent {
             }
             iteration += 1;
 
-            let assembled = match context::assemble(session, &agents, &skills, tool_defs.clone()) {
-                Ok(a) => a,
-                Err(e) => {
-                    self.emit(EventMsg::Error {
-                        message: format!("failed to assemble request: {e}"),
-                        recoverable: false,
-                    });
-                    break StopReason::Error;
-                }
-            };
+            let assembled =
+                match context::assemble(session, &agents, &memory, &skills, tool_defs.clone()) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        self.emit(EventMsg::Error {
+                            message: format!("failed to assemble request: {e}"),
+                            recoverable: false,
+                        });
+                        break StopReason::Error;
+                    }
+                };
 
             // Hard budget guard: never send a request that exceeds the model's input-token budget.
             // The provider rejects an oversize prompt with a 400 that aborts the whole turn, so
@@ -2870,9 +2872,10 @@ fn tool_preserves_auto_commit_ownership(name: &str) -> bool {
     // File tools are awaited host operations and the private worktree excludes sibling agents.
     // A shell or external/custom tool can leave a daemonized descendant on platforms without a
     // PID namespace (notably Seatbelt), so its same-path writes cannot be attributed at staging.
+    // `remember` is a confined, awaited host write to `.grokforge/memory/`, safe like a file tool.
     matches!(
         name,
-        "read_file" | "write_file" | "edit" | "list" | "glob" | "grep"
+        "read_file" | "write_file" | "edit" | "list" | "glob" | "grep" | "remember"
     )
 }
 

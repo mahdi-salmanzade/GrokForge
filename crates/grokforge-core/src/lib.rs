@@ -16,6 +16,7 @@ pub mod commands;
 pub mod compaction;
 pub mod context;
 pub mod mcp_config;
+pub mod memory;
 mod path_safety;
 pub mod redaction;
 pub mod session;

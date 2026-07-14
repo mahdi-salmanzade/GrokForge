@@ -882,7 +882,7 @@ impl App {
         match name {
             "help" | "?" => {
                 self.push_entry(Entry::Info(
-                    "commands: /plan <task>  ·  /skills [name]  ·  /tools [web|x|code] [on|off]  ·  /undo  ·  /clear  ·  /quit".to_string(),
+                    "commands: /plan <task>  ·  /skills [name]  ·  /memory  ·  /tools [web|x|code] [on|off]  ·  /undo  ·  /clear  ·  /quit".to_string(),
                 ));
                 if !self.project_commands.is_empty() {
                     let commands = self
@@ -904,6 +904,7 @@ impl App {
             }
             "undo" => self.undo(),
             "skills" => self.show_skills(rest.trim()),
+            "memory" => self.show_memory(),
             "tools" => self.handle_server_tools(rest.trim()),
             "plan" => {
                 let task = rest.trim();
@@ -935,6 +936,12 @@ impl App {
                 true,
             ),
             ("/skills", "Browse local project skills", true, false),
+            (
+                "/memory",
+                "Show persistent memory (.grokforge/memory/)",
+                false,
+                false,
+            ),
             (
                 "/tools",
                 "Open the capability deck: local tools + hosted toggles",
@@ -1137,6 +1144,30 @@ impl App {
         }
         for entry in matching {
             self.push_entry(entry);
+        }
+    }
+
+    /// Show the agent's persistent memory (the auto-loaded `.grokforge/memory/MEMORY.md` index).
+    fn show_memory(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            self.push_entry(Entry::Info(
+                "memory is available between turns; try again when idle.".to_string(),
+            ));
+            return;
+        };
+        let docs = grokforge_core::memory::discover(&session.config.workspace_root);
+        if docs.is_empty() {
+            self.push_entry(Entry::Info(
+                "no memory yet · Grok saves durable notes to .grokforge/memory/ with the `remember` tool".to_string(),
+            ));
+            return;
+        }
+        self.push_entry(Entry::Info(
+            "MEMORY · .grokforge/memory/MEMORY.md".to_string(),
+        ));
+        for doc in docs {
+            let body = bounded_text(&safe_terminal_text(&doc.content), 8 * 1024);
+            self.push_entry(Entry::Info(body));
         }
     }
 

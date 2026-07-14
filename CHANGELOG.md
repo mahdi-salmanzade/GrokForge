@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Agent-managed persistent memory under `.grokforge/memory/`. A new `remember` tool lets Grok save
+  durable facts, preferences, and project conventions across sessions; notes without a topic go to
+  the `MEMORY.md` index, and topic notes go to a slugged `<topic>.md` file linked from the index.
+  The `MEMORY.md` index is auto-loaded into context each session (redacted and ledgered like other
+  auto-context), while topic bodies stay local until read. Writes are confined to the memory
+  directory with a sanitized slug so a note can never escape it, and `/memory` shows the current
+  memory in the TUI.
+
 ### Fixed
 - Bounded the assembled request to the model's real context window so a long session no longer
   overruns the provider's prompt-token limit and fails the whole turn with a hard `400`. The
