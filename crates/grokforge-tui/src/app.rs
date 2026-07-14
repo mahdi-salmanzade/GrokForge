@@ -4558,6 +4558,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)] // discovery uses the Unix-only confined reader
     #[test]
     fn project_capabilities_are_discoverable_and_server_tools_are_explicit_opt_ins() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -4753,6 +4754,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)] // discovery uses the Unix-only confined reader
     #[test]
     fn slash_palette_filters_builtins_and_project_commands_live() {
         use crossterm::event::{KeyCode, KeyEvent};
@@ -4785,6 +4787,7 @@ mod tests {
         assert!(!filtered.contains("second line"));
     }
 
+    #[cfg(unix)] // discovery uses the Unix-only confined reader
     #[test]
     fn slash_palette_keyboard_navigation_completes_and_executes() {
         use crossterm::event::{KeyCode, KeyEvent};
