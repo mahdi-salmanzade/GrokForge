@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-14
+
 ### Changed
 - Replaced OS-keychain credential storage with one password-encrypted file at
   `~/.grokforge/credentials.enc`. On first interactive use, GrokForge asks the user to set and
