@@ -17,6 +17,7 @@ grokforge-core = { workspace = true }
 grokforge-sandbox = { workspace = true }
 grokforge-git = { workspace = true }
 grokforge-xai = { workspace = true }
+grokforge-render = { workspace = true }
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm = { workspace = true }
 tokio = { workspace = true }

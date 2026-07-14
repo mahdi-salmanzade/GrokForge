@@ -5,10 +5,12 @@
 
 mod app;
 mod approver;
+mod brand;
 
 use std::io::{self, Stdout};
 use std::sync::Arc;
 
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -197,7 +199,8 @@ fn protect_user_changes(session: &mut Session) -> Option<String> {
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+        let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
         let _ = disable_raw_mode();
         return Err(error);
     }
@@ -205,7 +208,7 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
         Ok(terminal) => Ok(terminal),
         Err(error) => {
             let mut stdout = io::stdout();
-            let _ = execute!(stdout, LeaveAlternateScreen);
+            let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
             let _ = disable_raw_mode();
             Err(error)
         }
@@ -217,8 +220,11 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Re
     if let Err(error) = terminal.show_cursor() {
         first_error = Some(error);
     }
-    if let Err(error) = execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        && first_error.is_none()
+    if let Err(error) = execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    ) && first_error.is_none()
     {
         first_error = Some(error);
     }

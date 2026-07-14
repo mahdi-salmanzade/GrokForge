@@ -18,6 +18,7 @@ use grokforge_core::commands::{self, CommandDoc};
 use grokforge_core::skills::{self, SkillDoc};
 use grokforge_core::{Agent, RolloutWriter, Session, TurnCancellation};
 use grokforge_protocol::{Decision, DenialClass, EventMsg, ResponseItem, Usage};
+use grokforge_render::{LineKind, RenderLine, RenderSpan, SpanRole, render_markdown};
 use grokforge_xai::ServerTool;
 use ratatui::Terminal;
 use ratatui::backend::Backend;
@@ -38,6 +39,7 @@ const MAX_ENTRY_BYTES: usize = 48 * 1024;
 const MAX_RENDER_TRANSCRIPT_ENTRIES: usize = 512;
 const MAX_RENDER_TRANSCRIPT_BYTES: usize = 48 * 1024;
 const APPROVAL_PAGE_BYTES: usize = 8 * 1024;
+const MAX_PALETTE_ROWS: usize = 7;
 const REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 
 // GrokForge's UI palette. Explicit colors make the product identity consistent across terminal
@@ -128,6 +130,17 @@ enum ShutdownState {
     Active,
     Requested,
     Ready,
+}
+
+/// One locally discoverable slash action. The palette is derived from these records on every
+/// composer edit; with a hard cap of 64 project commands this stays tiny and, importantly, never
+/// sends project-command text to the model merely because the user typed `/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlashPaletteItem {
+    completion: String,
+    description: String,
+    accepts_arguments: bool,
+    requires_argument: bool,
 }
 
 /// Lazily paginates an approval across the actual modal viewport. Page boundaries are cached,
@@ -286,6 +299,9 @@ pub struct App {
     streaming: Option<String>,
     reasoning: Option<String>,
     composer: String,
+    /// `None` means the user dismissed the current slash deck with Esc. Any composer edit
+    /// restores selection zero without adding another boolean to the app state machine.
+    slash_selection: Option<usize>,
     scroll: u16,
     follow: bool,
     pending: Option<PendingApproval>,
@@ -368,6 +384,7 @@ impl App {
             streaming: None,
             reasoning: None,
             composer: String::new(),
+            slash_selection: Some(0),
             scroll: 0,
             follow: true,
             pending: None,
@@ -524,6 +541,21 @@ impl App {
             return;
         }
 
+        // Match the shell convention without stealing Ctrl+D from approval handling or from an
+        // in-flight turn. A non-empty draft is deliberately preserved.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('d')
+            && self.composer.is_empty()
+            && !self.running
+        {
+            self.request_quit();
+            return;
+        }
+
+        if self.on_slash_palette_key(key) {
+            return;
+        }
+
         match key.code {
             KeyCode::Enter => self.submit(),
             KeyCode::Char(c)
@@ -533,14 +565,17 @@ impl App {
                         | KeyModifiers::SUPER
                         | KeyModifiers::HYPER
                         | KeyModifiers::META,
-                ) =>
+                ) && is_safe_terminal_char(c) =>
             {
                 if self.composer.len().saturating_add(c.len_utf8()) <= MAX_COMPOSER_BYTES {
                     self.composer.push(c);
+                    self.on_composer_changed();
                 }
             }
             KeyCode::Backspace => {
-                self.composer.pop();
+                if self.composer.pop().is_some() {
+                    self.on_composer_changed();
+                }
             }
             KeyCode::Up => {
                 self.follow = false;
@@ -570,8 +605,67 @@ impl App {
         }
     }
 
+    /// Handles keys only while the slash deck is visible. Approval input is dispatched before
+    /// this method, preserving Esc-as-deny and approval paging semantics.
+    fn on_slash_palette_key(&mut self, key: KeyEvent) -> bool {
+        let Some(selection) = self.slash_selection else {
+            return false;
+        };
+        if !self.composer.starts_with('/') {
+            return false;
+        }
+        let matches = self.slash_palette_matches();
+        match key.code {
+            KeyCode::Esc => {
+                self.slash_selection = None;
+                true
+            }
+            KeyCode::Up if !matches.is_empty() => {
+                self.slash_selection = Some(if selection == 0 {
+                    matches.len() - 1
+                } else {
+                    selection.min(matches.len() - 1) - 1
+                });
+                true
+            }
+            KeyCode::Down if !matches.is_empty() => {
+                self.slash_selection = Some((selection + 1) % matches.len());
+                true
+            }
+            KeyCode::Tab if !matches.is_empty() => {
+                let selected = matches[selection.min(matches.len() - 1)].clone();
+                self.complete_slash_item(&selected);
+                true
+            }
+            KeyCode::Enter if !matches.is_empty() => {
+                let selected = matches[selection.min(matches.len() - 1)].clone();
+                self.composer.clone_from(&selected.completion);
+                if selected.requires_argument {
+                    self.composer.push(' ');
+                    self.on_composer_changed();
+                } else {
+                    self.submit();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn complete_slash_item(&mut self, item: &SlashPaletteItem) {
+        self.composer.clone_from(&item.completion);
+        if item.accepts_arguments {
+            self.composer.push(' ');
+        }
+        self.on_composer_changed();
+    }
+
+    fn on_composer_changed(&mut self) {
+        self.slash_selection = Some(0);
+    }
+
     fn on_paste(&mut self, value: &str) {
-        if self.pending.is_some() || self.running {
+        if self.pending.is_some() {
             return;
         }
         let value = safe_terminal_text(value);
@@ -581,6 +675,7 @@ impl App {
             used = used.saturating_add(ch.len_utf8());
             used <= remaining
         }));
+        self.on_composer_changed();
     }
 
     fn on_approval_request(&mut self, pending: PendingApproval) {
@@ -652,11 +747,18 @@ impl App {
     }
 
     fn submit(&mut self) {
-        let text = self.composer.trim().to_string();
+        // The composer is sanitized on every input path, and again here as a final boundary before
+        // text can reach project-command expansion, persistence, or the model request ledger.
+        let text = safe_terminal_text(&self.composer).trim().to_string();
         if text.is_empty() || self.running {
             return;
         }
         self.composer.clear();
+        self.slash_selection = Some(0);
+        if text.eq_ignore_ascii_case("exit") || text.eq_ignore_ascii_case("quit") {
+            self.request_quit();
+            return;
+        }
         if let Some(cmd) = text.strip_prefix('/') {
             self.handle_slash(cmd);
             return;
@@ -750,6 +852,93 @@ impl App {
         }
     }
 
+    fn slash_palette_items(&self) -> Vec<SlashPaletteItem> {
+        let builtin = [
+            ("/help", "Command map and keyboard shortcuts", false, false),
+            (
+                "/plan",
+                "Design a solution without changing files",
+                true,
+                true,
+            ),
+            ("/skills", "Browse local project skills", true, false),
+            (
+                "/tools",
+                "Open the capability deck: local tools + hosted toggles",
+                true,
+                false,
+            ),
+            (
+                "/tools web on",
+                "Enable hosted web search · separately metered",
+                false,
+                false,
+            ),
+            ("/tools web off", "Disable hosted web search", false, false),
+            (
+                "/tools x on",
+                "Enable hosted X search · separately metered",
+                false,
+                false,
+            ),
+            ("/tools x off", "Disable hosted X search", false, false),
+            (
+                "/tools code on",
+                "Enable hosted code interpreter · separately metered",
+                false,
+                false,
+            ),
+            (
+                "/tools code off",
+                "Disable hosted code interpreter",
+                false,
+                false,
+            ),
+            ("/undo", "Revert the most recent Grok turn", false, false),
+            ("/clear", "Clear the visible transcript", false, false),
+            ("/quit", "Close GrokForge", false, false),
+        ];
+        let mut items = builtin
+            .into_iter()
+            .map(
+                |(completion, description, accepts_arguments, requires_argument)| {
+                    SlashPaletteItem {
+                        completion: completion.to_string(),
+                        description: description.to_string(),
+                        accepts_arguments,
+                        requires_argument,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        items.extend(
+            self.project_commands
+                .iter()
+                .map(|command| SlashPaletteItem {
+                    completion: format!("/{}", command.name),
+                    description: project_command_description(command),
+                    accepts_arguments: true,
+                    requires_argument: false,
+                }),
+        );
+        items
+    }
+
+    fn slash_palette_matches(&self) -> Vec<SlashPaletteItem> {
+        let Some(query) = self.composer.strip_prefix('/') else {
+            return Vec::new();
+        };
+        let query = safe_terminal_line(query).to_ascii_lowercase();
+        self.slash_palette_items()
+            .into_iter()
+            .filter(|item| {
+                item.completion[1..]
+                    .to_ascii_lowercase()
+                    .starts_with(&query)
+            })
+            .collect()
+    }
+
     fn run_project_command(&mut self, name: &str, arguments: &str) -> bool {
         let Some(command) = self
             .project_commands
@@ -783,6 +972,15 @@ impl App {
         }
 
         let Some(tool_name) = tool_name else {
+            self.push_entry(Entry::Info(
+                "LOCAL CAPABILITIES · available without hosted-tool charges".to_string(),
+            ));
+            self.push_entry(Entry::Info(
+                "read · write · edit · list · glob · grep · shell".to_string(),
+            ));
+            self.push_entry(Entry::Info(
+                "git status · git diff · spawn task".to_string(),
+            ));
             let enabled = self
                 .session
                 .as_ref()
@@ -1104,6 +1302,7 @@ impl App {
         self.render_transcript(chunks[1], f);
         self.render_composer(chunks[2], f);
         self.render_status(chunks[3], f);
+        self.render_slash_palette(chunks[1], f);
 
         if let (Some(pending), Some(detail)) = (&self.pending, &self.approval_detail) {
             render_approval_modal(area, f, pending, detail);
@@ -1119,7 +1318,7 @@ impl App {
         } else if let Some(tool) = &self.active_tool {
             (format!("● {}", compact_preview(tool, 18)), TOOL)
         } else if self.reasoning.is_some() {
-            ("◇ THINKING".to_string(), MUTED)
+            ("◇ TRACING".to_string(), MUTED)
         } else if self.running {
             ("● WORKING".to_string(), ACCENT)
         } else {
@@ -1141,16 +1340,26 @@ impl App {
         f.render_widget(block, area);
 
         let content = horizontal_inset(area, u16::from(area.width >= 24));
-        let brand = Line::from(vec![
-            Span::styled(
-                "◢ ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "GROKFORGE",
+        let brand = if content.width >= 18 {
+            Line::from(vec![
+                Span::styled("@%#", Style::default().fg(ACCENT)),
+                Span::styled("*+=  ", Style::default().fg(ACCENT_SOFT)),
+                Span::styled(
+                    "GROKFORGE",
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+            ])
+        } else if content.width >= 8 {
+            Line::from(vec![
+                Span::styled("@%  ", Style::default().fg(ACCENT_SOFT)),
+                Span::styled("GF", Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+            ])
+        } else {
+            Line::from(Span::styled(
+                "GF",
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-        ]);
+            ))
+        };
         f.render_widget(Paragraph::new(brand.clone()), first_row(content));
 
         let state = self.activity_state();
@@ -1186,12 +1395,9 @@ impl App {
 
         if area.height > 2 {
             let tagline = Line::from(vec![
-                Span::styled(
-                    "Make Grok great in the terminal.",
-                    Style::default().fg(MUTED),
-                ),
-                Span::styled("  ·  ", Style::default().fg(FAINT)),
-                Span::styled("forge boldly", Style::default().fg(ACCENT_SOFT)),
+                Span::styled("FORGE CORE", Style::default().fg(ACCENT_SOFT)),
+                Span::styled("  //  ", Style::default().fg(FAINT)),
+                Span::styled("TRACE · SHAPE · PROVE", Style::default().fg(MUTED)),
             ]);
             let row = Rect::new(content.x, content.y.saturating_add(1), content.width, 1);
             f.render_widget(Paragraph::new(tagline.clone()), row);
@@ -1277,15 +1483,21 @@ impl App {
         }
         if let Some(reasoning) = &self.reasoning {
             lines.push(Line::from(vec![
-                Span::styled("◇  THINKING  ", Style::default().fg(FAINT)),
-                Span::styled(compact_preview(reasoning, 240), Style::default().fg(MUTED)),
+                Span::styled("◇  TRACE  ", Style::default().fg(FAINT)),
+                Span::styled(compact_preview(reasoning, 112), Style::default().fg(MUTED)),
                 Span::styled("  ●", Style::default().fg(ACCENT)),
             ]));
         }
         if let Some(streaming) = &self.streaming {
-            push_role_header(&mut lines, "◆", "GROK", ACCENT, Some("● GENERATING"));
+            push_role_header(
+                &mut lines,
+                "◆",
+                "GROK // FORGE",
+                ACCENT,
+                Some("● GENERATING"),
+            );
             let streaming = safe_terminal_text(streaming);
-            push_body(&mut lines, &streaming, TEXT, content_width);
+            push_markdown_body(&mut lines, &streaming, content_width);
         }
 
         let viewport = content_area.height;
@@ -1413,11 +1625,18 @@ impl App {
         if area.width >= 94 {
             let hints = Line::from(vec![
                 Span::styled("↵", Style::default().fg(ACCENT_SOFT)),
-                Span::styled(" send   ", Style::default().fg(MUTED)),
+                Span::styled(" cast   ", Style::default().fg(MUTED)),
                 Span::styled("↑↓", Style::default().fg(TEXT)),
                 Span::styled(" scroll   ", Style::default().fg(MUTED)),
-                Span::styled("/help", Style::default().fg(TEXT)),
-                Span::styled("   Ctrl+C quit  ", Style::default().fg(MUTED)),
+                Span::styled("/ deck", Style::default().fg(TEXT)),
+                Span::styled(
+                    if self.running {
+                        "   Ctrl+C stop + exit  "
+                    } else {
+                        "   Ctrl+C quit  "
+                    },
+                    Style::default().fg(MUTED),
+                ),
             ]);
             if usize::from(area.width)
                 >= status_width.saturating_add(hints.width()).saturating_add(2)
@@ -1433,9 +1652,9 @@ impl App {
         }
 
         let compact = area.height < 3;
-        let prefix = if compact { " › " } else { " ›  " };
+        let prefix = if compact { "@> " } else { " @>  " };
         let prefix_width = u16::try_from(Line::from(prefix).width()).unwrap_or(0);
-        let border_width = if compact { 0 } else { 2 };
+        let border_width = u16::from(!compact);
         let available = area
             .width
             .saturating_sub(border_width)
@@ -1446,7 +1665,7 @@ impl App {
                 if self.running {
                     "Grok is working · draft your next message…"
                 } else {
-                    "Ask Grok · describe a change, paste an error, or type /help"
+                    "Describe the work · / opens tools + commands"
                 },
                 Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
             )
@@ -1461,11 +1680,10 @@ impl App {
                 ACCENT
             };
             block = block
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .borders(Borders::LEFT | Borders::TOP | Borders::BOTTOM)
                 .border_style(Style::default().fg(border_color))
                 .title(Line::from(Span::styled(
-                    " PROMPT ",
+                    " CAST ",
                     Style::default()
                         .fg(ACCENT_SOFT)
                         .add_modifier(Modifier::BOLD),
@@ -1484,7 +1702,7 @@ impl App {
             let composer_width = u16::try_from(Line::from(display.as_str()).width())
                 .unwrap_or(u16::MAX)
                 .min(available);
-            let max_x = area.right().saturating_sub(u16::from(!compact));
+            let max_x = area.right().saturating_sub(1);
             let x = area
                 .x
                 .saturating_add(u16::from(!compact))
@@ -1494,6 +1712,100 @@ impl App {
             let y = area.y.saturating_add(u16::from(!compact));
             f.set_cursor_position((x, y.min(area.bottom().saturating_sub(1))));
         }
+    }
+
+    fn render_slash_palette(&self, area: Rect, f: &mut ratatui::Frame) {
+        if self.pending.is_some()
+            || !self.composer.starts_with('/')
+            || area.width == 0
+            || area.height == 0
+        {
+            return;
+        }
+        let Some(selection) = self.slash_selection else {
+            return;
+        };
+        let items = self.slash_palette_matches();
+        if items.is_empty() {
+            return;
+        }
+
+        let selected = selection.min(items.len() - 1);
+        let bordered = area.width >= 16 && area.height >= 3;
+        let border_rows = if bordered { 2 } else { 0 };
+        let inset = if area.width >= 40 { 4 } else { 0 };
+        let width = area.width.saturating_sub(inset).clamp(1, 88);
+        let available_rows = area.height.saturating_sub(border_rows);
+        let show_toolbox = width >= 26 && available_rows >= 2;
+        let toolbox_rows = u16::from(show_toolbox);
+        let row_count = items
+            .len()
+            .min(MAX_PALETTE_ROWS)
+            .min(usize::from(available_rows.saturating_sub(toolbox_rows)).max(1));
+        let height = u16::try_from(row_count)
+            .unwrap_or(area.height)
+            .saturating_add(toolbox_rows)
+            .saturating_add(border_rows)
+            .min(area.height);
+        let palette_area = Rect::new(
+            area.x.saturating_add(inset),
+            area.bottom().saturating_sub(height),
+            width,
+            height,
+        );
+        let start = selected
+            .saturating_add(1)
+            .saturating_sub(row_count)
+            .min(items.len().saturating_sub(row_count));
+        let visible = &items[start..start + row_count];
+        let inner_width = usize::from(width.saturating_sub(if bordered { 2 } else { 0 }));
+        let name_width = visible
+            .iter()
+            .map(|item| item.completion.len())
+            .max()
+            .unwrap_or(0)
+            .min(inner_width.saturating_sub(4) / 2)
+            .max(1);
+        let show_descriptions = inner_width >= 34;
+        let mut lines = visible
+            .iter()
+            .enumerate()
+            .map(|(offset, item)| {
+                slash_palette_line(
+                    item,
+                    start + offset == selected,
+                    name_width,
+                    show_descriptions,
+                )
+            })
+            .collect::<Vec<_>>();
+        if show_toolbox {
+            lines.push(slash_toolbox_line(inner_width));
+        }
+
+        f.render_widget(Clear, palette_area);
+        let mut block = Block::default().style(Style::default().bg(SURFACE).fg(TEXT));
+        if bordered {
+            let title = if width >= 76 {
+                format!(
+                    " / FORGE DECK · {} FOUND · ↑↓ PICK · TAB COMPLETE · ENTER SELECT · ESC CLOSE ",
+                    items.len()
+                )
+            } else {
+                format!(" / FORGE DECK · {} ", items.len())
+            };
+            block = block
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ACCENT))
+                .title(Line::from(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(ACCENT_SOFT)
+                        .add_modifier(Modifier::BOLD),
+                )));
+        }
+        f.render_widget(Paragraph::new(lines).block(block), palette_area);
     }
 }
 
@@ -1784,7 +2096,7 @@ fn apply_display_fallback(f: &mut ratatui::Frame, area: Rect, mode: DisplayMode)
 
 fn ascii_ui_symbol(symbol: &str) -> Option<&'static str> {
     match symbol {
-        "╭" | "╮" | "╰" | "╯" | "└" | "✓" => Some("+"),
+        "╭" | "╮" | "╰" | "╯" | "┌" | "┐" | "└" | "┘" | "✓" => Some("+"),
         "─" => Some("-"),
         "│" => Some("|"),
         "◢" => Some("#"),
@@ -1808,89 +2120,197 @@ fn render_welcome(area: Rect, f: &mut ratatui::Frame) {
         return;
     }
 
-    if area.width >= 58 && area.height >= 12 {
-        let card = centered_fixed(
-            area,
-            area.width.saturating_sub(4).min(76),
-            10.min(area.height.saturating_sub(2)),
-        );
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(BORDER))
-            .style(Style::default().bg(SURFACE).fg(TEXT))
-            .title(Line::from(vec![
-                Span::styled(" ◆ ", Style::default().fg(ACCENT)),
-                Span::styled(
-                    "READY TO FORGE ",
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                ),
-            ]));
-        let inner = horizontal_inset(block.inner(card), 2);
-        f.render_widget(block, card);
-        let lines = vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("GrokForge is ready", Style::default().fg(TEXT)),
-                Span::styled(
-                    " and grounded in this workspace.",
-                    Style::default().fg(MUTED),
-                ),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Start with a question, a bug, or a change you want shipped.",
-                Style::default().fg(TEXT),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("›  ", Style::default().fg(USER)),
-                Span::styled(
-                    "Explain how this repository fits together",
-                    Style::default().fg(MUTED),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("›  ", Style::default().fg(ACCENT)),
-                Span::styled(
-                    "/plan a safe, reviewable change",
-                    Style::default().fg(MUTED),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("ENTER", Style::default().fg(ACCENT_SOFT)),
-                Span::styled(" send   ·   ", Style::default().fg(FAINT)),
-                Span::styled("/help", Style::default().fg(TEXT)),
-                Span::styled(" commands", Style::default().fg(FAINT)),
-            ]),
-        ];
-        f.render_widget(Paragraph::new(lines), inner);
+    if area.width < 18 {
+        let mark = if area.width >= 8 { "@%  GF" } else { "GF" };
+        let mut lines = vec![Line::from(Span::styled(
+            mark,
+            Style::default()
+                .fg(ACCENT_SOFT)
+                .add_modifier(Modifier::BOLD),
+        ))];
+        if area.height >= 2 {
+            lines.push(Line::from(Span::styled(
+                "READY",
+                Style::default().fg(SUCCESS),
+            )));
+        }
+        let compact = centered_fixed(area, area.width.min(12), area.height.min(2));
+        f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), compact);
+        return;
+    }
+
+    if let Some((art, gap, copy_width)) = welcome_art_layout(area) {
+        let copy_lines = welcome_copy(copy_width);
+        let copy_height = u16::try_from(copy_lines.len()).unwrap_or(area.height);
+        let hero_width = art
+            .width()
+            .saturating_add(gap)
+            .saturating_add(copy_width)
+            .min(area.width);
+        let hero_height = art.height().max(copy_height).min(area.height);
+        let hero = centered_fixed(area, hero_width, hero_height);
+        let art_y = hero
+            .y
+            .saturating_add(hero.height.saturating_sub(art.height()) / 2);
+        let art_area = Rect::new(hero.x, art_y, art.width(), art.height());
+        render_brand_art(art_area, art, f);
+
+        let copy_x = hero.x.saturating_add(art.width()).saturating_add(gap);
+        let copy_y = hero
+            .y
+            .saturating_add(hero.height.saturating_sub(copy_height) / 2);
+        let copy_area = Rect::new(copy_x, copy_y, copy_width, copy_height.min(hero.height));
+        f.render_widget(Paragraph::new(copy_lines), copy_area);
         return;
     }
 
     let compact = centered_fixed(area, area.width.min(40), area.height.min(4));
     let lines = vec![
         Line::from(vec![
-            Span::styled(
-                "◆ ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("@%#*+=  ", Style::default().fg(ACCENT_SOFT)),
             Span::styled(
                 "GROKFORGE",
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(Span::styled("Ready to build.", Style::default().fg(MUTED))),
         Line::from(Span::styled(
-            "Ask Grok about this workspace.",
+            "FORGE CORE / READY",
+            Style::default().fg(ACCENT),
+        )),
+        Line::from(Span::styled(
+            "Ask. Build. Verify.",
             Style::default().fg(TEXT),
         )),
-        Line::from(Span::styled(
-            "Enter sends  ·  /help",
-            Style::default().fg(FAINT),
-        )),
+        Line::from(vec![
+            Span::styled("/", Style::default().fg(ACCENT_SOFT)),
+            Span::styled(" deck  ·  ENTER cast", Style::default().fg(FAINT)),
+        ]),
     ];
     f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), compact);
+}
+
+fn welcome_art_layout(area: Rect) -> Option<(&'static crate::brand::BrandArt, u16, u16)> {
+    if area.width >= 116 && area.height >= 33 {
+        return crate::brand::responsive(66, 33).map(|art| (art, 4, 46));
+    }
+    if area.width >= 72 && area.height >= 17 {
+        return crate::brand::responsive(33, 17).map(|art| (art, 3, 36));
+    }
+    if area.width >= 43 && area.height >= 9 {
+        return crate::brand::responsive(17, 9).map(|art| (art, 2, 24));
+    }
+    None
+}
+
+fn welcome_copy(width: u16) -> Vec<Line<'static>> {
+    if width >= 34 {
+        vec![
+            Line::from(Span::styled(
+                "@%#*+=  FORGE CORE / READY",
+                Style::default().fg(ACCENT_SOFT),
+            )),
+            Line::from(Span::styled(
+                "GROKFORGE",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "LOCAL-FIRST TERMINAL INTELLIGENCE",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "WHAT ARE WE BUILDING?",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled("›  ", Style::default().fg(USER)),
+                Span::styled("Trace a failure to its source", Style::default().fg(MUTED)),
+            ]),
+            Line::from(vec![
+                Span::styled("›  ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    "Ship a focused, verified change",
+                    Style::default().fg(MUTED),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("/", Style::default().fg(ACCENT_SOFT)),
+                Span::styled("  OPEN THE FORGE DECK", Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("ENTER", Style::default().fg(ACCENT_SOFT)),
+                Span::styled("  CAST THE PROMPT", Style::default().fg(FAINT)),
+            ]),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "FORGE CORE / READY",
+                Style::default().fg(ACCENT),
+            )),
+            Line::from(Span::styled(
+                "GROKFORGE",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Ask. Build. Verify.",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("/", Style::default().fg(ACCENT_SOFT)),
+                Span::styled("  command deck", Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("ENTER", Style::default().fg(ACCENT_SOFT)),
+                Span::styled("  cast prompt", Style::default().fg(FAINT)),
+            ]),
+        ]
+    }
+}
+
+fn render_brand_art(area: Rect, art: &crate::brand::BrandArt, f: &mut ratatui::Frame) {
+    let lines = art
+        .lines()
+        .iter()
+        .map(|line| styled_brand_line(line))
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn styled_brand_line(value: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut chars = value.chars().peekable();
+    while let Some(first) = chars.next() {
+        let color = brand_glyph_color(first);
+        let mut run = String::from(first);
+        while chars
+            .peek()
+            .is_some_and(|next| brand_glyph_color(*next) == color)
+        {
+            if let Some(next) = chars.next() {
+                run.push(next);
+            }
+        }
+        if let Some(color) = color {
+            spans.push(Span::styled(run, Style::default().fg(color)));
+        } else {
+            spans.push(Span::raw(run));
+        }
+    }
+    Line::from(spans)
+}
+
+fn brand_glyph_color(glyph: char) -> Option<Color> {
+    match glyph {
+        ' ' => None,
+        '.' | ':' => Some(BORDER),
+        '-' | '=' | '+' => Some(ACCENT_SOFT),
+        '*' | '#' | '%' | '@' => Some(ACCENT),
+        _ => Some(MUTED),
+    }
 }
 
 fn push_role_header(
@@ -1932,6 +2352,158 @@ fn push_body(lines: &mut Vec<Line<'static>>, text: &str, color: Color, width: u1
             ]));
         }
     }
+}
+
+fn push_markdown_body(lines: &mut Vec<Line<'static>>, text: &str, width: u16) {
+    let indent = " ".repeat(usize::from(width).saturating_sub(1).min(3));
+    let body_width = usize::from(width).saturating_sub(indent.len()).max(1);
+    let rendered = render_markdown(text);
+
+    for rendered_line in &rendered.lines {
+        if rendered_line.kind == LineKind::Blank {
+            lines.push(Line::from(""));
+            continue;
+        }
+
+        let mut pieces = Vec::new();
+        let mut structural_width = 0usize;
+        if let Some((prefix, style)) = markdown_semantic_prefix(rendered_line) {
+            structural_width = structural_width.saturating_add(display_width(prefix));
+            pieces.push((prefix.to_string(), style));
+        }
+        let mut in_structural_prefix = true;
+        for span in &rendered_line.spans {
+            if in_structural_prefix
+                && matches!(span.role, SpanRole::ListMarker | SpanRole::QuoteMarker)
+            {
+                structural_width = structural_width.saturating_add(display_width(&span.text));
+            } else {
+                in_structural_prefix = false;
+            }
+            pieces.push((span.text.clone(), markdown_span_style(rendered_line, span)));
+        }
+
+        structural_width = structural_width.min(body_width.saturating_sub(1));
+        let continuation_width = body_width.saturating_sub(structural_width).max(1);
+        for (index, row) in wrap_styled_pieces(pieces, body_width, continuation_width)
+            .into_iter()
+            .enumerate()
+        {
+            let mut spans = vec![Span::raw(indent.clone())];
+            if index > 0 && structural_width > 0 {
+                spans.push(Span::raw(" ".repeat(structural_width)));
+            }
+            spans.extend(
+                row.into_iter()
+                    .map(|(text, style)| Span::styled(text, style)),
+            );
+            lines.push(Line::from(spans));
+        }
+    }
+}
+
+fn markdown_semantic_prefix(line: &RenderLine) -> Option<(&'static str, Style)> {
+    match line.kind {
+        LineKind::Heading { level: 1 } => Some((
+            "@ ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        LineKind::Heading { level: 2 } => Some((
+            "// ",
+            Style::default()
+                .fg(ACCENT_SOFT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        LineKind::Heading { .. } => Some((
+            "· ",
+            Style::default()
+                .fg(ACCENT_SOFT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        LineKind::CodeBlock { .. } => Some(("│ ", Style::default().fg(BORDER))),
+        LineKind::Truncation => Some(("! ", Style::default().fg(WARNING))),
+        _ => None,
+    }
+}
+
+fn markdown_span_style(line: &RenderLine, span: &RenderSpan) -> Style {
+    let mut style = match line.kind {
+        LineKind::Heading { level: 1 | 2 } => {
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+        }
+        LineKind::Heading { .. } | LineKind::TableRow { header: true } => Style::default()
+            .fg(ACCENT_SOFT)
+            .add_modifier(Modifier::BOLD),
+        LineKind::CodeBlock { .. } => Style::default().fg(TEXT).bg(SURFACE_RAISED),
+        LineKind::TableSeparator | LineKind::ThematicBreak => Style::default().fg(BORDER),
+        LineKind::Truncation => Style::default().fg(WARNING),
+        _ => Style::default().fg(TEXT),
+    };
+
+    style = match span.role {
+        SpanRole::ListMarker => style.fg(ACCENT_SOFT),
+        SpanRole::QuoteMarker => style.fg(USER),
+        SpanRole::TableDelimiter | SpanRole::ThematicBreak => style.fg(BORDER),
+        SpanRole::Truncation => style.fg(WARNING),
+        SpanRole::Text => style,
+    };
+    if span.style.strong {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if span.style.emphasis {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if span.style.strikethrough {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if span.style.code {
+        style = style.fg(ACCENT_SOFT).bg(SURFACE_RAISED);
+    }
+    if span.link.is_some() {
+        style = style.fg(USER).add_modifier(Modifier::UNDERLINED);
+    }
+    style
+}
+
+fn wrap_styled_pieces(
+    pieces: Vec<(String, Style)>,
+    first_width: usize,
+    continuation_width: usize,
+) -> Vec<Vec<(String, Style)>> {
+    let mut rows = Vec::new();
+    let mut row = Vec::<(String, Style)>::new();
+    let mut row_width = 0usize;
+    let mut limit = first_width.max(1);
+
+    for (text, style) in pieces {
+        for ch in text.chars() {
+            let ch_width = ch.width().unwrap_or(0);
+            if !row.is_empty() && row_width.saturating_add(ch_width) > limit {
+                rows.push(std::mem::take(&mut row));
+                row_width = 0;
+                limit = continuation_width.max(1);
+            }
+            if let Some((run, run_style)) = row.last_mut()
+                && *run_style == style
+            {
+                run.push(ch);
+            } else {
+                row.push((ch.to_string(), style));
+            }
+            row_width = row_width.saturating_add(ch_width);
+        }
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+fn display_width(value: &str) -> usize {
+    value
+        .chars()
+        .map(|character| character.width().unwrap_or(0))
+        .sum()
 }
 
 fn hard_wrap_display_line(line: &str, width: usize) -> Vec<String> {
@@ -1976,19 +2548,18 @@ fn push_wrapped_char(
 fn push_entry_lines(lines: &mut Vec<Line<'static>>, entry: &Entry, width: u16) {
     match entry {
         Entry::User(text) => {
-            push_role_header(lines, "›", "YOU", USER, None);
+            push_role_header(lines, "›", "YOU // INTENT", USER, None);
             let text = safe_terminal_text(text);
             push_body(lines, &text, TEXT, width);
         }
         Entry::Assistant(text) => {
-            push_role_header(lines, "◆", "GROK", ACCENT, None);
-            let text = safe_terminal_text(text);
-            push_body(lines, &text, TEXT, width);
+            push_role_header(lines, "◆", "GROK // FORGE", ACCENT, None);
+            push_markdown_body(lines, text, width);
         }
         Entry::Reasoning(text) => {
             lines.push(Line::from(vec![
-                Span::styled("◇  THINKING  ", Style::default().fg(FAINT)),
-                Span::styled(compact_preview(text, 240), Style::default().fg(MUTED)),
+                Span::styled("◇  TRACE  ", Style::default().fg(FAINT)),
+                Span::styled(compact_preview(text, 112), Style::default().fg(MUTED)),
             ]));
         }
         Entry::Tool { text, sandboxed } => {
@@ -2134,7 +2705,7 @@ fn push_entry_lines(lines: &mut Vec<Line<'static>>, entry: &Entry, width: u16) {
             ]));
         }
     }
-    if !matches!(entry, Entry::Tool { .. }) {
+    if !matches!(entry, Entry::Tool { .. } | Entry::Reasoning(_)) {
         lines.push(Line::from(""));
     }
 }
@@ -2155,6 +2726,72 @@ fn compact_preview(value: &str, max_chars: usize) -> String {
         output.push('…');
     }
     output
+}
+
+fn project_command_description(command: &CommandDoc) -> String {
+    let summary = command
+        .template
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Run this project's saved workflow")
+        .trim_start_matches(['#', '-', '*', '>', ' '])
+        .trim();
+    let summary = if summary.is_empty() {
+        "Run this project's saved workflow".to_string()
+    } else {
+        compact_preview(summary, 96)
+    };
+    format!("Project · {summary}")
+}
+
+fn slash_palette_line(
+    item: &SlashPaletteItem,
+    chosen: bool,
+    name_width: usize,
+    show_description: bool,
+) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(
+            if chosen { "◆ " } else { "  " },
+            Style::default().fg(if chosen { ACCENT } else { FAINT }),
+        ),
+        Span::styled(
+            format!("{:<name_width$}", item.completion),
+            Style::default()
+                .fg(if chosen { TEXT } else { ACCENT_SOFT })
+                .add_modifier(if chosen {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+    ];
+    if show_description {
+        spans.push(Span::styled(
+            format!("  {}", item.description),
+            Style::default().fg(if chosen { TEXT } else { MUTED }),
+        ));
+    }
+    Line::from(spans).style(Style::default().bg(if chosen { SURFACE_RAISED } else { SURFACE }))
+}
+
+fn slash_toolbox_line(width: usize) -> Line<'static> {
+    let tools = if width >= 74 {
+        "read · write · edit · list · glob · grep · shell · git · task"
+    } else if width >= 48 {
+        "read · edit · search · shell · git · task"
+    } else {
+        "open /tools"
+    };
+    Line::from(vec![
+        Span::styled(
+            "  LOCAL TOOLS  ",
+            Style::default().fg(TOOL).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(tools, Style::default().fg(MUTED)),
+    ])
+    .style(Style::default().bg(SURFACE))
 }
 
 fn humanize_tool_call(name: &str, arguments: &str) -> String {
@@ -2320,6 +2957,11 @@ fn render_approval_modal(
     );
     f.render_widget(Clear, modal);
 
+    if modal.width < 3 || modal.height < 3 {
+        f.render_widget(Paragraph::new(compact_approval_controls()), modal);
+        return;
+    }
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -2338,6 +2980,24 @@ fn render_approval_modal(
     let inner = horizontal_inset(block.inner(modal), u16::from(modal.width >= 12));
     f.render_widget(block, modal);
     if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if inner.height <= 2 {
+        let controls_area = first_row(inner);
+        f.render_widget(Paragraph::new(compact_approval_controls()), controls_area);
+        if inner.height == 2 {
+            let reason_area = Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1);
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("WHY  ", Style::default().fg(WARNING)),
+                    Span::styled(
+                        safe_terminal_line(&pending.request.reason),
+                        Style::default().fg(TEXT),
+                    ),
+                ])),
+                reason_area,
+            );
+        }
         return;
     }
 
@@ -2397,7 +3057,7 @@ fn render_approval_modal(
     let controls = if chunks[3].width >= 58 && chunks[3].height >= 2 {
         Paragraph::new(vec![
             Line::from(vec![
-                Span::styled(" Esc ", Style::default().fg(TEXT).bg(DANGER)),
+                Span::styled(" Esc ", Style::default().fg(CANVAS).bg(DANGER)),
                 Span::styled(" deny   ", Style::default().fg(MUTED)),
                 Span::styled(" y ", Style::default().fg(CANVAS).bg(SUCCESS)),
                 Span::styled(" approve once   ", Style::default().fg(MUTED)),
@@ -2426,15 +3086,19 @@ fn render_approval_modal(
             ]),
         ])
     } else {
-        Paragraph::new(Line::from(vec![
-            Span::styled("Esc deny", Style::default().fg(DANGER)),
-            Span::styled("  ·  ", Style::default().fg(FAINT)),
-            Span::styled("y yes", Style::default().fg(SUCCESS)),
-            Span::styled("  ·  ", Style::default().fg(FAINT)),
-            Span::styled("a all", Style::default().fg(WARNING)),
-        ]))
+        Paragraph::new(compact_approval_controls())
     };
     f.render_widget(controls, chunks[3]);
+}
+
+fn compact_approval_controls() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("Esc deny", Style::default().fg(DANGER)),
+        Span::styled("  ·  ", Style::default().fg(FAINT)),
+        Span::styled("y yes", Style::default().fg(SUCCESS)),
+        Span::styled("  ·  ", Style::default().fg(FAINT)),
+        Span::styled("a all", Style::default().fg(WARNING)),
+    ])
 }
 
 fn approval_sheet_rect(area: Rect) -> Rect {
@@ -2550,11 +3214,13 @@ fn approval_char_width(ch: char) -> usize {
 fn safe_terminal_text(value: &str) -> String {
     value
         .chars()
-        .filter(|ch| {
-            matches!(ch, '\n' | '\t')
-                || (!ch.is_control() && !matches!(*ch as u32, 0x7f..=0x9f) && !is_bidi_control(*ch))
-        })
+        .filter(|ch| is_safe_terminal_char(*ch))
         .collect()
+}
+
+fn is_safe_terminal_char(ch: char) -> bool {
+    matches!(ch, '\n' | '\t')
+        || (!ch.is_control() && !matches!(ch as u32, 0x7f..=0x9f) && !is_bidi_control(ch))
 }
 
 fn safe_terminal_line(value: &str) -> String {
@@ -2681,14 +3347,55 @@ mod tests {
 
         let frame = buffer_frame(&app, 80, 24);
         assert!(frame.contains("TRANSCRIPT-MARKER"), "{frame}");
-        assert!(frame.contains("THINKING"));
+        assert!(frame.contains("TRACE"));
     }
 
     #[test]
     fn welcome_does_not_claim_an_unverified_network_connection() {
         let frame = buffer_frame(&test_app(), 80, 24);
-        assert!(frame.contains("GrokForge is ready"));
+        assert!(frame.contains("FORGE CORE / READY"));
         assert!(!frame.to_lowercase().contains("connected"));
+    }
+
+    #[test]
+    fn welcome_art_selects_exact_responsive_rasters() {
+        for (width, height, art_width, art_height) in
+            [(116, 33, 66, 33), (72, 17, 33, 17), (43, 9, 17, 9)]
+        {
+            let area = ratatui::layout::Rect::new(0, 0, width, height);
+            let (art, _, _) = super::welcome_art_layout(area).expect("responsive brand art");
+            assert_eq!((art.width(), art.height()), (art_width, art_height));
+        }
+        assert!(super::welcome_art_layout(ratatui::layout::Rect::new(0, 0, 42, 8)).is_none());
+    }
+
+    #[test]
+    fn welcome_identity_yields_cleanly_to_the_first_message() {
+        let mut app = test_app();
+        let welcome = buffer_frame(&app, 168, 88);
+        assert!(welcome.contains("LOCAL-FIRST TERMINAL INTELLIGENCE"));
+        assert!(welcome.contains("WHAT ARE WE BUILDING?"));
+
+        app.transcript.push(Entry::User(
+            "Make this terminal unmistakably ours".to_string(),
+        ));
+        let conversation = buffer_frame(&app, 168, 88);
+        assert!(!conversation.contains("LOCAL-FIRST TERMINAL INTELLIGENCE"));
+        assert!(!conversation.contains("WHAT ARE WE BUILDING?"));
+        assert!(conversation.contains("Make this terminal unmistakably ours"));
+    }
+
+    #[test]
+    fn brand_chrome_adapts_without_chopped_wordmarks() {
+        for width in [1, 2, 8, 12, 16, 18, 24, 48, 72, 116] {
+            for height in [1, 2, 4, 5, 8, 16, 24, 33] {
+                let frame = buffer_frame(&test_app(), width, height);
+                assert_eq!(frame.lines().count(), usize::from(height));
+                if width < 18 {
+                    assert!(!frame.contains("GROKFORG"), "{width}×{height}:\n{frame}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2730,7 +3437,7 @@ mod tests {
             frame.is_ascii(),
             "plain frame contained non-ASCII UI: {frame}"
         );
-        assert!(frame.contains("* READY TO FORGE"));
+        assert!(frame.contains("FORGE CORE / READY"));
         assert!(
             buffer
                 .content()
@@ -2743,8 +3450,9 @@ mod tests {
     fn wide_frames_preserve_the_visual_hierarchy() {
         let mut app = test_app();
         let welcome = buffer_frame(&app, 80, 24);
-        assert!(welcome.contains("◆ READY TO FORGE"));
-        assert!(welcome.contains("╭ PROMPT"));
+        assert!(welcome.contains("FORGE CORE / READY"));
+        assert!(welcome.contains("LOCAL-FIRST TERMINAL INTELLIGENCE"));
+        assert!(welcome.contains("CAST"));
         assert_eq!(welcome.lines().count(), 24);
 
         app.transcript.push(Entry::User(
@@ -2838,6 +3546,147 @@ mod tests {
     }
 
     #[test]
+    fn slash_palette_filters_builtins_and_project_commands_live() {
+        use crossterm::event::{KeyCode, KeyEvent};
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let commands = workspace.path().join(".grokforge/commands");
+        std::fs::create_dir_all(&commands).expect("commands directory");
+        std::fs::write(
+            commands.join("review.md"),
+            "Review the current diff carefully.\nDo not expose this second line.",
+        )
+        .expect("command");
+        let mut app = test_app_in(workspace.path().to_path_buf(), Vec::new());
+
+        app.on_key(KeyEvent::from(KeyCode::Char('/')));
+        let all = buffer_frame(&app, 96, 24);
+        assert!(all.contains("FORGE DECK"), "{all}");
+        assert!(all.contains("/tools"), "{all}");
+        assert!(all.contains("capability deck"), "{all}");
+        assert!(all.contains("LOCAL TOOLS"), "{all}");
+        assert!(all.contains("read · write · edit"), "{all}");
+
+        for ch in "rev".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(ch)));
+        }
+        let filtered = buffer_frame(&app, 96, 24);
+        assert!(filtered.contains("/review"), "{filtered}");
+        assert!(filtered.contains("Project · Review the current diff carefully."));
+        assert!(!filtered.contains("Command map and keyboard shortcuts"));
+        assert!(!filtered.contains("second line"));
+    }
+
+    #[test]
+    fn slash_palette_keyboard_navigation_completes_and_executes() {
+        use crossterm::event::{KeyCode, KeyEvent};
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let commands = workspace.path().join(".grokforge/commands");
+        std::fs::create_dir_all(&commands).expect("commands directory");
+        std::fs::write(commands.join("review.md"), "Review the current diff.").expect("command");
+        let mut app = test_app_in(workspace.path().to_path_buf(), Vec::new());
+
+        for ch in "/rev".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(ch)));
+        }
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.composer, "/review ");
+
+        app.composer = "/to".to_string();
+        app.on_composer_changed();
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.composer.is_empty());
+        assert!(
+            app.session
+                .as_ref()
+                .expect("session")
+                .config
+                .enabled_server_tools
+                .contains(&ServerTool::WebSearch)
+        );
+
+        app.composer = "/pl".to_string();
+        app.on_composer_changed();
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.composer, "/plan ");
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn slash_palette_escape_dismisses_without_stealing_normal_navigation() {
+        use crossterm::event::{KeyCode, KeyEvent};
+
+        let mut app = test_app();
+        app.composer = "/".to_string();
+        app.on_composer_changed();
+        let narrow = buffer_frame(&app, 10, 8);
+        assert_eq!(narrow.lines().count(), 8, "{narrow}");
+
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.slash_selection.is_none());
+        assert!(!buffer_frame(&app, 80, 24).contains("/ FORGE DECK ·"));
+        app.on_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.scroll, 1);
+
+        app.on_key(KeyEvent::from(KeyCode::Char('h')));
+        assert!(
+            app.slash_selection.is_some(),
+            "typing should reopen results"
+        );
+        assert!(buffer_frame(&app, 80, 24).contains("/help"));
+    }
+
+    #[test]
+    fn tools_command_is_an_immediate_local_capability_deck() {
+        let mut app = test_app();
+        app.handle_slash("tools");
+        let frame = buffer_frame(&app, 100, 32);
+        assert!(frame.contains("LOCAL CAPABILITIES"), "{frame}");
+        assert!(frame.contains("read · write · edit · list · glob · grep · shell"));
+        assert!(frame.contains("git status · git diff · spawn task"));
+        assert!(frame.contains("xAI-HOSTED TOOLS"));
+    }
+
+    #[test]
+    fn idle_exit_aliases_and_empty_ctrl_d_quit_locally() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for alias in ["exit", "QUIT", "  Exit  ", "e\u{202e}xit"] {
+            let mut app = test_app();
+            app.composer = alias.to_string();
+            app.submit();
+            assert_eq!(app.shutdown, super::ShutdownState::Ready, "{alias}");
+            assert!(app.transcript.is_empty(), "{alias} reached the transcript");
+        }
+
+        let mut app = test_app();
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.shutdown, super::ShutdownState::Ready);
+
+        let mut app = test_app();
+        app.composer = "keep this draft".to_string();
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.shutdown, super::ShutdownState::Active);
+        assert_eq!(app.composer, "keep this draft");
+    }
+
+    #[test]
+    fn project_command_summaries_cannot_inject_terminal_controls() {
+        let command = grokforge_core::commands::CommandDoc {
+            name: "review".to_string(),
+            path: PathBuf::from("review.md"),
+            template: "\u{1b}[31mReview \u{202e}hidden\nsecond line".to_string(),
+        };
+        let description = super::project_command_description(&command);
+        assert!(description.contains("Review hidden"), "{description}");
+        assert!(!description.contains('\u{1b}'));
+        assert!(!description.contains('\u{202e}'));
+        assert!(!description.contains('\n'));
+    }
+
+    #[test]
     fn common_tool_calls_are_humanized_without_leaking_payloads() {
         assert_eq!(
             super::humanize_tool_call("read_file", "{\"path\":\"src/lib.rs\"}"),
@@ -2872,9 +3721,9 @@ mod tests {
         let app = test_app();
         let text = buffer_text(&app, 80, 24);
         assert!(text.contains("GROKFORGE"));
-        assert!(text.contains("READY TO FORGE"));
+        assert!(text.contains("FORGE CORE / READY"));
         assert!(text.contains("grok-build-0.1"));
-        assert!(text.contains("Ask Grok"));
+        assert!(text.contains("/ opens tools + commands"));
     }
 
     #[test]
@@ -2889,13 +3738,29 @@ mod tests {
     }
 
     #[test]
+    fn assistant_markdown_renders_as_terminal_ui_instead_of_raw_source() {
+        let mut app = test_app();
+        app.transcript.push(Entry::Assistant(
+            "### Core **tools**\n\n| Tool | Purpose |\n| --- | --- |\n| `read` | Read **files** |"
+                .to_string(),
+        ));
+        let frame = buffer_frame(&app, 100, 32);
+        assert!(frame.contains("· Core tools"), "{frame}");
+        assert!(frame.contains("Tool  │  Purpose"), "{frame}");
+        assert!(frame.contains("read  │  Read files"), "{frame}");
+        assert!(!frame.contains("###"), "{frame}");
+        assert!(!frame.contains("**"), "{frame}");
+        assert!(!frame.contains("| ---"), "{frame}");
+    }
+
+    #[test]
     fn protocol_activity_is_visible_in_transcript_and_status() {
         let mut app = test_app();
         app.running = true;
         app.on_agent_event(EventMsg::ReasoningDelta {
             delta: "Checking the retry path before editing.".to_string(),
         });
-        assert!(buffer_text(&app, 100, 24).contains("THINKING"));
+        assert!(buffer_text(&app, 100, 24).contains("TRACE"));
 
         app.on_agent_event(EventMsg::ToolCallBegin {
             call_id: grokforge_protocol::ToolCallId::new(),
@@ -2931,7 +3796,7 @@ mod tests {
         });
 
         let frame = buffer_frame(&app, 168, 40);
-        assert!(frame.contains("◇  THINKING"));
+        assert!(frame.contains("◇  TRACE"));
         assert!(frame.contains("⚙  shell  ● sandboxed  $ cargo test retry"));
         assert!(frame.contains("BLOCKED network"));
         assert!(frame.contains("↻  RETRY  attempt 2"));
@@ -2974,23 +3839,29 @@ mod tests {
         use tokio::sync::oneshot;
 
         for width in [12, 20, 30] {
-            let mut app = test_app();
-            let (respond, _wait) = oneshot::channel();
-            app.pending = Some(crate::approver::PendingApproval {
-                request: ApprovalRequest {
-                    id: ApprovalId::new(),
-                    call_id: None,
-                    kind: ApprovalKind::WriteFile {
-                        path: "/tmp/x".into(),
+            for height in 1..=8 {
+                let mut app = test_app();
+                let (respond, _wait) = oneshot::channel();
+                app.pending = Some(crate::approver::PendingApproval {
+                    request: ApprovalRequest {
+                        id: ApprovalId::new(),
+                        call_id: None,
+                        kind: ApprovalKind::WriteFile {
+                            path: "/tmp/x".into(),
+                        },
+                        reason: "write a file".to_string(),
                     },
-                    reason: "write a file".to_string(),
-                },
-                respond,
-            });
-            app.approval_detail = Some(ApprovalDetail::new("request: write /tmp/x".to_string()));
-            let frame = buffer_frame(&app, width, 8);
-            assert!(frame.contains("Esc deny"), "{width}-column frame:\n{frame}");
-            assert_eq!(frame.lines().count(), 8);
+                    respond,
+                });
+                app.approval_detail =
+                    Some(ApprovalDetail::new("request: write /tmp/x".to_string()));
+                let frame = buffer_frame(&app, width, height);
+                assert!(
+                    frame.contains("Esc deny"),
+                    "{width}×{height} frame:\n{frame}"
+                );
+                assert_eq!(frame.lines().count(), usize::from(height));
+            }
         }
     }
 
@@ -3235,6 +4106,7 @@ mod tests {
         let mut app = test_app();
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+        app.on_key(KeyEvent::new(KeyCode::Char('\u{202e}'), KeyModifiers::NONE));
         assert!(app.composer.is_empty());
 
         app.on_paste(&format!(
@@ -3244,6 +4116,24 @@ mod tests {
         assert_eq!(app.composer.len(), MAX_COMPOSER_BYTES);
         assert!(!app.composer.contains('\u{1b}'));
         assert!(!app.composer.contains('\u{202e}'));
+
+        let mut drafting = test_app();
+        drafting.running = true;
+        drafting.on_paste("queue this next prompt");
+        assert_eq!(drafting.composer, "queue this next prompt");
+    }
+
+    #[test]
+    fn full_composer_drafts_keep_the_cursor_inside_the_viewport() {
+        for width in [1, 2, 8, 10, 16, 40, 80] {
+            let mut app = test_app();
+            app.composer = "x".repeat(1_024);
+            let mut terminal = Terminal::new(TestBackend::new(width, 8)).expect("terminal");
+            terminal.draw(|frame| app.render(frame)).expect("draw");
+            let cursor = terminal.get_cursor_position().expect("cursor position");
+            assert!(cursor.x < width, "{width}-column cursor: {cursor:?}");
+            assert!(cursor.y < 8, "{width}-column cursor: {cursor:?}");
+        }
     }
 
     #[tokio::test]
