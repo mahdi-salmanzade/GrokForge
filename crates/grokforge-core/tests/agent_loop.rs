@@ -130,6 +130,9 @@ fn parallel_tool_calls_then_done() -> Reply {
 }
 
 /// A single response that asks to spawn two subagents at once (exercises the parallel batch path).
+/// Only used by the Unix-gated multi-subagent test (subagents need a git worktree), so gate it too
+/// to avoid a `dead_code` error on Windows.
+#[cfg(unix)]
 fn two_spawn_tasks() -> Reply {
     Reply::sse_events(&[
         json!({
