@@ -61,9 +61,12 @@ directories = "5"
 keyring = "3"
 rpassword = "7"
 
-# --- crypto (PKCE for xAI OAuth) ---
+# --- crypto (PKCE for xAI OAuth; password-encrypted credential file) ---
 sha2 = "0.10"
 base64 = "0.22"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
 
 # --- ids / time ---
 uuid = { version = "1", features = ["v4", "serde"] }

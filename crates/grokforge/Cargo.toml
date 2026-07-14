@@ -27,19 +27,16 @@ grokforge-tui = { workspace = true }
 grokforge-xai = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 rpassword = { workspace = true }
-
-# Keyring platform backends are opt-in in keyring 3.x; gate per-OS so each target only pulls
-# the backend it can build (macOS Keychain / Windows Credential Manager / Linux Secret Service).
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { workspace = true, features = ["apple-native"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-keyring = { workspace = true, features = ["windows-native"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { workspace = true, features = ["sync-secret-service"] }
+directories = { workspace = true }
+# Credentials are kept in a password-encrypted file on the host (no OS keychain):
+# Argon2 derives the key from the password + a random salt, ChaCha20-Poly1305 encrypts.
+argon2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+base64 = { workspace = true }
+getrandom = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -8,8 +8,10 @@ limits are.
 
 The built-in model client sends requests only to the API endpoint you configure with
 `XAI_BASE_URL` (default `https://api.x.ai`). GrokForge has no telemetry code path. You provide the
-API key with `XAI_API_KEY`, stores an API key in the OS keychain, or obtains a subscription token
-through the browser-based OAuth flow.
+API key with `XAI_API_KEY`, or store an API key / subscription OAuth tokens in a password-encrypted
+file at `~/.grokforge/credentials.enc` (Argon2id key derivation from your password plus a random
+salt, sealed with ChaCha20-Poly1305, `0600` permissions). GrokForge does **not** use the OS keychain
+or any system secret store.
 
 Each first-party model request body is assembled through the context-ledger path. The ledger
 reconciles its source entries to the byte length of the exact serialized JSON body and records

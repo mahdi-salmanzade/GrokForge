@@ -53,20 +53,20 @@ Just run it — GrokForge sets up credentials on first launch:
 ./target/release/grokforge
 ```
 
-If you're not signed in yet, it asks how you want to connect:
+On first launch it asks you to **set a password**, then how you want to connect:
 
 - **[1] Your Grok subscription** (SuperGrok / X Premium+) — signs in through your browser (OAuth); usage bills against your subscription, no API key needed. *xAI currently limits subscription API access to the SuperGrok **Heavy** tier; other tiers may get a 403 until xAI lifts that.*
 - **[2] An xAI API key** — paste a key from [console.x.ai](https://console.x.ai) (pay-as-you-go; new developer accounts also get free monthly credits via the data-sharing program).
 
-Either choice is saved to your OS keychain, so it's a one-time step. You can also set things up ahead of time:
+Your credentials are then encrypted with your password (Argon2id + ChaCha20-Poly1305) and written to `~/.grokforge/credentials.enc` — **nothing is stored in the OS keychain or any system secret store**. On later runs you enter the password to unlock. You can also set things up ahead of time:
 
 ```sh
-grokforge login                 # store an xAI API key in the OS keychain
+grokforge login                 # store an xAI API key (password-encrypted on disk)
 grokforge login --subscription  # sign in with your SuperGrok / X Premium+ subscription
-export XAI_API_KEY=your_key     # or just use an environment variable (best for CI)
+export XAI_API_KEY=your_key     # or just use an environment variable (best for CI, no password)
 ```
 
-Resolution order is env var → stored API key → subscription token → interactive prompt. Run `grokforge doctor` to see which credential is active and whether the sandbox is enforced.
+Resolution order is `XAI_API_KEY` env → the encrypted file (unlocked with your password) → interactive setup. Run `grokforge doctor` to see which credential is active and whether the sandbox is enforced.
 
 Run one task without opening the TUI:
 
