@@ -3,6 +3,7 @@
 //! Default invocation launches the interactive TUI (M3). `exec` runs headless (M2).
 //! The other subcommands are scaffolded here and implemented at their milestones.
 
+mod acp;
 mod credentials;
 mod debug;
 mod doctor;
@@ -87,6 +88,9 @@ enum Command {
     },
     /// Report toolchain, sandbox capability, and configuration health.
     Doctor,
+    /// Run as an ACP (Agent Client Protocol) agent over stdio, for editor embedding (Zed, etc.).
+    /// Requires `XAI_API_KEY` in the environment (stdin is the protocol channel).
+    Acp,
     /// Print the shell completion script.
     Completions {
         /// Target shell (bash, zsh, fish, powershell).
@@ -272,6 +276,7 @@ async fn main() -> std::process::ExitCode {
             .await
         }
         Some(Command::Doctor) => doctor::run(),
+        Some(Command::Acp) => acp::run(cli.trust_project_mcp).await,
         Some(Command::Resume { id }) => sessions::resume(id, cli.trust_project_mcp).await,
         Some(Command::Sessions) => sessions::list().await,
         Some(Command::Login { subscription }) => {

@@ -64,6 +64,8 @@ GrokForge is better when control matters:
 - Read-only plan mode
 - Persistent sessions with resume support
 - Parallel subagents (up to 32 per turn) in isolated worktrees with scoped commits, shown live in a "PARALLEL AGENTS" panel
+- `@`-mention file/folder attachments and agent-managed persistent memory (`.grokforge/memory/`)
+- Editor embedding over ACP (Agent Client Protocol) via `grokforge acp` — Zed and other ACP clients
 - A context ledger that accounts for the request body sent to Grok
 - Secret redaction, bounded output, and no telemetry
 

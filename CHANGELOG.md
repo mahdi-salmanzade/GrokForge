@@ -7,6 +7,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- ACP (Agent Client Protocol) support via `grokforge acp`, so editors like Zed can embed GrokForge
+  as an agent. It speaks JSON-RPC 2.0 over newline-delimited stdio as an additive frontend over the
+  same `Op`/`Event` seam the headless frontend uses (fulfilling ADR 0005's hedge — no core
+  changes). Protocol version 1: `initialize`, `session/new`, `session/prompt` with streaming
+  `session/update` notifications and a `stopReason` response, `session/cancel`, and
+  `session/request_permission` bridged from the approval engine so the editor gates
+  boundary-crossing actions. Credentials come from `XAI_API_KEY` (stdin is the protocol channel);
+  session persistence, `session/load`, and client `fs`/`terminal` calls are deferred.
 - `@`-mention file and folder attachments. Typing `@path` in a prompt inlines that file (or the
   files under that folder) into the message as bounded `<attachment>` blocks, so it flows through
   the same redaction, ledger, and context-budget path as any other input — attaching a huge folder

@@ -1,7 +1,19 @@
 # ADR 0005 — ACP (editor embedding) is deferred; the protocol crate is the hedge
 
-- Status: accepted
+- Status: accepted (v0.1) — **superseded 2026-07-14: ACP v1 has since shipped**
 - Date: 2026-07-12
+
+## Update (2026-07-14)
+
+The hedge paid off exactly as designed. `grokforge acp` now runs an ACP agent server over
+newline-delimited JSON-RPC 2.0 on stdio as an **additive frontend** (`crates/grokforge/src/acp.rs`)
+over the same `Op`/`Event` seam the headless frontend uses — no core changes were required.
+Implemented for protocol version 1: `initialize`, `session/new`, `session/prompt` (streaming
+`session/update` notifications + a `stopReason` response), `session/cancel`, and
+`session/request_permission` bridged from the core approval engine (a custom `Approver` forwards
+each request to the editor). Deferred within ACP: session persistence/`session/load`, client
+`fs`/`terminal` calls, and image/audio prompt content. Credentials come from `XAI_API_KEY` because
+stdin is the protocol channel. The original decision below is retained as the historical record.
 
 ## Context
 
