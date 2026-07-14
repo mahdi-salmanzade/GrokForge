@@ -11,6 +11,7 @@
 
 pub mod agents_md;
 pub mod approvals;
+pub mod attach;
 mod cancellation;
 pub mod commands;
 pub mod compaction;

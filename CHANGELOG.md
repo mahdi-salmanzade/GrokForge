@@ -7,6 +7,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `@`-mention file and folder attachments. Typing `@path` in a prompt inlines that file (or the
+  files under that folder) into the message as bounded `<attachment>` blocks, so it flows through
+  the same redaction, ledger, and context-budget path as any other input — attaching a huge folder
+  can no longer blow the prompt limit. Reads reuse the descriptor-relative, no-follow workspace
+  reader (an `@path` cannot follow a symlink out of the workspace) and skip common secret files by
+  default. The TUI adds an interactive fuzzy picker: type `@`, arrow-select a `.gitignore`-aware
+  path suggestion, and Tab/Enter inserts it. `@`-expansion works in headless `exec` too.
 - Agent-managed persistent memory under `.grokforge/memory/`. A new `remember` tool lets Grok save
   durable facts, preferences, and project conventions across sessions; notes without a topic go to
   the `MEMORY.md` index, and topic notes go to a slugged `<topic>.md` file linked from the index.

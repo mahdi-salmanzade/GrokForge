@@ -47,6 +47,8 @@ const REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 const MAX_AGENT_LANES: usize = 64;
 /// Most lanes rendered in the parallel-agents panel before collapsing the rest into a "+N more".
 const MAX_AGENT_PANEL_ROWS: u16 = 12;
+/// Path suggestions shown in the `@`-attach picker.
+const AT_PICKER_LIMIT: usize = 8;
 
 // GrokForge's UI palette. Explicit colors make the product identity consistent across terminal
 // themes; every foreground/background pair is intentionally high-contrast. The interface still
@@ -357,6 +359,12 @@ pub struct App {
     agents: Vec<AgentLane>,
     /// Monotonic redraw tick used to animate the agent spinners.
     frame: u64,
+    /// Workspace root, retained so the `@`-attach picker works even while a turn holds the session.
+    workspace_root: std::path::PathBuf,
+    /// Selected row in the `@`-attach picker (`None` when the picker is dismissed/inactive).
+    at_selection: Option<usize>,
+    /// Cached path suggestions for the current `@`-mention query.
+    at_matches: Vec<String>,
 
     // The channel stays open for the app's lifetime because `agent` (Arc) holds the sender.
     events_rx: mpsc::UnboundedReceiver<EventMsg>,
@@ -398,6 +406,7 @@ impl App {
         status_preset: String,
     ) -> Self {
         let resumed = session.history.len();
+        let workspace_root = session.config.workspace_root.clone();
         let available_skills = skills::discover(&session.config.workspace_root);
         let project_commands = commands::discover(&session.config.workspace_root);
         let mut transcript = Vec::new();
@@ -443,6 +452,9 @@ impl App {
             display_mode: DisplayMode::from_environment(),
             agents: Vec::new(),
             frame: 0,
+            workspace_root,
+            at_selection: None,
+            at_matches: Vec::new(),
             events_rx,
             approvals_rx,
             turn_handle: None,
@@ -598,6 +610,9 @@ impl App {
         if self.on_slash_palette_key(key) {
             return;
         }
+        if self.on_at_palette_key(key) {
+            return;
+        }
 
         match key.code {
             KeyCode::Enter => self.submit(),
@@ -705,6 +720,85 @@ impl App {
 
     fn on_composer_changed(&mut self) {
         self.slash_selection = Some(0);
+        self.refresh_at_state();
+    }
+
+    /// The active `@`-mention query (the text after a trailing `@word`), or `None` when the
+    /// composer is not currently typing a mention. Slash commands take precedence.
+    fn at_query(&self) -> Option<String> {
+        if self.composer.starts_with('/') || self.composer.ends_with(char::is_whitespace) {
+            return None;
+        }
+        let last = self.composer.split_whitespace().next_back()?;
+        let rest = last.strip_prefix('@')?;
+        if rest.contains('@') {
+            return None;
+        }
+        Some(rest.to_string())
+    }
+
+    /// Recompute the `@`-attach suggestions for the current composer state.
+    fn refresh_at_state(&mut self) {
+        if let Some(query) = self.at_query() {
+            self.at_matches =
+                grokforge_core::attach::search_paths(&self.workspace_root, &query, AT_PICKER_LIMIT);
+            self.at_selection = if self.at_matches.is_empty() {
+                None
+            } else {
+                Some(0)
+            };
+        } else {
+            self.at_matches.clear();
+            self.at_selection = None;
+        }
+    }
+
+    /// Handle keys while the `@`-attach picker is visible. Returns whether the key was consumed.
+    fn on_at_palette_key(&mut self, key: KeyEvent) -> bool {
+        let Some(selection) = self.at_selection else {
+            return false;
+        };
+        if self.at_matches.is_empty() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.at_selection = None;
+                true
+            }
+            KeyCode::Up => {
+                let len = self.at_matches.len();
+                self.at_selection = Some(if selection == 0 {
+                    len - 1
+                } else {
+                    selection - 1
+                });
+                true
+            }
+            KeyCode::Down => {
+                self.at_selection = Some((selection + 1) % self.at_matches.len());
+                true
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                let path = self.at_matches[selection.min(self.at_matches.len() - 1)].clone();
+                self.complete_at_item(&path);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Replace the trailing `@query` with the chosen path and commit it with a trailing space,
+    /// which closes the picker so the next Enter submits.
+    fn complete_at_item(&mut self, path: &str) {
+        if let Some(at) = self.composer.rfind('@') {
+            self.composer.truncate(at);
+        }
+        let addition = format!("@{path} ");
+        if self.composer.len().saturating_add(addition.len()) <= MAX_COMPOSER_BYTES {
+            self.composer.push_str(&addition);
+        }
+        self.on_composer_changed();
     }
 
     fn on_paste(&mut self, value: &str) {
@@ -1483,6 +1577,7 @@ impl App {
         self.render_composer(chunks[2], f);
         self.render_status(chunks[3], f);
         self.render_slash_palette(chunks[1], f);
+        self.render_at_palette(chunks[1], f);
 
         if let (Some(pending), Some(detail)) = (&self.pending, &self.approval_detail) {
             render_approval_modal(area, f, pending, detail);
@@ -2012,6 +2107,73 @@ impl App {
             let y = area.y.saturating_add(u16::from(!compact));
             f.set_cursor_position((x, y.min(area.bottom().saturating_sub(1))));
         }
+    }
+
+    /// Render the `@`-attach path picker as a popup at the bottom of `area`, listing the current
+    /// fuzzy suggestions with the selection highlighted.
+    fn render_at_palette(&self, area: Rect, f: &mut ratatui::Frame) {
+        if self.pending.is_some() || area.width < 12 || area.height < 3 {
+            return;
+        }
+        let Some(selection) = self.at_selection else {
+            return;
+        };
+        if self.at_matches.is_empty() || self.at_query().is_none() {
+            return;
+        }
+        let selected = selection.min(self.at_matches.len() - 1);
+        let inset = if area.width >= 40 { 4 } else { 0 };
+        let width = area.width.saturating_sub(inset).clamp(1, 72);
+        let rows = self
+            .at_matches
+            .len()
+            .min(AT_PICKER_LIMIT)
+            .min(usize::from(area.height.saturating_sub(2)).max(1));
+        let height = u16::try_from(rows)
+            .unwrap_or(1)
+            .saturating_add(2)
+            .min(area.height);
+        let palette_area = Rect::new(
+            area.x.saturating_add(inset),
+            area.bottom().saturating_sub(height),
+            width,
+            height,
+        );
+        let start = selected
+            .saturating_add(1)
+            .saturating_sub(rows)
+            .min(self.at_matches.len().saturating_sub(rows));
+        let inner_width = usize::from(width.saturating_sub(2));
+        let lines = self.at_matches[start..start + rows]
+            .iter()
+            .enumerate()
+            .map(|(offset, path)| {
+                let chosen = start + offset == selected;
+                let marker = if chosen { "▸ " } else { "  " };
+                let text = pad_or_truncate(path, inner_width.saturating_sub(2));
+                Line::from(vec![
+                    Span::styled(
+                        marker.to_string(),
+                        Style::default().fg(if chosen { ACCENT } else { FAINT }),
+                    ),
+                    Span::styled(text, Style::default().fg(if chosen { TEXT } else { MUTED })),
+                ])
+            })
+            .collect::<Vec<_>>();
+
+        f.render_widget(Clear, palette_area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .title(Span::styled(
+                " @ ATTACH · ↑↓ · TAB/ENTER · ESC ",
+                Style::default().fg(ACCENT),
+            ))
+            .style(Style::default().bg(SURFACE).fg(TEXT));
+        let inner = block.inner(palette_area);
+        f.render_widget(block, palette_area);
+        f.render_widget(Paragraph::new(lines), inner);
     }
 
     fn render_slash_palette(&self, area: Rect, f: &mut ratatui::Frame) {

@@ -468,14 +468,26 @@ impl Agent {
             return stop;
         }
 
+        // Expand `@path` file/folder mentions into inline, bounded, workspace-confined attachment
+        // blocks before the message enters the transcript, so they flow through the same
+        // redaction, ledger, and context-budget path as any other user input. File I/O runs off
+        // the async runtime.
+        let expanded = {
+            let workspace_root = session.config.workspace_root.clone();
+            let raw = user_text.to_string();
+            tokio::task::spawn_blocking(move || crate::attach::expand(&workspace_root, &raw))
+                .await
+                .unwrap_or_else(|_| user_text.to_string())
+        };
+
         // In plan mode, instruct the model not to change anything.
         let effective_text = if plan {
             format!(
                 "[PLAN MODE — do not modify files or run mutating commands; produce a concise, \
-                 numbered plan for the following task]\n\n{user_text}"
+                 numbered plan for the following task]\n\n{expanded}"
             )
         } else {
-            user_text.to_string()
+            expanded
         };
         if effective_text.len() > MAX_USER_TEXT_BYTES {
             let stop = StopReason::Error;
