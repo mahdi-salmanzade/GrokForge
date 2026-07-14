@@ -691,6 +691,45 @@ async fn subagent_runs_in_an_isolated_worktree_branch() {
     assert!(has_subagent_result, "parent should see the subagent result");
 }
 
+#[tokio::test]
+async fn oversized_request_fails_with_a_budget_error_not_a_provider_400() {
+    let workspace = tempfile::tempdir().unwrap();
+    // No routes are registered: the budget guard must stop the turn before any request is sent,
+    // so the mock is never contacted.
+    let mock = MockXai::builder().start().await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let agent = agent_for(&mock, tx);
+    let mut config = SessionConfig::new(workspace.path().to_path_buf(), "grok-build-0.1")
+        .with_policy(
+            grokforge_protocol::ApprovalPolicy::Never,
+            SandboxMode::DangerFullAccess,
+        );
+    // One token over the output reserve → a ~0-byte input budget, so even the base request (system
+    // prompt + the user message) exceeds it and the guard fires immediately.
+    config.context_window_tokens = Some(16_385);
+    let mut session = Session::new(config);
+
+    let stop = agent.run_turn(&mut session, "hello", &mut None).await;
+
+    assert_eq!(stop, StopReason::Error);
+    let mut saw_budget_error = false;
+    while let Ok(ev) = rx.try_recv() {
+        if let EventMsg::Error {
+            message,
+            recoverable,
+        } = ev
+            && message.contains("input budget")
+        {
+            assert!(!recoverable, "the budget error is terminal for this turn");
+            saw_budget_error = true;
+        }
+    }
+    assert!(
+        saw_budget_error,
+        "an over-budget request should surface an actionable budget error, not be sent and 400"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn spawns_multiple_subagents_in_parallel() {

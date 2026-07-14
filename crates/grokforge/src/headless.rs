@@ -152,6 +152,9 @@ pub async fn run(args: ExecArgs) -> ExitCode {
     if let Err(code) = crate::validate_model_startup(&client, &model).await {
         return code;
     }
+    // Best-effort: bound the request to the model's real context window (captured before `model`
+    // is moved into the config); falls back to a conservative default when unavailable.
+    let context_window_tokens = client.model_context_window(&model).await;
     let approver: Arc<AutoApprover> = if args.preset == "yolo" {
         Arc::new(AutoApprover::yolo())
     } else {
@@ -164,6 +167,7 @@ pub async fn run(args: ExecArgs) -> ExitCode {
     }
     config.max_iterations = args.max_iterations;
     config.effort = effort;
+    config.context_window_tokens = context_window_tokens;
     if args.web_search {
         config.enabled_server_tools.insert(ServerTool::WebSearch);
     }

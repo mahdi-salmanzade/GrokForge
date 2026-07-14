@@ -32,9 +32,12 @@ pub async fn launch(trust_project_mcp: bool) -> ExitCode {
         return code;
     }
 
-    let config = SessionConfig::new(workspace, model)
+    let mut config = SessionConfig::new(workspace, model)
         // Default `auto` preset: workspace-write, ask before exceeding the sandbox.
         .with_policy(ApprovalPolicy::OnRequest, SandboxMode::WorkspaceWrite);
+    // Best-effort: bound the request to the model's real context window so a long session cannot
+    // exceed the prompt-token limit (falls back to a conservative default when unavailable).
+    config.context_window_tokens = client.model_context_window(model).await;
 
     match grokforge_tui::run(client, config, "auto".to_string(), trust_project_mcp).await {
         Ok(()) => ExitCode::SUCCESS,

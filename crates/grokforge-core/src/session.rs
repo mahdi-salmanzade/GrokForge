@@ -43,7 +43,21 @@ pub struct SessionConfig {
     pub compaction_keep_tail: usize,
     /// Whether to auto-compact at turn end.
     pub auto_compact: bool,
+    /// The model's advertised context window in tokens (from `GET /v1/models`), when known. Used
+    /// to bound the assembled request so it never exceeds the provider's hard prompt-length limit.
+    /// `None` falls back to a conservative default that is safe for every current model.
+    pub context_window_tokens: Option<u64>,
 }
+
+/// Conservative bytes-per-token estimate. Real text is ~3.3–4.0 bytes/token; deliberately
+/// under-estimating means a given byte budget maps to *fewer* tokens, keeping the request safely
+/// under the model's token limit rather than risking a hard 400.
+const BYTES_PER_TOKEN: usize = 3;
+/// Tokens reserved for the model's response so the input budget still leaves room to answer.
+const OUTPUT_RESERVE_TOKENS: u64 = 16_384;
+/// Fallback context window when the model's real window is unknown. Matches the smallest common
+/// Grok context, so it is safe (never over-large) for every model.
+const FALLBACK_CONTEXT_TOKENS: u64 = 256_000;
 
 impl SessionConfig {
     /// A config for `workspace_root` and `model` with sensible defaults.
@@ -65,7 +79,23 @@ impl SessionConfig {
             compaction_trigger_bytes: 400_000,
             compaction_keep_tail: 8,
             auto_compact: true,
+            context_window_tokens: None,
         }
+    }
+
+    /// The maximum assembled-request size, in bytes, that stays under the model's input-token
+    /// budget: the context window minus a response reserve, at a conservative bytes/token ratio.
+    /// The whole serialized request body (system prompt, auto-context, tool defs, and history) is
+    /// held under this so the provider never rejects the turn with a prompt-too-long 400.
+    #[must_use]
+    pub fn input_budget_bytes(&self) -> usize {
+        let window = self
+            .context_window_tokens
+            .unwrap_or(FALLBACK_CONTEXT_TOKENS);
+        let input_tokens = window.saturating_sub(OUTPUT_RESERVE_TOKENS);
+        usize::try_from(input_tokens)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(BYTES_PER_TOKEN)
     }
 
     #[must_use]
@@ -137,6 +167,20 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_budget_falls_back_and_scales_with_the_context_window() {
+        let mut config = SessionConfig::new(PathBuf::from("/tmp"), "m");
+        // Unknown window → a non-zero conservative budget.
+        let fallback = config.input_budget_bytes();
+        assert!(fallback > 0);
+        // A larger advertised window yields a larger budget.
+        config.context_window_tokens = Some(1_000_000);
+        assert!(config.input_budget_bytes() > fallback);
+        // A window at or below the output reserve clamps to zero rather than underflowing.
+        config.context_window_tokens = Some(1);
+        assert_eq!(config.input_budget_bytes(), 0);
+    }
 
     #[test]
     fn resume_constructor_preserves_session_id() {

@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Bounded the assembled request to the model's real context window so a long session no longer
+  overruns the provider's prompt-token limit and fails the whole turn with a hard `400`. The
+  compaction trigger is now capped at an absolute, model-derived ceiling (the previous
+  `baseline + trigger` threshold grew every compaction, letting history creep past the limit), and
+  a pre-send guard checks the exact serialized body size: if it still exceeds the budget it forces
+  one compaction and, failing that, stops with an actionable message instead of a raw provider
+  error. The budget uses the model's advertised context window from `GET /v1/models` (with a
+  conservative fallback) at a deliberately low bytes-per-token ratio for headroom.
+
 ## [0.2.0] - 2026-07-14
 
 ### Changed

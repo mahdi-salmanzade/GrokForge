@@ -250,6 +250,20 @@ impl XaiClient {
         }
     }
 
+    /// Best-effort lookup of a model's advertised context window (in tokens) from
+    /// `GET /v1/models`. Returns `None` on any error, or when the endpoint does not advertise a
+    /// window, so callers can fall back to a conservative default. Used to bound the assembled
+    /// request so it stays under the model's hard prompt-length limit.
+    pub async fn model_context_window(&self, model: &str) -> Option<u64> {
+        let available = self.list_models().await.ok()?;
+        available
+            .into_iter()
+            .find(|candidate| {
+                candidate.id == model || candidate.aliases.iter().any(|id| id == model)
+            })
+            .and_then(|candidate| candidate.context_window)
+    }
+
     /// Serialize a request and return the body plus its exact byte length. Exposed so the
     /// context ledger can reconcile its per-source byte accounting against what is actually sent.
     pub fn serialize_request(req: &ResponsesRequest) -> Result<(Vec<u8>, usize), XaiError> {

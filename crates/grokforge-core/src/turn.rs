@@ -547,6 +547,11 @@ impl Agent {
         let mut auto_commit_has_exclusive_ownership = true;
         let mut compacted_baseline = None;
         let mut compaction_failed = false;
+        // The largest request body (in bytes) that stays under the model's prompt-token limit.
+        let budget = session.config.input_budget_bytes();
+        // Set while a single forced budget-recovery compaction is outstanding, so the guard cannot
+        // loop forever when the oversize content cannot be compacted away.
+        let mut budget_recovery_used = false;
         let mut stop = 'agent: loop {
             if cancellation.is_cancelled() {
                 break StopReason::Interrupted;
@@ -555,10 +560,19 @@ impl Agent {
             // 32 MiB cap. Compact before every request, including the first request of a resumed
             // oversized session, so compaction remains a recovery path rather than an end-turn
             // best effort.
-            let compaction_threshold = compacted_baseline.map_or(
-                session.config.compaction_trigger_bytes,
-                |baseline: usize| baseline.saturating_add(session.config.compaction_trigger_bytes),
-            );
+            // Reserve headroom inside the budget for non-history context (system prompt,
+            // AGENTS.md, skills, tool defs) so history alone never fills the whole window.
+            let history_ceiling = budget.saturating_sub(budget / 4).max(1);
+            let compaction_threshold = compacted_baseline
+                .map_or(
+                    session.config.compaction_trigger_bytes,
+                    |baseline: usize| {
+                        baseline.saturating_add(session.config.compaction_trigger_bytes)
+                    },
+                )
+                // The baseline-relative threshold otherwise grows every compaction; cap it at the
+                // model's absolute budget so a long session cannot creep past the token limit.
+                .min(history_ceiling);
             if session.config.auto_compact
                 && !compaction_failed
                 && compaction::should_compact(
@@ -587,9 +601,7 @@ impl Agent {
             }
             iteration += 1;
 
-            let Assembled {
-                request, ledger, ..
-            } = match context::assemble(session, &agents, &skills, tool_defs.clone()) {
+            let assembled = match context::assemble(session, &agents, &skills, tool_defs.clone()) {
                 Ok(a) => a,
                 Err(e) => {
                     self.emit(EventMsg::Error {
@@ -599,6 +611,47 @@ impl Agent {
                     break StopReason::Error;
                 }
             };
+
+            // Hard budget guard: never send a request that exceeds the model's input-token budget.
+            // The provider rejects an oversize prompt with a 400 that aborts the whole turn, so
+            // instead recover with one forced compaction; if it still does not fit, stop with an
+            // actionable message rather than a raw provider error.
+            if assembled.body_len > budget {
+                if session.config.auto_compact
+                    && !budget_recovery_used
+                    && !compaction_failed
+                    && session.history.len() > 1
+                {
+                    budget_recovery_used = true;
+                    if self
+                        .compact_inner(session, rollout.as_mut(), cancellation)
+                        .await
+                    {
+                        compacted_baseline = Some(compaction::estimate_bytes(&session.history));
+                    } else {
+                        compaction_failed = true;
+                    }
+                    if cancellation.is_cancelled() {
+                        break StopReason::Interrupted;
+                    }
+                    continue 'agent;
+                }
+                self.emit(EventMsg::Error {
+                    message: format!(
+                        "the request is about {} KB, over this model's ~{} KB input budget even after compaction — start a new session (/new) or remove large pasted or attached content",
+                        assembled.body_len / 1024,
+                        budget / 1024
+                    ),
+                    recoverable: false,
+                });
+                break StopReason::Error;
+            }
+            // The request fits; allow a fresh forced compaction if history grows again later.
+            budget_recovery_used = false;
+
+            let Assembled {
+                request, ledger, ..
+            } = assembled;
             for entry in ledger.entries {
                 self.emit(EventMsg::LedgerAppended(entry));
             }
@@ -1578,6 +1631,7 @@ impl Agent {
         sub_config.compaction_trigger_bytes = session.config.compaction_trigger_bytes;
         sub_config.compaction_keep_tail = session.config.compaction_keep_tail;
         sub_config.auto_compact = session.config.auto_compact;
+        sub_config.context_window_tokens = session.config.context_window_tokens;
         sub_config.network = session.config.network;
         // This dedicated worktree gives the subagent exclusive path ownership, which is the
         // precondition for race-safe auto-commit. Keep its default auto-commit enabled even
