@@ -238,7 +238,7 @@ async fn onboard(path: &std::path::Path) -> Option<String> {
     match save_to(path, &password, &creds) {
         Ok(()) => eprintln!("✓ credentials encrypted and saved to {}", path.display()),
         Err(e) => {
-            eprintln!("warning: couldn't save credentials ({e}); using for this session only")
+            eprintln!("warning: couldn't save credentials ({e}); using for this session only");
         }
     }
     Some(token)
