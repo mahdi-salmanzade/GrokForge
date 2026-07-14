@@ -48,10 +48,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replace the previous file instead of writing first and applying `0600` permissions afterward.
   Unsupported, malformed, oversized, or billing-ambiguous envelopes are rejected; Unix also
   rejects linked paths and files readable by group or other users. Argon2id parameters are pinned
-  for the v1 format, new passwords require at least 12 characters, and failure to discover the home
-  directory no longer falls back to writing in the current project. The native macOS/Linux sandbox
-  masks the file from model-run commands even in full-access mode. This closes the permission
-  window and blocks model-command reads of the encrypted secret.
+  for the v1 format, and failure to discover the home directory no longer falls back to writing in
+  the current project. The native macOS/Linux sandbox masks the file from model-run commands even
+  in full-access mode. This closes the permission window and blocks model-command reads of the
+  encrypted secret. GrokForge recommends longer passwords and warns below 12 characters, but
+  accepts any non-empty password instead of enforcing a minimum chosen on the user's behalf.
 - Made API-key and subscription logins mutually exclusive. Choosing one now clears the other, so a
   successful subscription sign-in cannot accidentally continue using and billing a previously
   stored API key. Refresh persistence failures are also surfaced instead of silently discarded.

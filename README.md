@@ -88,7 +88,9 @@ Just run it — GrokForge sets up credentials on the first interactive launch wh
 
 On that first launch:
 
-1. Set and confirm a GrokForge password of at least 12 characters.
+1. Set and confirm any non-empty GrokForge password. Short passwords are accepted with a warning;
+   longer passwords provide stronger protection against offline guessing if the encrypted file is
+   copied.
 2. Choose how you want to connect:
    - **[1] Your Grok subscription** (SuperGrok / X Premium+) — signs in through your browser
      (OAuth); usage bills against your subscription, no API key needed. *xAI currently limits

@@ -26,7 +26,7 @@ const CREDENTIAL_FILE_MAX_BYTES: usize = 64 * 1024;
 const ARGON2_MEMORY_KIB: u32 = 19_456;
 const ARGON2_ITERATIONS: u32 = 2;
 const ARGON2_PARALLELISM: u32 = 1;
-const MIN_NEW_PASSWORD_CHARS: usize = 12;
+const SHORT_PASSWORD_WARNING_CHARS: usize = 12;
 
 /// Credentials held in the encrypted file. New writes keep exactly one login method active, and
 /// ambiguous legacy files containing both are rejected instead of guessing which one to bill.
@@ -311,19 +311,20 @@ fn prompt_password(prompt: &str) -> Option<Zeroizing<String>> {
         .map(Zeroizing::new)
 }
 
-fn new_password_is_long_enough(password: &str) -> bool {
-    password.chars().count() >= MIN_NEW_PASSWORD_CHARS
+fn new_password_is_short(password: &str) -> bool {
+    password.chars().count() < SHORT_PASSWORD_WARNING_CHARS
 }
 
 fn prompt_new_password() -> Option<Zeroizing<String>> {
     eprintln!("Create a password to encrypt your credentials on this machine.");
     eprintln!(
-        "Use at least {MIN_NEW_PASSWORD_CHARS} characters. No recovery — if you forget it, you'll sign in again."
+        "Any non-empty password is accepted. Longer passwords are harder to guess if the encrypted file is copied."
     );
     let first = prompt_password("New password: ")?;
-    if !new_password_is_long_enough(&first) {
-        eprintln!("password must be at least {MIN_NEW_PASSWORD_CHARS} characters.");
-        return None;
+    if new_password_is_short(&first) {
+        eprintln!(
+            "warning: passwords shorter than {SHORT_PASSWORD_WARNING_CHARS} characters are easier to guess; continuing with your choice."
+        );
     }
     let confirm = prompt_password("Confirm password: ")?;
     if first.as_str() != confirm.as_str() {
@@ -685,9 +686,9 @@ mod tests {
     }
 
     #[test]
-    fn new_password_minimum_is_long_enough_for_offline_storage() {
-        assert!(!new_password_is_long_enough("short"));
-        assert!(new_password_is_long_enough("correct horse"));
+    fn short_passwords_warn_but_are_not_a_validation_boundary() {
+        assert!(new_password_is_short("1234"));
+        assert!(!new_password_is_short("correct horse"));
     }
 
     #[test]
