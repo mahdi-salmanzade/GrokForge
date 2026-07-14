@@ -2,6 +2,7 @@
   <img src="assets/grokforge.svg" alt="GrokForge" width="96" height="96" />
   <h1>GrokForge</h1>
   <p><strong>Make Grok great in the terminal.</strong></p>
+  <img src="assets/terminal.png" alt="GrokForge running in the terminal" width="820" />
 </div>
 
 GrokForge exists because using Grok from a terminal should feel like a serious development tool, not a chat window wired to `sh`.
