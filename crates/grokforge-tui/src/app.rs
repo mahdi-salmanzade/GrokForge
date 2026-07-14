@@ -610,8 +610,9 @@ impl App {
         while self.shutdown != ShutdownState::Ready {
             tokio::select! {
                 _ = redraw.tick() => {
-                    // Keep animating the parallel-agents spinners while any lane is still running.
-                    if self.has_running_agents() {
+                    // Animate the working braille wheel while a turn is in flight, and the
+                    // parallel-agents spinners while any lane is still running.
+                    if self.running || self.has_running_agents() {
                         self.frame = self.frame.wrapping_add(1);
                         redraw_needed = true;
                     }
@@ -2124,19 +2125,35 @@ impl App {
     }
 
     fn activity_state(&self) -> (String, Color) {
+        // Animated braille wheel while GrokForge is actually working (tool / reasoning / turn).
+        let spin = self.working_spinner();
         if self.pending.is_some() {
             ("● APPROVAL".to_string(), WARNING)
         } else if let Some(attempt) = self.stream_retry {
             (format!("↻ RETRY {attempt}"), WARNING)
         } else if let Some(tool) = &self.active_tool {
-            (format!("● {}", compact_preview(tool, 18)), TOOL)
+            (format!("{spin} {}", compact_preview(tool, 18)), TOOL)
         } else if self.reasoning.is_some() {
-            ("◇ TRACING".to_string(), MUTED)
+            (format!("{spin} TRACING"), MUTED)
         } else if self.running {
-            ("● WORKING".to_string(), ACCENT)
+            (format!("{spin} WORKING"), ACCENT)
         } else {
             ("● READY".to_string(), SUCCESS)
         }
+    }
+
+    /// The current frame of the "working" braille wheel (animated by the redraw tick while a turn
+    /// is in flight). Falls back to an ASCII spinner where the palette can't render braille.
+    fn working_spinner(&self) -> &'static str {
+        const ASCII: [&str; 4] = ["|", "/", "-", "\\"];
+        const WHEEL: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+        let frames: &[&str] = if self.display_mode.ascii {
+            &ASCII
+        } else {
+            &WHEEL
+        };
+        let phase = usize::try_from(self.frame % frames.len() as u64).unwrap_or(0);
+        frames[phase]
     }
 
     fn render_header(&self, area: Rect, f: &mut ratatui::Frame) {

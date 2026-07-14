@@ -688,9 +688,15 @@ impl Agent {
                     }
                     continue 'agent;
                 }
+                // Compaction is exhausted but the request still doesn't fit (a big auto-context
+                // plus large recent tool reads). Rather than abort, shrink the oldest tool output
+                // to fit and keep going — the full transcript stays in the rollout.
+                if trim_history_to_budget(session, budget, assembled.body_len) {
+                    continue 'agent;
+                }
                 self.emit(EventMsg::Error {
                     message: format!(
-                        "the request is about {} KB, over this model's ~{} KB input budget even after compaction — start a new session (/new) or remove large pasted or attached content",
+                        "the request is about {} KB and cannot be reduced under this model's ~{} KB input budget — start a new session (/new) or point at a smaller workspace/AGENTS.md",
                         assembled.body_len / 1024,
                         budget / 1024
                     ),
@@ -2876,6 +2882,48 @@ fn escalation_kind(
     Some(kind)
 }
 
+/// Shrink the in-memory history so the next assembled request fits `budget`, by truncating the
+/// content of older tool results (the biggest, most compressible consumers). No items are removed,
+/// so tool-call/result pairing stays intact, and the full transcript remains in the rollout for
+/// resume. The two most recent items are left untouched so the immediate context survives.
+/// Returns whether anything was trimmed.
+fn trim_history_to_budget(session: &mut Session, budget: usize, current_body_len: usize) -> bool {
+    const KEEP_RECENT: usize = 2;
+    const MIN_TOOL_RESULT_BYTES: usize = 2 * 1024;
+    const TRIM_MARKER: &str = "\n… [older tool output trimmed to fit the model's context window]";
+
+    let history_bytes = compaction::estimate_bytes(&session.history);
+    let overhead = current_body_len.saturating_sub(history_bytes);
+    // Keep a 10% margin for serialization/redaction divergence from the byte estimate.
+    let history_budget = budget.saturating_sub(overhead).saturating_mul(9) / 10;
+    if history_bytes <= history_budget {
+        return false;
+    }
+    let mut need_to_free = history_bytes - history_budget;
+    let cutoff = session.history.len().saturating_sub(KEEP_RECENT);
+    let mut trimmed = false;
+    for item in session.history.iter_mut().take(cutoff) {
+        if need_to_free == 0 {
+            break;
+        }
+        if let ResponseItem::ToolResult { content, .. } = item
+            && content.len() > MIN_TOOL_RESULT_BYTES + TRIM_MARKER.len()
+        {
+            let target = MIN_TOOL_RESULT_BYTES.max(content.len().saturating_sub(need_to_free));
+            let mut end = target.min(content.len());
+            while end > 0 && !content.is_char_boundary(end) {
+                end -= 1;
+            }
+            let freed = content.len() - end;
+            content.truncate(end);
+            content.push_str(TRIM_MARKER);
+            need_to_free = need_to_free.saturating_sub(freed);
+            trimmed = true;
+        }
+    }
+    trimmed
+}
+
 /// A heuristic commit subject. Model-generated conventional-commit messages (via structured
 /// outputs) are a planned refinement; this keeps the git-native workflow self-contained.
 fn commit_message(touched: &[std::path::PathBuf]) -> String {
@@ -2960,6 +3008,39 @@ fn summarize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trim_history_to_budget_shrinks_old_tool_output_and_keeps_recent() {
+        let config =
+            crate::session::SessionConfig::new(std::path::PathBuf::from("/tmp"), "grok-build-0.1");
+        let mut session = Session::new(config);
+        let big = "x".repeat(300_000);
+        session.history = vec![
+            ResponseItem::user("the task"),
+            ResponseItem::ToolResult {
+                id: ToolCallId::new(),
+                content: big.clone(),
+                is_error: false,
+                redactions: 0,
+            },
+            ResponseItem::assistant("recent reasoning"),
+            ResponseItem::user("latest prompt"),
+        ];
+        let before = compaction::estimate_bytes(&session.history);
+
+        // A tiny budget with no non-history overhead forces a trim of the old tool result.
+        assert!(trim_history_to_budget(&mut session, 50_000, before));
+        assert!(compaction::estimate_bytes(&session.history) < before);
+        // No items were removed (pairing preserved) and the two most recent are untouched.
+        assert_eq!(session.history.len(), 4);
+        let ResponseItem::ToolResult { content, .. } = &session.history[1] else {
+            panic!("expected the tool result to remain in place");
+        };
+        assert!(
+            content.len() < big.len(),
+            "old tool output should be trimmed"
+        );
+    }
 
     #[test]
     fn compaction_auxiliary_request_is_shrunk_to_exact_model_budget() {

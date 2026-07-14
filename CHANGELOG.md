@@ -9,6 +9,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - The Up/Down arrows now recall previously entered prompts (shell-style input history); the
   transcript scrolls with PageUp/PageDown and End.
+- The activity indicator is now an animated braille wheel while GrokForge is actually working
+  (running a tool, reasoning, or a turn) instead of a static dot.
+
+### Fixed
+- Long context-heavy sessions no longer dead-end on the input budget. When a request still exceeds
+  the model's window after compaction (a big auto-loaded `AGENTS.md` plus large recent tool reads),
+  GrokForge now shrinks the oldest tool outputs to fit and keeps going instead of aborting the turn
+  — pairing is preserved and the full transcript stays in the rollout. Only a truly irreducible
+  request stops with an actionable message.
 
 ### Fixed
 - Raised the context-budget estimate from a worst-case 1 byte/token to a conservative 3 (~700 KB
