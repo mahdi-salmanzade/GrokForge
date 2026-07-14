@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-15
+
 ### Added
 - Real typed configuration with defaults, a securely opened owner-controlled
   `~/.grokforge/config.toml`, an explicit `--trust-project-config` gate for the restricted project

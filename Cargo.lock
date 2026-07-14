@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "grokforge"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "grokforge-config"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "directories",
  "figment",
@@ -943,11 +943,11 @@ dependencies = [
 
 [[package]]
 name = "grokforge-context"
-version = "0.2.0"
+version = "1.0.0"
 
 [[package]]
 name = "grokforge-core"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "directories",
@@ -974,7 +974,7 @@ dependencies = [
 
 [[package]]
 name = "grokforge-git"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "grokforge-protocol",
  "tempfile",
@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "grokforge-mcp"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "grokforge-protocol"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1004,14 +1004,14 @@ dependencies = [
 
 [[package]]
 name = "grokforge-render"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "pulldown-cmark",
 ]
 
 [[package]]
 name = "grokforge-sandbox"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "directories",
@@ -1025,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "grokforge-test-support"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "serde_json",
  "tokio",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "grokforge-tui"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "crossterm",
@@ -1053,7 +1053,7 @@ dependencies = [
 
 [[package]]
 name = "grokforge-xai"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "eventsource-stream",
