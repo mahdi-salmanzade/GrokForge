@@ -55,11 +55,14 @@ pub struct SessionConfig {
     pub context_window_tokens: Option<u64>,
 }
 
-/// Worst-case serialized bytes per input token. Token-dense ASCII and source code can approach
-/// one token per byte, so using the more typical 3–4 bytes/token ratio would over-admit exactly
-/// the payloads a coding agent handles most often. At one byte/token, the number of tokenizer
-/// tokens cannot exceed the admitted UTF-8 request bytes.
-const WORST_CASE_BYTES_PER_TOKEN: usize = 1;
+/// Conservative serialized bytes per input token. Real code/text is ~3.3–4.0 bytes/token, so a
+/// deliberately low 3 keeps the byte budget mapping to fewer tokens (headroom against the model's
+/// limit) while still admitting a normal repository's auto-context (an AGENTS.md/memory file plus
+/// tool defs and history). A strict one-byte "worst case" made the budget smaller than the
+/// AGENTS.md cap itself, so trivial turns failed with nothing to compact. The pre-send guard still
+/// measures the exact serialized body, and if the estimate is ever wrong the provider's own limit
+/// is the backstop — surfaced as a clear message, not a silent stall.
+const BYTES_PER_TOKEN: usize = 3;
 /// Tokens reserved for the model's response so the input budget still leaves room to answer.
 const OUTPUT_RESERVE_TOKENS: u64 = 16_384;
 /// Fallback context window when the model's real window is unknown. Matches the smallest common
@@ -94,9 +97,10 @@ impl SessionConfig {
     }
 
     /// The maximum assembled-request size, in bytes, that stays under the model's input-token
-    /// budget: the context window minus a response reserve, at a worst-case one-byte-per-token
+    /// budget: the context window minus a response reserve, at a conservative bytes-per-token
     /// ratio. The whole serialized request body (system prompt, auto-context, tool defs, and
-    /// history) is held under this so token-dense ASCII/code cannot evade the guard.
+    /// history) is held under this, and the turn loop measures the exact serialized body against
+    /// it before sending.
     #[must_use]
     pub fn input_budget_bytes(&self) -> usize {
         let window = self
@@ -105,7 +109,7 @@ impl SessionConfig {
         let input_tokens = window.saturating_sub(OUTPUT_RESERVE_TOKENS);
         usize::try_from(input_tokens)
             .unwrap_or(usize::MAX)
-            .saturating_mul(WORST_CASE_BYTES_PER_TOKEN)
+            .saturating_mul(BYTES_PER_TOKEN)
     }
 
     #[must_use]
@@ -187,7 +191,7 @@ mod tests {
             fallback,
             usize::try_from(FALLBACK_CONTEXT_TOKENS - OUTPUT_RESERVE_TOKENS)
                 .unwrap()
-                .saturating_mul(WORST_CASE_BYTES_PER_TOKEN)
+                .saturating_mul(BYTES_PER_TOKEN)
         );
         // A larger advertised window yields a larger budget.
         config.context_window_tokens = Some(1_000_000);
@@ -198,11 +202,11 @@ mod tests {
     }
 
     #[test]
-    fn input_budget_allows_only_one_ascii_byte_per_available_token() {
+    fn input_budget_scales_by_the_conservative_bytes_per_token_estimate() {
         let mut config = SessionConfig::new(PathBuf::from("/tmp"), "m");
         config.context_window_tokens = Some(OUTPUT_RESERVE_TOKENS + 4_096);
 
-        assert_eq!(config.input_budget_bytes(), 4_096);
+        assert_eq!(config.input_budget_bytes(), 4_096 * BYTES_PER_TOKEN);
     }
 
     #[test]

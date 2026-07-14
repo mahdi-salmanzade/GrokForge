@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- The Up/Down arrows now recall previously entered prompts (shell-style input history); the
+  transcript scrolls with PageUp/PageDown and End.
+
+### Fixed
+- Raised the context-budget estimate from a worst-case 1 byte/token to a conservative 3 (~700 KB
+  for a 256k-token model). The 1-byte budget could be *smaller than the auto-loaded `AGENTS.md` cap
+  itself*, so even a trivial turn overran the budget with nothing to compact. The pre-send guard
+  still measures the exact serialized request body against the budget.
+
 ## [1.0.0] - 2026-07-15
 
 ### Added

@@ -51,6 +51,8 @@ const MAX_AGENT_LANES: usize = 64;
 const MAX_AGENT_PANEL_ROWS: u16 = 12;
 /// Path suggestions shown in the `@`-attach picker.
 const AT_PICKER_LIMIT: usize = 8;
+/// Prompts retained for Up/Down recall.
+const MAX_INPUT_HISTORY: usize = 200;
 /// Mouse wheels commonly emit several rapid events per gesture; three transcript rows per event
 /// feels responsive without making short messages disappear in one notch.
 const MOUSE_SCROLL_ROWS: u16 = 3;
@@ -370,6 +372,12 @@ pub struct App {
     at_selection: Option<usize>,
     /// Cached path suggestions for the current `@`-mention query.
     at_matches: Vec<String>,
+    /// Previously submitted prompts, recalled with Up/Down.
+    input_history: Vec<String>,
+    /// Cursor into `input_history` while recalling (`None` = editing the live draft).
+    history_cursor: Option<usize>,
+    /// The in-progress draft saved on the first Up, restored on Down past the newest entry.
+    history_draft: String,
 
     // The channel stays open for the app's lifetime because `agent` (Arc) holds the sender.
     events_rx: mpsc::UnboundedReceiver<EventMsg>,
@@ -519,6 +527,9 @@ impl App {
             workspace_root,
             at_selection: None,
             at_matches: Vec::new(),
+            input_history: Vec::new(),
+            history_cursor: None,
+            history_draft: String::new(),
             events_rx,
             approvals_rx,
             turn_handle: None,
@@ -759,16 +770,10 @@ impl App {
                     self.on_composer_changed();
                 }
             }
-            KeyCode::Up => {
-                self.follow = false;
-                self.scroll = self.scroll.saturating_add(1);
-            }
-            KeyCode::Down => {
-                self.scroll = self.scroll.saturating_sub(1);
-                if self.scroll == 0 {
-                    self.follow = true;
-                }
-            }
+            // Shell-style: the arrows recall previously entered prompts; the transcript scrolls
+            // with PageUp/PageDown (and End jumps to the latest).
+            KeyCode::Up => self.history_recall_prev(),
+            KeyCode::Down => self.history_recall_next(),
             KeyCode::PageUp => {
                 self.follow = false;
                 self.scroll = self.scroll.saturating_add(10);
@@ -1043,6 +1048,7 @@ impl App {
         if text.is_empty() || self.running {
             return;
         }
+        self.record_history(&text);
         self.composer.clear();
         self.slash_selection = Some(0);
         if text.eq_ignore_ascii_case("exit") || text.eq_ignore_ascii_case("quit") {
@@ -1056,6 +1062,52 @@ impl App {
         self.push_entry(Entry::User(text.clone()));
         self.follow = true;
         self.start_turn(text, false);
+    }
+
+    /// Record a submitted prompt in the input history (skipping consecutive duplicates) and reset
+    /// the recall cursor so the next Up starts from the newest entry.
+    fn record_history(&mut self, text: &str) {
+        if self.input_history.last().map(String::as_str) != Some(text) {
+            self.input_history.push(text.to_string());
+            if self.input_history.len() > MAX_INPUT_HISTORY {
+                self.input_history.remove(0);
+            }
+        }
+        self.history_cursor = None;
+        self.history_draft.clear();
+    }
+
+    /// Up: recall an older prompt. The first Up saves the current draft so Down can restore it.
+    fn history_recall_prev(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let index = match self.history_cursor {
+            None => {
+                self.history_draft.clone_from(&self.composer);
+                self.input_history.len() - 1
+            }
+            Some(0) => 0,
+            Some(current) => current - 1,
+        };
+        self.history_cursor = Some(index);
+        self.composer.clone_from(&self.input_history[index]);
+        self.on_composer_changed();
+    }
+
+    /// Down: move toward newer prompts; past the newest, restore the draft that was being typed.
+    fn history_recall_next(&mut self) {
+        let Some(index) = self.history_cursor else {
+            return;
+        };
+        if index + 1 < self.input_history.len() {
+            self.history_cursor = Some(index + 1);
+            self.composer.clone_from(&self.input_history[index + 1]);
+        } else {
+            self.history_cursor = None;
+            self.composer = std::mem::take(&mut self.history_draft);
+        }
+        self.on_composer_changed();
     }
 
     /// Spawn a turn (execute or plan mode), moving the session + rollout into the task.
@@ -4255,6 +4307,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn arrow_keys_recall_prompt_history() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut app = test_app();
+        app.record_history("first prompt");
+        app.record_history("second prompt");
+
+        // Up walks from newest to oldest; the first Up saves the (empty) draft.
+        app.on_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.composer, "second prompt");
+        app.on_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.composer, "first prompt");
+        app.on_key(KeyEvent::from(KeyCode::Up)); // clamped at the oldest
+        assert_eq!(app.composer, "first prompt");
+
+        // Down walks back toward newest, then past it restores the draft.
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.composer, "second prompt");
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.composer, "");
+        assert!(app.history_cursor.is_none());
+    }
+
     fn test_app_with_history(history: Vec<ResponseItem>) -> App {
         test_app_in(PathBuf::from("/tmp"), history)
     }
@@ -4841,8 +4916,9 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Esc));
         assert!(app.slash_selection.is_none());
         assert!(!buffer_frame(&app, 80, 24).contains("/ FORGE DECK ·"));
-        app.on_key(KeyEvent::from(KeyCode::Up));
-        assert_eq!(app.scroll, 1);
+        // The arrows now recall prompt history; the transcript scrolls with PageUp/PageDown.
+        app.on_key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(app.scroll, 10);
 
         app.on_key(KeyEvent::from(KeyCode::Char('h')));
         assert!(
