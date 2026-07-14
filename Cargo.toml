@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -18,17 +18,17 @@ categories = ["command-line-utilities", "development-tools"]
 # requirements let patch updates flow while holding the researched major.minor.
 [workspace.dependencies]
 # --- internal crates ---
-grokforge-protocol = { path = "crates/grokforge-protocol", version = "1.0.0" }
-grokforge-config = { path = "crates/grokforge-config", version = "1.0.0" }
-grokforge-xai = { path = "crates/grokforge-xai", version = "1.0.0" }
-grokforge-core = { path = "crates/grokforge-core", version = "1.0.0" }
-grokforge-sandbox = { path = "crates/grokforge-sandbox", version = "1.0.0" }
-grokforge-git = { path = "crates/grokforge-git", version = "1.0.0" }
-grokforge-context = { path = "crates/grokforge-context", version = "1.0.0" }
-grokforge-mcp = { path = "crates/grokforge-mcp", version = "1.0.0" }
-grokforge-render = { path = "crates/grokforge-render", version = "1.0.0" }
-grokforge-tui = { path = "crates/grokforge-tui", version = "1.0.0" }
-grokforge-test-support = { path = "crates/grokforge-test-support", version = "1.0.0" }
+grokforge-protocol = { path = "crates/grokforge-protocol", version = "1.0.1" }
+grokforge-config = { path = "crates/grokforge-config", version = "1.0.1" }
+grokforge-xai = { path = "crates/grokforge-xai", version = "1.0.1" }
+grokforge-core = { path = "crates/grokforge-core", version = "1.0.1" }
+grokforge-sandbox = { path = "crates/grokforge-sandbox", version = "1.0.1" }
+grokforge-git = { path = "crates/grokforge-git", version = "1.0.1" }
+grokforge-context = { path = "crates/grokforge-context", version = "1.0.1" }
+grokforge-mcp = { path = "crates/grokforge-mcp", version = "1.0.1" }
+grokforge-render = { path = "crates/grokforge-render", version = "1.0.1" }
+grokforge-tui = { path = "crates/grokforge-tui", version = "1.0.1" }
+grokforge-test-support = { path = "crates/grokforge-test-support", version = "1.0.1" }
 
 # --- async / runtime ---
 tokio = { version = "1", features = ["full"] }
