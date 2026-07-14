@@ -14,8 +14,8 @@ use std::path::Path;
 const MAX_ATTACH_FILE_BYTES: usize = 96 * 1024;
 /// Total inlined bytes across every `@`-mention in one message.
 const MAX_TOTAL_ATTACH_BYTES: usize = 384 * 1024;
-/// Files read from a single `@folder` mention.
-const MAX_DIR_FILES: usize = 60;
+/// Files listed in a single `@folder` manifest (further files are summarized as a count).
+const MAX_MANIFEST_FILES: usize = 500;
 /// Directory entries scanned before a walk gives up (bounds worst-case cost).
 const MAX_WALK_ENTRIES: usize = 20_000;
 /// Candidates returned to the picker before ranking.
@@ -227,34 +227,80 @@ fn read_attachment(workspace_root: &Path, mention: &str, budget: usize) -> Optio
     if !meta.is_dir() {
         return None;
     }
-    let mut out = String::new();
-    let mut used = 0usize;
-    let mut files = 0usize;
-    for entry in ignore::WalkBuilder::new(&absolute)
+    // A folder becomes a *manifest* (paths + sizes), not inlined content: dumping a large folder
+    // would blow the context budget. The agent gets a map of what's there and reads the files that
+    // matter with `read_file` (cheap to revisit thanks to the provider's prompt cache).
+    Some(folder_manifest(workspace_root, &absolute, trimmed))
+}
+
+/// Build a `<folder>` listing of the files under `absolute` (relative paths + sizes),
+/// `.gitignore`-aware and skipping common secret files, bounded to [`MAX_MANIFEST_FILES`].
+fn folder_manifest(workspace_root: &Path, absolute: &Path, rel: &str) -> String {
+    use std::fmt::Write as _;
+    let mut entries: Vec<(String, u64)> = Vec::new();
+    let mut total_files = 0usize;
+    let mut total_bytes = 0u64;
+    for entry in ignore::WalkBuilder::new(absolute)
         .build()
         .flatten()
         .take(MAX_WALK_ENTRIES)
     {
-        if used >= budget || files >= MAX_DIR_FILES {
-            break;
-        }
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
         let Ok(relative) = entry.path().strip_prefix(workspace_root) else {
             continue;
         };
-        let relative = relative.to_string_lossy();
+        let relative = relative.to_string_lossy().replace('\\', "/");
         if is_probably_secret(&relative) {
             continue;
         }
-        if let Some(block) = read_one_file(workspace_root, entry.path(), &relative, budget - used) {
-            used = used.saturating_add(block.len());
-            files += 1;
-            out.push_str(&block);
+        let size = entry.metadata().map_or(0, |meta| meta.len());
+        total_files += 1;
+        total_bytes = total_bytes.saturating_add(size);
+        if entries.len() < MAX_MANIFEST_FILES {
+            entries.push((relative, size));
         }
     }
-    if out.is_empty() { None } else { Some(out) }
+
+    let mut out = String::new();
+    out.push_str("<folder path=\"");
+    out.push_str(&sanitize_attr(rel));
+    out.push_str("\" note=\"Listing only — read the files you need with read_file.\">\n");
+    for (path, size) in &entries {
+        out.push_str("  ");
+        out.push_str(path);
+        out.push_str(" (");
+        out.push_str(&human_size(*size));
+        out.push_str(")\n");
+    }
+    if total_files > entries.len() {
+        let _ = writeln!(
+            out,
+            "  … {} more file(s) not listed",
+            total_files - entries.len()
+        );
+    }
+    let _ = writeln!(
+        out,
+        "[{total_files} file(s), {} total]",
+        human_size(total_bytes)
+    );
+    out.push_str("</folder>\n");
+    out
+}
+
+/// Compact human-readable byte size (integer math, no float precision casts).
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    if bytes >= MB {
+        format!("{}.{} MB", bytes / MB, (bytes % MB) * 10 / MB)
+    } else if bytes >= KB {
+        format!("{}.{} KB", bytes / KB, (bytes % KB) * 10 / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn read_one_file(
@@ -443,6 +489,19 @@ mod tests {
         assert_eq!(
             expand(dir.path(), "just a normal message"),
             "just a normal message"
+        );
+    }
+
+    #[test]
+    fn folder_mention_lists_files_without_inlining_content() {
+        let dir = ws();
+        let out = expand(dir.path(), "look at @src/");
+        // A folder becomes a manifest the agent can explore, not inlined file content.
+        assert!(out.contains("<folder path=\"src\""), "{out}");
+        assert!(out.contains("src/lib.rs"), "{out}");
+        assert!(
+            !out.contains("fn main() {}"),
+            "folder content must not be inlined: {out}"
         );
     }
 

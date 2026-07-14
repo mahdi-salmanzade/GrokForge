@@ -10,9 +10,7 @@ mod brand;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 
-use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -210,21 +208,12 @@ fn protect_user_changes(session: &mut Session) -> Option<String> {
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Capture the mouse so the scroll wheel belongs to GrokForge (it scrolls the transcript)
-    // rather than falling through to the terminal, which would scroll its native scrollback and
-    // expose the pre-launch shell history behind the alternate screen.
-    if let Err(error) = execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    ) {
-        let _ = execute!(
-            stdout,
-            DisableMouseCapture,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
+    // The mouse is deliberately NOT captured: capturing it would let the wheel scroll GrokForge's
+    // transcript, but it also takes native click-drag selection away from the terminal, breaking
+    // copy. Copy matters more than hiding the pre-launch scrollback, so the terminal keeps the
+    // mouse (drag-to-select/copy works; PgUp/PgDn and the arrows scroll GrokForge).
+    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+        let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
         let _ = disable_raw_mode();
         return Err(error);
     }
@@ -232,12 +221,7 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
         Ok(terminal) => Ok(terminal),
         Err(error) => {
             let mut stdout = io::stdout();
-            let _ = execute!(
-                stdout,
-                DisableMouseCapture,
-                DisableBracketedPaste,
-                LeaveAlternateScreen
-            );
+            let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
             let _ = disable_raw_mode();
             Err(error)
         }
@@ -251,7 +235,6 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Re
     }
     if let Err(error) = execute!(
         terminal.backend_mut(),
-        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     ) && first_error.is_none()
