@@ -913,7 +913,15 @@ mod tests {
     #[test]
     fn danger_policy_always_masks_grokforge_credentials() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let private = tempfile::tempdir().expect("private");
+        // Keep the credentials fixture out of /tmp and /run: bubblewrap already tmpfs-hides those
+        // runtime roots, so a fixture placed under them is masked implicitly and produces no
+        // explicit MaskMount (this is why a plain tempdir passes on macOS but not Linux). In
+        // production the credentials live under ~/.grokforge — never a hidden runtime root — so
+        // base the fixture on the crate directory to exercise the real explicit-mask path.
+        let private = tempfile::Builder::new()
+            .prefix("gf-cred-test")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("private");
         let credentials = private.path().join("credentials.enc");
         std::fs::write(&credentials, "encrypted credentials").expect("credentials fixture");
         let policy = SandboxPolicy::danger_full_access(workspace.path());
