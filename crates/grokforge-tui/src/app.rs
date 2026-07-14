@@ -1986,11 +1986,18 @@ impl App {
         } else {
             u16::from(remaining >= 2)
         };
+        // A one-line activity band sits directly above the composer (Claude Code style) while
+        // GrokForge is working, so the live status is where the user is looking — not tucked into
+        // the bottom-left status bar.
+        let activity_height = u16::from(
+            self.working_activity().is_some() && remaining.saturating_sub(composer_height) >= 2,
+        );
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(header_height),
                 Constraint::Min(0),
+                Constraint::Length(activity_height),
                 Constraint::Length(composer_height),
                 Constraint::Length(status_height),
             ])
@@ -1999,8 +2006,9 @@ impl App {
         self.render_header(chunks[0], f);
         let transcript_area = self.render_agents_panel(chunks[1], f);
         self.render_transcript(transcript_area, f);
-        self.render_composer(chunks[2], f);
-        self.render_status(chunks[3], f);
+        self.render_activity(chunks[2], f);
+        self.render_composer(chunks[3], f);
+        self.render_status(chunks[4], f);
         self.render_slash_palette(chunks[1], f);
         self.render_at_palette(chunks[1], f);
 
@@ -2140,6 +2148,47 @@ impl App {
         } else {
             ("● READY".to_string(), SUCCESS)
         }
+    }
+
+    /// Live activity to show in the band above the composer (Claude Code style), or `None` when
+    /// idle (nothing is shown, the composer just waits for input).
+    fn working_activity(&self) -> Option<(String, Color)> {
+        let spin = self.working_spinner();
+        if self.pending.is_some() {
+            Some(("● approval needed — respond above".to_string(), WARNING))
+        } else if let Some(attempt) = self.stream_retry {
+            Some((format!("↻ retrying (attempt {attempt})…"), WARNING))
+        } else if let Some(tool) = &self.active_tool {
+            Some((format!("{spin} {}…", compact_preview(tool, 24)), TOOL))
+        } else if self.reasoning.is_some() {
+            Some((format!("{spin} thinking…"), MUTED))
+        } else if self.running {
+            Some((format!("{spin} working…  ·  esc to interrupt"), ACCENT))
+        } else {
+            None
+        }
+    }
+
+    /// Render the one-line activity band directly above the composer.
+    fn render_activity(&self, area: Rect, f: &mut ratatui::Frame) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let Some((text, color)) = self.working_activity() else {
+            return;
+        };
+        f.render_widget(
+            Block::default().style(Style::default().bg(CANVAS).fg(TEXT)),
+            area,
+        );
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                text,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), horizontal_inset(area, 1));
     }
 
     /// The current frame of the "working" braille wheel (animated by the redraw tick while a turn
@@ -2371,25 +2420,15 @@ impl App {
             area,
         );
 
-        let (indicator, state_color) = self.activity_state();
+        // The live activity indicator now lives in the band above the composer; the bottom line
+        // carries persistent metadata only, led by the model.
         let mut spans = vec![
             Span::raw(" "),
             Span::styled(
-                indicator,
-                Style::default()
-                    .fg(state_color)
-                    .add_modifier(Modifier::BOLD),
+                safe_terminal_line(&self.status_model),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
         ];
-        if area.width >= 24 {
-            spans.extend([
-                Span::styled("  │  ", Style::default().fg(FAINT)),
-                Span::styled(
-                    safe_terminal_line(&self.status_model),
-                    Style::default().fg(TEXT),
-                ),
-            ]);
-        }
         if area.width >= 46 {
             spans.extend([
                 Span::styled("  ·  ", Style::default().fg(FAINT)),

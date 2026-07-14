@@ -9,8 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - The Up/Down arrows now recall previously entered prompts (shell-style input history); the
   transcript scrolls with PageUp/PageDown and End.
-- The activity indicator is now an animated braille wheel while GrokForge is actually working
-  (running a tool, reasoning, or a turn) instead of a static dot.
+- The live activity indicator moved from the bottom-left status bar to a one-line band directly
+  above the composer (Claude Code style), so the animated braille "working…/thinking…/<tool>…"
+  feedback appears where you're typing. The bottom line now carries persistent metadata only
+  (model, preset, tokens, sandbox, branch).
 
 ### Fixed
 - Long context-heavy sessions no longer dead-end on the input budget. When a request still exceeds
