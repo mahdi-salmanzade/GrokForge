@@ -12,7 +12,7 @@ use grokforge_core::{
 };
 use grokforge_protocol::{ApprovalPolicy, EventMsg, NetworkMode, SandboxMode, StopReason};
 use grokforge_sandbox::default_runner;
-use grokforge_xai::{Effort, ServerTool, XaiClient};
+use grokforge_xai::{Effort, ServerTool, XaiClient, model_supports_effort};
 use tokio::sync::mpsc;
 
 /// Parsed `exec` options.
@@ -30,8 +30,9 @@ pub struct ExecArgs {
     pub web_search: bool,
     pub x_search: bool,
     pub code_interpreter: bool,
-    pub max_iterations: u32,
+    pub max_iterations: Option<u32>,
     pub trust_project_mcp: bool,
+    pub trust_project_config: bool,
 }
 
 fn preset_policy(preset: &str) -> Option<(ApprovalPolicy, SandboxMode)> {
@@ -78,12 +79,23 @@ fn grants_network(rules: &[AllowRule]) -> bool {
         .any(|rule| matches!(rule, AllowRule::Network | AllowRule::All))
 }
 
-fn parse_effort(s: &str) -> Option<Effort> {
+fn parse_effort(s: &str) -> Result<Option<Effort>, ()> {
     match s {
-        "low" => Some(Effort::Low),
-        "medium" => Some(Effort::Medium),
-        "high" => Some(Effort::High),
-        _ => None,
+        "auto" => Ok(None),
+        "low" => Ok(Some(Effort::Low)),
+        "medium" => Ok(Some(Effort::Medium)),
+        "high" => Ok(Some(Effort::High)),
+        "xhigh" => Ok(Some(Effort::Xhigh)),
+        _ => Err(()),
+    }
+}
+
+fn configured_effort(effort: grokforge_config::Effort) -> Effort {
+    match effort {
+        grokforge_config::Effort::Low => Effort::Low,
+        grokforge_config::Effort::Medium => Effort::Medium,
+        grokforge_config::Effort::High => Effort::High,
+        grokforge_config::Effort::Xhigh => Effort::Xhigh,
     }
 }
 
@@ -101,15 +113,30 @@ pub async fn run(args: ExecArgs) -> ExitCode {
         eprintln!("prompt must not be empty");
         return ExitCode::from(2);
     }
-    if args.max_iterations == 0 {
-        eprintln!("--max-iterations must be at least 1");
+    if args
+        .max_iterations
+        .is_some_and(|iterations| !(1..=256).contains(&iterations))
+    {
+        eprintln!("--max-iterations must be between 1 and 256");
         return ExitCode::from(2);
     }
-
     let workspace = match resolve_workspace(args.cd.as_deref()) {
         Ok(workspace) => workspace,
         Err(error) => {
             eprintln!("invalid --cd: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let settings = match grokforge_config::Config::load_with_project_config(
+        &workspace,
+        args.trust_project_config,
+    ) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!(
+                "configuration error: {}",
+                crate::sanitize_terminal(&error.to_string())
+            );
             return ExitCode::from(2);
         }
     };
@@ -123,22 +150,29 @@ pub async fn run(args: ExecArgs) -> ExitCode {
     let network_allowed = grants_network(&allow);
     let effort = match args.effort.as_deref() {
         Some(value) => {
-            if let Some(effort) = parse_effort(value) {
-                Some(effort)
-            } else {
-                eprintln!("invalid --effort `{value}` (low|medium|high)");
+            let Ok(effort) = parse_effort(value) else {
+                eprintln!("invalid --effort `{value}` (auto|low|medium|high|xhigh)");
                 return ExitCode::from(2);
-            }
+            };
+            effort
         }
-        None => None,
+        None if args.plan => Some(Effort::High),
+        None => settings.agent.effort.map(configured_effort),
     };
-
+    let model = args.model.unwrap_or_else(|| {
+        if args.plan {
+            settings.agent.plan_model.clone()
+        } else {
+            settings.agent.default_model.clone()
+        }
+    });
     // Headless: env override → unlock an existing encrypted file when attached to a terminal.
     // First-run onboarding stays disabled so scripts and CI never create credentials implicitly.
     let Some(api_key) = crate::credentials::resolve(false).await else {
         return ExitCode::from(3);
     };
-    let base_url = std::env::var("XAI_BASE_URL").unwrap_or_else(|_| "https://api.x.ai".to_string());
+    let base_url =
+        std::env::var("XAI_BASE_URL").unwrap_or_else(|_| settings.provider.grok.base_url.clone());
 
     let client = match XaiClient::new(&base_url, api_key) {
         Ok(c) => c,
@@ -148,26 +182,35 @@ pub async fn run(args: ExecArgs) -> ExitCode {
         }
     };
 
-    let model = args.model.unwrap_or_else(|| "grok-build-0.1".to_string());
-    if let Err(code) = crate::validate_model_startup(&client, &model).await {
-        return code;
+    let model_catalog = match crate::model_catalog_startup(&client, &model).await {
+        Ok(models) => models,
+        Err(code) => return code,
+    };
+    let selected_model = model_catalog.iter().find(|candidate| {
+        candidate.id == model || candidate.aliases.iter().any(|alias| alias == &model)
+    });
+    let active_model = selected_model.map_or(model, |candidate| candidate.id.clone());
+    let context_window_tokens = selected_model.and_then(|candidate| candidate.context_window);
+    if effort.is_some_and(|effort| !model_supports_effort(&active_model, effort)) {
+        eprintln!("reasoning effort `xhigh` requires an xAI multi-agent model");
+        return ExitCode::from(2);
     }
-    // Best-effort: bound the request to the model's real context window (captured before `model`
-    // is moved into the config); falls back to a conservative default when unavailable.
-    let context_window_tokens = client.model_context_window(&model).await;
     let approver: Arc<AutoApprover> = if args.preset == "yolo" {
         Arc::new(AutoApprover::yolo())
     } else {
         Arc::new(AutoApprover::new(allow))
     };
 
-    let mut config = SessionConfig::new(workspace.clone(), model).with_policy(policy, mode);
+    let mut config = SessionConfig::new(workspace.clone(), active_model).with_policy(policy, mode);
     if network_allowed {
         config.network = NetworkMode::Full;
     }
-    config.max_iterations = args.max_iterations;
+    config.max_iterations = args.max_iterations.unwrap_or(settings.agent.max_iterations);
     config.effort = effort;
     config.context_window_tokens = context_window_tokens;
+    config.auto_compact = settings.agent.auto_compact;
+    config.compaction_trigger_bytes = settings.agent.compaction_trigger_bytes;
+    config.compaction_keep_tail = settings.agent.compaction_keep_tail;
     if args.web_search {
         config.enabled_server_tools.insert(ServerTool::WebSearch);
     }
@@ -202,7 +245,8 @@ pub async fn run(args: ExecArgs) -> ExitCode {
         session.config.workspace_root.clone(),
         session.config.model.clone(),
         &args.prompt,
-    );
+    )
+    .with_effort(session.config.effort);
     if let Err(error) = meta.write(&dir, session.id).await {
         eprintln!("could not persist session metadata: {error}");
         return ExitCode::from(2);

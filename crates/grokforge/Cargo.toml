@@ -19,7 +19,9 @@ workspace = true
 
 [dependencies]
 clap = { workspace = true }
+clap_complete = { workspace = true }
 grokforge-protocol = { workspace = true }
+grokforge-config = { workspace = true }
 grokforge-core = { workspace = true }
 grokforge-sandbox = { workspace = true }
 grokforge-git = { workspace = true }

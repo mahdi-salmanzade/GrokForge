@@ -10,7 +10,9 @@ mod brand;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -122,7 +124,8 @@ async fn run_session_ready(
     // Metadata and rollout are the canonical recovery record. Finish both before Git inspection,
     // MCP process startup, or the first model request.
     if !metadata_exists {
-        let meta = SessionMeta::new(session.id, workspace.clone(), model.clone(), "");
+        let meta = SessionMeta::new(session.id, workspace.clone(), model.clone(), "")
+            .with_effort(session.config.effort);
         meta.write(&dir, session.id).await.map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -180,6 +183,14 @@ fn protect_user_changes(session: &mut Session) -> Option<String> {
     if !session.config.auto_commit {
         return None;
     }
+    // Foreground sessions share the user's working tree. Staging after a tool call would race any
+    // user/editor write to the same path, so commit-based undo is intentionally unavailable until
+    // the descriptor-safe foreground edit journal lands. Keep the runtime flag honest instead of
+    // implying that a clean foreground repository will be auto-committed.
+    if !session.config.isolated_worktree {
+        session.config.auto_commit = false;
+        return None;
+    }
     let git = grokforge_git::Git::discover(&session.config.workspace_root)?;
     match git.is_dirty() {
         Ok(false) => None,
@@ -199,8 +210,21 @@ fn protect_user_changes(session: &mut Session) -> Option<String> {
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
-        let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
+    // Capture the mouse so the scroll wheel belongs to GrokForge (it scrolls the transcript)
+    // rather than falling through to the terminal, which would scroll its native scrollback and
+    // expose the pre-launch shell history behind the alternate screen.
+    if let Err(error) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    ) {
+        let _ = execute!(
+            stdout,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
         return Err(error);
     }
@@ -208,7 +232,12 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
         Ok(terminal) => Ok(terminal),
         Err(error) => {
             let mut stdout = io::stdout();
-            let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
+            let _ = execute!(
+                stdout,
+                DisableMouseCapture,
+                DisableBracketedPaste,
+                LeaveAlternateScreen
+            );
             let _ = disable_raw_mode();
             Err(error)
         }
@@ -222,6 +251,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Re
     }
     if let Err(error) = execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     ) && first_error.is_none()
@@ -278,7 +308,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dirty_workspace_disables_auto_commit() {
+    fn foreground_workspace_disables_auto_commit_without_a_misleading_dirty_warning() {
         let dir = tempfile::tempdir().expect("workspace");
         assert!(
             Command::new("git")
@@ -291,6 +321,27 @@ mod tests {
         std::fs::write(dir.path().join("user.txt"), "user change\n").expect("user change");
         let mut session = Session::new(SessionConfig::new(dir.path().to_path_buf(), "model"));
         let warning = protect_user_changes(&mut session);
+        assert!(!session.config.auto_commit);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn dirty_isolated_workspace_disables_auto_commit_with_a_warning() {
+        let dir = tempfile::tempdir().expect("workspace");
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        std::fs::write(dir.path().join("user.txt"), "user change\n").expect("user change");
+        let mut session = Session::new(SessionConfig::new(dir.path().to_path_buf(), "model"));
+        session.config.isolated_worktree = true;
+
+        let warning = protect_user_changes(&mut session);
+
         assert!(!session.config.auto_commit);
         assert!(warning.is_some());
     }

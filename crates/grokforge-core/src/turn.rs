@@ -41,8 +41,11 @@ const MAX_PROVIDER_OUTPUT_AGGREGATE_BYTES: usize = 24 * 1024 * 1024;
 const MAX_PROVIDER_OUTPUT_ITEMS: usize = 512;
 const MAX_TOOL_CALLS_PER_RESPONSE: usize = 64;
 // Compaction must remain a recovery path even when resumed history is near its in-memory cap.
-// Four MiB stays below the 32 MiB request cap even under worst-case JSON escaping.
+// This is only a local transcript ceiling; the exact serialized auxiliary request is also capped
+// to the current model's input budget before a provider stream may be opened.
 const MAX_COMPACTION_TRANSCRIPT_BYTES: usize = 4 * 1024 * 1024;
+const COMPACTION_INSTRUCTION: &str = "Summarize the following conversation so the assistant can continue the task. \
+     Capture decisions, current state, and open work. Be concise.";
 // Keep the summary itself bounded so a coherent recent tail still has room in the durable line.
 const MAX_COMPACTION_SUMMARY_ITEM_BYTES: usize = 7 * 1024 * 1024;
 const MAX_COMPACTION_TAIL_BYTES: usize = 7 * 1024 * 1024;
@@ -87,6 +90,41 @@ fn advertised_tool_defs(
         append_server_tools(&mut tool_defs, enabled_server_tools);
     }
     tool_defs
+}
+
+/// Assemble a compaction request that fits the exact current-session input budget. The empty
+/// request establishes the serialized protocol overhead first; transcript capacity is then
+/// reduced until JSON escaping and redaction also fit. No provider request is made here.
+fn assemble_compaction_within_budget(
+    session: &Session,
+    items: &[ResponseItem],
+) -> Result<Option<Assembled>, grokforge_xai::XaiError> {
+    let budget = session.config.input_budget_bytes();
+    let empty = context::assemble_auxiliary(session, COMPACTION_INSTRUCTION, "", "compaction")?;
+    let mut transcript_limit =
+        MAX_COMPACTION_TRANSCRIPT_BYTES.min(budget.saturating_sub(empty.body_len));
+
+    while transcript_limit > 0 {
+        let transcript = compaction::transcript_text_bounded(items, transcript_limit);
+        if transcript.is_empty() {
+            return Ok(None);
+        }
+        let assembled = context::assemble_auxiliary(
+            session,
+            COMPACTION_INSTRUCTION,
+            &transcript,
+            "compaction",
+        )?;
+        if assembled.body_len <= budget {
+            return Ok(Some(assembled));
+        }
+
+        // Escaping can expand a transcript byte several-fold. Halving gives bounded progress
+        // without assuming a particular tokenizer or JSON expansion ratio.
+        transcript_limit /= 2;
+    }
+
+    Ok(None)
 }
 
 #[derive(Debug)]
@@ -1160,17 +1198,15 @@ impl Agent {
         let older = &session.history[..split];
         let (files, errors) = compaction::extract_verbatim(older);
         let prior_redactions = compaction::redaction_count(older);
-        let transcript =
-            compaction::transcript_text_bounded(older, MAX_COMPACTION_TRANSCRIPT_BYTES);
-
-        let assembled = match context::assemble_auxiliary(
-            session,
-            "Summarize the following conversation so the assistant can continue the task. \
-             Capture decisions, current state, and open work. Be concise.",
-            &transcript,
-            "compaction",
-        ) {
-            Ok(assembled) => assembled,
+        let assembled = match assemble_compaction_within_budget(session, older) {
+            Ok(Some(assembled)) => assembled,
+            Ok(None) => {
+                tracing::warn!(
+                    budget = session.config.input_budget_bytes(),
+                    "compaction request could not fit the model input budget; preserving history"
+                );
+                return false;
+            }
             Err(e) => {
                 tracing::warn!("compaction request assembly failed: {e}");
                 return false;
@@ -1635,6 +1671,8 @@ impl Agent {
                     SandboxMode::WorkspaceWrite,
                 );
         sub_config.effort = session.config.effort;
+        // The catalog powers only foreground model selection. A subagent already inherits one
+        // validated model, so copying the full catalog into every parallel child is wasted memory.
         sub_config
             .enabled_server_tools
             .clone_from(&session.config.enabled_server_tools);
@@ -1677,7 +1715,8 @@ impl Agent {
             worktree.clone(),
             session.config.model.clone(),
             &prompt,
-        );
+        )
+        .with_effort(sub_session.config.effort);
         if let Err(error) = meta.write(&sessions, sub_session.id).await {
             tracing::warn!(%error, branch, "subagent metadata could not be persisted");
             drop(sub_writer);
@@ -2921,6 +2960,48 @@ fn summarize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_auxiliary_request_is_shrunk_to_exact_model_budget() {
+        let mut config =
+            crate::session::SessionConfig::new(std::path::PathBuf::from("/tmp"), "grok-build-0.1");
+        // Leaves 3,616 input tokens/bytes after the response reserve.
+        config.context_window_tokens = Some(20_000);
+        let mut session = Session::new(config);
+        session
+            .history
+            .push(ResponseItem::user("\\\"\n".repeat(100_000)));
+
+        let full_transcript =
+            compaction::transcript_text_bounded(&session.history, MAX_COMPACTION_TRANSCRIPT_BYTES);
+        let full = context::assemble_auxiliary(
+            &session,
+            COMPACTION_INSTRUCTION,
+            &full_transcript,
+            "compaction",
+        )
+        .expect("assemble oversized control request");
+        assert!(full.body_len > session.config.input_budget_bytes());
+
+        let bounded = assemble_compaction_within_budget(&session, &session.history)
+            .expect("assemble bounded compaction request")
+            .expect("some transcript should fit");
+        assert!(bounded.body_len <= session.config.input_budget_bytes());
+        assert_eq!(bounded.body_len, bounded.ledger.total_bytes());
+    }
+
+    #[test]
+    fn compaction_auxiliary_request_is_refused_when_envelope_cannot_fit() {
+        let mut config =
+            crate::session::SessionConfig::new(std::path::PathBuf::from("/tmp"), "grok-build-0.1");
+        config.context_window_tokens = Some(1);
+        let mut session = Session::new(config);
+        session.history.push(ResponseItem::user("must not be sent"));
+
+        let assembled = assemble_compaction_within_budget(&session, &session.history)
+            .expect("assembly itself should succeed");
+        assert!(assembled.is_none());
+    }
 
     #[test]
     fn server_tools_are_appended_without_exceeding_the_request_cap() {

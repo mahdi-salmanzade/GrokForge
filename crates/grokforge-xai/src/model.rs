@@ -5,8 +5,8 @@
 
 use serde::Deserialize;
 
-/// A model advertised by the endpoint. Pricing is intentionally not read from here — it is
-/// unreliable across endpoints, so GrokForge keeps a config-owned price table instead.
+/// A model advertised by the endpoint. Pricing is intentionally not inferred from this response:
+/// it is unreliable across endpoints, and GrokForge does not yet ship a maintained price catalog.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelInfo {
     pub id: String,

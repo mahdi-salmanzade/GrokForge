@@ -13,7 +13,8 @@ const MAX_TOTAL_COMMAND_BYTES: usize = 512 * 1024;
 // survive a limit.
 const MAX_COMMAND_DIRECTORY_ENTRIES: usize = 1_024;
 const RESERVED_COMMAND_NAMES: &[&str] = &[
-    "clear", "exit", "help", "plan", "q", "quit", "skills", "tools", "undo",
+    "clear", "effort", "exit", "help", "memory", "model", "plan", "q", "quit", "skills", "tools",
+    "undo",
 ];
 
 /// A project prompt command.

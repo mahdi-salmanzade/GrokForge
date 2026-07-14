@@ -13,14 +13,16 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use futures::{FutureExt, StreamExt};
 use grokforge_core::commands::{self, CommandDoc};
 use grokforge_core::skills::{self, SkillDoc};
-use grokforge_core::{Agent, RolloutWriter, Session, TurnCancellation};
+use grokforge_core::{Agent, RolloutWriter, Session, SessionMeta, TurnCancellation, sessions_dir};
 use grokforge_protocol::{Decision, DenialClass, EventMsg, ResponseItem, Usage};
 use grokforge_render::{LineKind, RenderLine, RenderSpan, SpanRole, render_markdown};
-use grokforge_xai::ServerTool;
+use grokforge_xai::{Effort, ServerTool, model_supports_effort};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -49,6 +51,9 @@ const MAX_AGENT_LANES: usize = 64;
 const MAX_AGENT_PANEL_ROWS: u16 = 12;
 /// Path suggestions shown in the `@`-attach picker.
 const AT_PICKER_LIMIT: usize = 8;
+/// Mouse wheels commonly emit several rapid events per gesture; three transcript rows per event
+/// feels responsive without making short messages disappear in one notch.
+const MOUSE_SCROLL_ROWS: u16 = 3;
 
 // GrokForge's UI palette. Explicit colors make the product identity consistent across terminal
 // themes; every foreground/background pair is intentionally high-contrast. The interface still
@@ -373,6 +378,8 @@ pub struct App {
     turn_cancellation: Option<TurnCancellation>,
     turn_complete_seen: bool,
     undo_handle: Option<JoinHandle<Entry>>,
+    model_handle: Option<JoinHandle<ModelSaveOutcome>>,
+    effort_handle: Option<JoinHandle<EffortSaveOutcome>>,
 }
 
 #[derive(Debug)]
@@ -380,6 +387,61 @@ struct TurnOutcome {
     session: Session,
     rollout: Option<RolloutWriter>,
     panic: Option<String>,
+}
+
+#[derive(Debug)]
+struct ModelSaveOutcome {
+    model: String,
+    context_window: Option<u64>,
+    result: std::io::Result<()>,
+}
+
+#[derive(Debug)]
+struct EffortSaveOutcome {
+    effort: Option<Effort>,
+    label: String,
+    result: std::io::Result<()>,
+}
+
+/// Normal execute settings temporarily replaced for a single interactive plan turn.
+#[derive(Debug)]
+struct PlanConfigRestore {
+    model: String,
+    context_window_tokens: Option<u64>,
+    effort: Option<Effort>,
+}
+
+impl PlanConfigRestore {
+    fn apply(session: &mut Session) -> Result<Self, String> {
+        let requested = session.config.plan_model.as_str();
+        let selected = session.config.model_catalog.iter().find(|candidate| {
+            candidate.id == requested || candidate.aliases.iter().any(|alias| alias == requested)
+        });
+        let (plan_model, context_window_tokens) = match selected {
+            Some(model) => (model.id.clone(), model.context_window),
+            None if session.config.model_catalog.is_empty() => (requested.to_string(), None),
+            None => {
+                return Err(format!(
+                    "configured plan model `{requested}` is not advertised by the endpoint"
+                ));
+            }
+        };
+        let restore = Self {
+            model: std::mem::replace(&mut session.config.model, plan_model),
+            context_window_tokens: std::mem::replace(
+                &mut session.config.context_window_tokens,
+                context_window_tokens,
+            ),
+            effort: session.config.effort.replace(Effort::High),
+        };
+        Ok(restore)
+    }
+
+    fn restore(self, session: &mut Session) {
+        session.config.model = self.model;
+        session.config.context_window_tokens = self.context_window_tokens;
+        session.config.effort = self.effort;
+    }
 }
 
 impl std::fmt::Debug for App {
@@ -390,6 +452,8 @@ impl std::fmt::Debug for App {
             .field("has_pending_approval", &self.pending.is_some())
             .field("queued_approvals", &self.approval_queue.len())
             .field("has_pending_undo", &self.undo_handle.is_some())
+            .field("has_pending_model_save", &self.model_handle.is_some())
+            .field("has_pending_effort_save", &self.effort_handle.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -461,6 +525,8 @@ impl App {
             turn_cancellation: None,
             turn_complete_seen: false,
             undo_handle: None,
+            model_handle: None,
+            effort_handle: None,
         }
     }
 
@@ -497,6 +563,8 @@ impl App {
         if self.shutdown == ShutdownState::Requested
             && self.turn_handle.is_none()
             && self.undo_handle.is_none()
+            && self.model_handle.is_none()
+            && self.effort_handle.is_none()
             && !self.running
         {
             self.shutdown = ShutdownState::Ready;
@@ -511,6 +579,12 @@ impl App {
             let _ = handle.await;
         }
         if let Some(handle) = self.undo_handle.take() {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.model_handle.take() {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.effort_handle.take() {
             let _ = handle.await;
         }
         self.running = false;
@@ -543,6 +617,7 @@ impl App {
                     match maybe_event {
                         Some(Ok(Event::Key(key))) => self.on_terminal_key(key),
                         Some(Ok(Event::Paste(text))) => self.on_paste(&text),
+                        Some(Ok(Event::Mouse(mouse))) => self.on_mouse(mouse),
                         Some(Ok(_)) => {}
                         Some(Err(error)) => {
                             self.push_entry(Entry::Error(format!("terminal input failed: {error}")));
@@ -571,6 +646,14 @@ impl App {
                     self.finish_undo(result);
                     redraw_needed = true;
                 }
+                result = wait_for_model_save(&mut self.model_handle), if self.model_handle.is_some() => {
+                    self.finish_model_save(result);
+                    redraw_needed = true;
+                }
+                result = wait_for_effort_save(&mut self.effort_handle), if self.effort_handle.is_some() => {
+                    self.finish_effort_save(result);
+                    redraw_needed = true;
+                }
             }
         }
         self.await_quiescence().await;
@@ -580,6 +663,47 @@ impl App {
     fn on_terminal_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Release {
             self.on_key(key);
+        }
+    }
+
+    /// Scroll the transcript with the mouse wheel. Mouse capture keeps the wheel from reaching the
+    /// terminal (which would otherwise expose the native pre-launch scrollback behind the
+    /// alternate screen); here it drives GrokForge's own transcript scrolling instead.
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                // The welcome deck has its own responsive layout rather than a scrollable
+                // transcript. Do not leave follow mode or show a meaningless scroll badge there.
+                if self.transcript.is_empty()
+                    && self.streaming.is_none()
+                    && self.reasoning.is_none()
+                {
+                    self.follow = true;
+                    self.scroll = 0;
+                    return;
+                }
+                self.scroll = if self.follow {
+                    MOUSE_SCROLL_ROWS
+                } else {
+                    self.scroll.saturating_add(MOUSE_SCROLL_ROWS)
+                };
+                self.follow = false;
+            }
+            MouseEventKind::ScrollDown => {
+                if self.follow {
+                    // Maintain the follow-state invariant even if a caller constructed an
+                    // inconsistent state (follow=true with a stale non-zero offset).
+                    self.scroll = 0;
+                    return;
+                }
+                self.scroll = self.scroll.saturating_sub(MOUSE_SCROLL_ROWS);
+                if self.scroll == 0 {
+                    self.follow = true;
+                }
+            }
+            // Capture is enabled for wheel delivery only. Click, drag, movement, and horizontal
+            // wheel events intentionally have no application meaning and cannot mutate state.
+            _ => {}
         }
     }
 
@@ -794,7 +918,7 @@ impl App {
         if let Some(at) = self.composer.rfind('@') {
             self.composer.truncate(at);
         }
-        let addition = format!("@{path} ");
+        let addition = format_at_mention(path);
         if self.composer.len().saturating_add(addition.len()) <= MAX_COMPOSER_BYTES {
             self.composer.push_str(&addition);
         }
@@ -939,6 +1063,18 @@ impl App {
         let Some(mut session) = self.session.take() else {
             return;
         };
+        let plan_restore = if plan {
+            match PlanConfigRestore::apply(&mut session) {
+                Ok(restore) => Some(restore),
+                Err(message) => {
+                    self.session = Some(session);
+                    self.push_entry(Entry::Error(message));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let mut rollout = self.rollout.take();
         self.running = true;
         self.turn_complete_seen = false;
@@ -963,6 +1099,9 @@ impl App {
             })
             .catch_unwind()
             .await;
+            if let Some(restore) = plan_restore {
+                restore.restore(&mut session);
+            }
             TurnOutcome {
                 session,
                 rollout,
@@ -976,7 +1115,7 @@ impl App {
         match name {
             "help" | "?" => {
                 self.push_entry(Entry::Info(
-                    "commands: /plan <task>  ·  /skills [name]  ·  /memory  ·  /tools [web|x|code] [on|off]  ·  /undo  ·  /clear  ·  /quit".to_string(),
+                    "commands: /plan <task>  ·  /model [slug]  ·  /effort [auto|low|medium|high|xhigh]  ·  /skills [name]  ·  /memory  ·  /tools [web|x|code] [on|off]  ·  /undo  ·  /clear  ·  /quit".to_string(),
                 ));
                 if !self.project_commands.is_empty() {
                     let commands = self
@@ -999,6 +1138,8 @@ impl App {
             "undo" => self.undo(),
             "skills" => self.show_skills(rest.trim()),
             "memory" => self.show_memory(),
+            "model" => self.handle_model(rest.trim()),
+            "effort" => self.handle_effort(rest.trim()),
             "tools" => self.handle_server_tools(rest.trim()),
             "plan" => {
                 let task = rest.trim();
@@ -1030,6 +1171,13 @@ impl App {
                 true,
             ),
             ("/skills", "Browse local project skills", true, false),
+            (
+                "/model",
+                "List available models or switch the active model",
+                true,
+                false,
+            ),
+            ("/effort", "Show or set reasoning effort", true, false),
             (
                 "/memory",
                 "Show persistent memory (.grokforge/memory/)",
@@ -1068,7 +1216,12 @@ impl App {
                 false,
                 false,
             ),
-            ("/undo", "Revert the most recent Grok turn", false, false),
+            (
+                "/undo",
+                "Undo an isolated-worktree agent commit · foreground journal pending",
+                false,
+                false,
+            ),
             ("/clear", "Clear the visible transcript", false, false),
             ("/quit", "Close GrokForge", false, false),
         ];
@@ -1132,6 +1285,160 @@ impl App {
         self.follow = true;
         self.start_turn(commands::expand(&command, arguments), false);
         true
+    }
+
+    fn handle_model(&mut self, requested: &str) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        if requested.is_empty() {
+            let current = session.config.model.clone();
+            let available = session
+                .config
+                .model_catalog
+                .iter()
+                .map(|model| model.id.as_str())
+                .take(32)
+                .collect::<Vec<_>>()
+                .join("  ·  ");
+            self.push_entry(Entry::Info(format!("active model · {current}")));
+            if available.is_empty() {
+                self.push_entry(Entry::Info(
+                    "model catalog unavailable · restart with --model <slug> to validate a different model"
+                        .to_string(),
+                ));
+            } else {
+                self.push_entry(Entry::Info(format!(
+                    "available models · {available} · switch with /model <slug>"
+                )));
+            }
+            return;
+        }
+        if requested.len() > 160
+            || requested.trim() != requested
+            || requested.chars().any(char::is_control)
+            || requested.chars().any(char::is_whitespace)
+        {
+            self.push_entry(Entry::Info(
+                "usage: /model <advertised-model-slug>".to_string(),
+            ));
+            return;
+        }
+        let selected = session
+            .config
+            .model_catalog
+            .iter()
+            .find(|model| {
+                model.id == requested || model.aliases.iter().any(|alias| alias == requested)
+            })
+            .cloned();
+        let Some(selected) = selected else {
+            self.push_entry(Entry::Info(format!(
+                "model `{requested}` was not in the startup catalog · run /model to see available models"
+            )));
+            return;
+        };
+        if session
+            .config
+            .effort
+            .is_some_and(|effort| !model_supports_effort(&selected.id, effort))
+        {
+            self.push_entry(Entry::Info(
+                "model switch blocked · xhigh requires an xAI multi-agent model · set /effort auto or /effort high first"
+                    .to_string(),
+            ));
+            return;
+        }
+        if selected.id == session.config.model {
+            self.push_entry(Entry::Info(format!(
+                "model already active · {}",
+                selected.id
+            )));
+            return;
+        }
+        let Ok(dir) = sessions_dir() else {
+            self.push_entry(Entry::Error(
+                "cannot persist model switch: session directory unavailable".to_string(),
+            ));
+            return;
+        };
+        let session_id = session.id;
+        let model = selected.id;
+        let context_window = selected.context_window;
+        self.running = true;
+        self.push_entry(Entry::Info(format!("switching model · {model}")));
+        self.model_handle = Some(tokio::spawn(async move {
+            let result = SessionMeta::update_model(&dir, session_id, model.clone()).await;
+            ModelSaveOutcome {
+                model,
+                context_window,
+                result,
+            }
+        }));
+    }
+
+    fn handle_effort(&mut self, requested: &str) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        if requested.is_empty() {
+            let current = match session.config.effort {
+                None => "auto",
+                Some(Effort::Low) => "low",
+                Some(Effort::Medium) => "medium",
+                Some(Effort::High) => "high",
+                Some(Effort::Xhigh) => "xhigh",
+            };
+            self.push_entry(Entry::Info(format!(
+                "reasoning effort · {current} · set with /effort <auto|low|medium|high|xhigh>"
+            )));
+            return;
+        }
+        let effort = match requested {
+            "auto" => None,
+            "low" => Some(Effort::Low),
+            "medium" => Some(Effort::Medium),
+            "high" => Some(Effort::High),
+            "xhigh" => Some(Effort::Xhigh),
+            _ => {
+                self.push_entry(Entry::Info(
+                    "usage: /effort <auto|low|medium|high|xhigh>".to_string(),
+                ));
+                return;
+            }
+        };
+        if effort.is_some_and(|effort| !model_supports_effort(&session.config.model, effort)) {
+            self.push_entry(Entry::Info(
+                "reasoning effort xhigh requires an xAI multi-agent model".to_string(),
+            ));
+            return;
+        }
+        if effort == session.config.effort {
+            self.push_entry(Entry::Info(format!(
+                "reasoning effort already active · {requested}"
+            )));
+            return;
+        }
+        let Ok(dir) = sessions_dir() else {
+            self.push_entry(Entry::Error(
+                "cannot persist effort switch: session directory unavailable".to_string(),
+            ));
+            return;
+        };
+        let session_id = session.id;
+        let label = requested.to_string();
+        self.running = true;
+        self.push_entry(Entry::Info(format!(
+            "saving reasoning effort · {requested}"
+        )));
+        self.effort_handle = Some(tokio::spawn(async move {
+            let result = SessionMeta::update_effort(&dir, session_id, effort).await;
+            EffortSaveOutcome {
+                effort,
+                label,
+                result,
+            }
+        }));
     }
 
     fn handle_server_tools(&mut self, input: &str) {
@@ -1270,6 +1577,13 @@ impl App {
         let Some(session) = self.session.as_ref() else {
             return;
         };
+        if !session.config.isolated_worktree {
+            self.push_entry(Entry::Info(
+                "foreground undo is not available yet · GrokForge leaves shared-worktree edits uncommitted to avoid racing your editor; review with git diff"
+                    .to_string(),
+            ));
+            return;
+        }
         let root = session.config.workspace_root.clone();
         let id = session.id;
         self.follow = true;
@@ -1528,6 +1842,64 @@ impl App {
         match result {
             Ok(entry) => self.push_entry(entry),
             Err(error) => self.push_entry(Entry::Error(format!("undo task failed: {error}"))),
+        }
+        self.finish_quit_if_quiescent();
+    }
+
+    fn finish_model_save(&mut self, result: Result<ModelSaveOutcome, tokio::task::JoinError>) {
+        self.model_handle.take();
+        self.running = false;
+        match result {
+            Ok(ModelSaveOutcome {
+                model,
+                context_window,
+                result: Ok(()),
+            }) => {
+                if let Some(session) = self.session.as_mut() {
+                    session.config.model.clone_from(&model);
+                    session.config.context_window_tokens = context_window;
+                }
+                self.status_model.clone_from(&model);
+                self.push_entry(Entry::Info(format!(
+                    "model active · {model} · saved for resume"
+                )));
+            }
+            Ok(ModelSaveOutcome {
+                result: Err(error), ..
+            }) => self.push_entry(Entry::Error(format!(
+                "model switch was not applied because session metadata could not be saved: {error}"
+            ))),
+            Err(error) => {
+                self.push_entry(Entry::Error(format!("model switch task failed: {error}")));
+            }
+        }
+        self.finish_quit_if_quiescent();
+    }
+
+    fn finish_effort_save(&mut self, result: Result<EffortSaveOutcome, tokio::task::JoinError>) {
+        self.effort_handle.take();
+        self.running = false;
+        match result {
+            Ok(EffortSaveOutcome {
+                effort,
+                label,
+                result: Ok(()),
+            }) => {
+                if let Some(session) = self.session.as_mut() {
+                    session.config.effort = effort;
+                }
+                self.push_entry(Entry::Info(format!(
+                    "reasoning effort active · {label} · saved for resume"
+                )));
+            }
+            Ok(EffortSaveOutcome {
+                result: Err(error), ..
+            }) => self.push_entry(Entry::Error(format!(
+                "effort switch was not applied because session metadata could not be saved: {error}"
+            ))),
+            Err(error) => {
+                self.push_entry(Entry::Error(format!("effort switch task failed: {error}")));
+            }
         }
         self.finish_quit_if_quiescent();
     }
@@ -2271,6 +2643,22 @@ impl App {
     }
 }
 
+/// Encode a picker result in the quoted syntax understood by the core attachment parser. Always
+/// quoting keeps paths with whitespace lossless; quotes and backslashes use the parser's two
+/// explicit escape sequences.
+fn format_at_mention(path: &str) -> String {
+    let mut mention = String::with_capacity(path.len().saturating_add(4));
+    mention.push_str("@\"");
+    for character in path.chars() {
+        if matches!(character, '\"' | '\\') {
+            mention.push('\\');
+        }
+        mention.push(character);
+    }
+    mention.push_str("\" ");
+    mention
+}
+
 async fn wait_for_turn(
     handle: &mut Option<JoinHandle<TurnOutcome>>,
 ) -> Result<TurnOutcome, tokio::task::JoinError> {
@@ -2283,6 +2671,24 @@ async fn wait_for_turn(
 async fn wait_for_undo(
     handle: &mut Option<JoinHandle<Entry>>,
 ) -> Result<Entry, tokio::task::JoinError> {
+    match handle {
+        Some(handle) => handle.await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_for_model_save(
+    handle: &mut Option<JoinHandle<ModelSaveOutcome>>,
+) -> Result<ModelSaveOutcome, tokio::task::JoinError> {
+    match handle {
+        Some(handle) => handle.await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_for_effort_save(
+    handle: &mut Option<JoinHandle<EffortSaveOutcome>>,
+) -> Result<EffortSaveOutcome, tokio::task::JoinError> {
     match handle {
         Some(handle) => handle.await,
         None => std::future::pending().await,
@@ -3796,10 +4202,12 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use futures::FutureExt as _;
     use grokforge_core::{Agent, Session, SessionConfig, ToolRegistry};
     use grokforge_protocol::{Decision, DenialClass, EventMsg, LedgerEntry, ResponseItem, Usage};
     use grokforge_sandbox::PassthroughRunner;
-    use grokforge_xai::{ServerTool, XaiClient};
+    use grokforge_xai::{Effort, ModelInfo, ServerTool, XaiClient};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
@@ -3807,13 +4215,41 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        AgentLane, App, ApprovalDetail, DisplayMode, Entry, LaneStatus, MAX_COMPOSER_BYTES,
-        TurnOutcome,
+        AgentLane, App, ApprovalDetail, DisplayMode, EffortSaveOutcome, Entry, LaneStatus,
+        MAX_COMPOSER_BYTES, MOUSE_SCROLL_ROWS, ModelSaveOutcome, PlanConfigRestore, TurnOutcome,
+        format_at_mention,
     };
     use crate::approver::ChannelApprover;
 
     fn test_app() -> App {
         test_app_with_history(Vec::new())
+    }
+
+    #[test]
+    fn attachment_picker_quotes_and_escapes_selected_paths() {
+        assert_eq!(
+            format_at_mention("docs/design notes.md"),
+            "@\"docs/design notes.md\" "
+        );
+        assert_eq!(
+            format_at_mention("docs/a\"quote\\name.md"),
+            "@\"docs/a\\\"quote\\\\name.md\" "
+        );
+
+        let mut app = test_app();
+        app.composer = "inspect @design".to_string();
+        app.complete_at_item("docs/design notes.md");
+        assert_eq!(app.composer, "inspect @\"docs/design notes.md\" ");
+        assert!(app.at_selection.is_none());
+    }
+
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     fn test_app_with_history(history: Vec<ResponseItem>) -> App {
@@ -3849,6 +4285,16 @@ mod tests {
             ascii: false,
         };
         app
+    }
+
+    fn advertised_model(id: &str, aliases: &[&str], context_window: u64) -> ModelInfo {
+        ModelInfo {
+            id: id.to_string(),
+            created: None,
+            owned_by: Some("xai".to_string()),
+            aliases: aliases.iter().map(|alias| (*alias).to_string()).collect(),
+            context_window: Some(context_window),
+        }
     }
 
     fn buffer_text(app: &App, w: u16, h: u16) -> String {
@@ -4148,6 +4594,163 @@ mod tests {
         assert!(frame.contains("Review changes carefully"));
         assert!(frame.contains("☁  xAI TOOL  web search  ● ON"));
         assert!(frame.contains("metered"));
+    }
+
+    #[test]
+    fn model_command_uses_the_startup_catalog() {
+        let mut app = test_app();
+        app.session
+            .as_mut()
+            .expect("session")
+            .config
+            .model_catalog
+            .push(ModelInfo {
+                id: "grok-4.5".to_string(),
+                created: None,
+                owned_by: Some("xai".to_string()),
+                aliases: vec!["grok-4.5-latest".to_string()],
+                context_window: Some(500_000),
+            });
+
+        app.handle_slash("model");
+        assert!(
+            app.transcript
+                .iter()
+                .any(|entry| matches!(entry, Entry::Info(text) if text.contains("grok-4.5")))
+        );
+
+        app.running = true;
+        app.finish_model_save(Ok(ModelSaveOutcome {
+            model: "grok-4.5".to_string(),
+            context_window: Some(500_000),
+            result: Ok(()),
+        }));
+        let session = app.session.as_ref().expect("session");
+        assert_eq!(session.config.model, "grok-4.5");
+        assert_eq!(session.config.context_window_tokens, Some(500_000));
+        assert_eq!(app.status_model, "grok-4.5");
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn incompatible_effort_and_model_switches_are_rejected_before_persistence() {
+        let mut app = test_app();
+        app.handle_slash("effort xhigh");
+        assert_eq!(app.session.as_ref().expect("session").config.effort, None);
+        assert!(app.effort_handle.is_none());
+        assert!(
+            app.transcript.iter().any(
+                |entry| matches!(entry, Entry::Info(text) if text.contains("multi-agent model"))
+            )
+        );
+
+        let session = app.session.as_mut().expect("session");
+        session.config.model = "grok-fast-multi-agent".to_string();
+        session.config.effort = Some(Effort::Xhigh);
+        session
+            .config
+            .model_catalog
+            .push(advertised_model("grok-4.5", &[], 500_000));
+        app.handle_model("grok-4.5");
+        let session = app.session.as_ref().expect("session");
+        assert_eq!(session.config.model, "grok-fast-multi-agent");
+        assert_eq!(session.config.effort, Some(Effort::Xhigh));
+        assert!(app.model_handle.is_none());
+    }
+
+    #[test]
+    fn successful_effort_save_updates_memory_only_after_persistence() {
+        let mut app = test_app();
+        assert_eq!(app.session.as_ref().expect("session").config.effort, None);
+        app.running = true;
+        app.finish_effort_save(Ok(EffortSaveOutcome {
+            effort: Some(Effort::High),
+            label: "high".to_string(),
+            result: Ok(()),
+        }));
+        assert_eq!(
+            app.session.as_ref().expect("session").config.effort,
+            Some(Effort::High)
+        );
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn plan_routing_installs_catalog_model_context_and_high_then_restores() {
+        let mut app = test_app();
+        let session = app.session.as_mut().expect("session");
+        session.config.model = "grok-build-0.1".to_string();
+        session.config.plan_model = "plan-latest".to_string();
+        session.config.context_window_tokens = Some(256_000);
+        session.config.effort = Some(Effort::Low);
+        session
+            .config
+            .model_catalog
+            .push(advertised_model("grok-4.5", &["plan-latest"], 500_000));
+
+        let restore = PlanConfigRestore::apply(session).expect("plan model");
+        assert_eq!(session.config.model, "grok-4.5");
+        assert_eq!(session.config.context_window_tokens, Some(500_000));
+        assert_eq!(session.config.effort, Some(Effort::High));
+
+        restore.restore(session);
+        assert_eq!(session.config.model, "grok-build-0.1");
+        assert_eq!(session.config.context_window_tokens, Some(256_000));
+        assert_eq!(session.config.effort, Some(Effort::Low));
+    }
+
+    #[tokio::test]
+    async fn plan_routing_restores_all_fields_after_a_caught_panic() {
+        let mut app = test_app();
+        let session = app.session.as_mut().expect("session");
+        session.config.plan_model = "grok-4.5".to_string();
+        session.config.context_window_tokens = Some(256_000);
+        session.config.effort = None;
+        session
+            .config
+            .model_catalog
+            .push(advertised_model("grok-4.5", &[], 500_000));
+        let original_model = session.config.model.clone();
+
+        let restore = PlanConfigRestore::apply(session).expect("plan model");
+        let panic = std::panic::AssertUnwindSafe(async { panic!("plan failed") })
+            .catch_unwind()
+            .await;
+        assert!(panic.is_err());
+        restore.restore(session);
+
+        assert_eq!(session.config.model, original_model);
+        assert_eq!(session.config.context_window_tokens, Some(256_000));
+        assert_eq!(session.config.effort, None);
+    }
+
+    #[test]
+    fn plan_routing_rejects_an_unadvertised_configured_model() {
+        let mut app = test_app();
+        let session = app.session.as_mut().expect("session");
+        session.config.plan_model = "retired-plan-model".to_string();
+        session
+            .config
+            .model_catalog
+            .push(advertised_model("grok-4.5", &[], 500_000));
+        let original_model = session.config.model.clone();
+
+        assert!(PlanConfigRestore::apply(session).is_err());
+        assert_eq!(session.config.model, original_model);
+        assert_eq!(session.config.effort, None);
+    }
+
+    #[test]
+    fn foreground_undo_is_honest_instead_of_spawning_a_noop_git_task() {
+        let mut app = test_app();
+
+        app.handle_slash("undo");
+
+        assert!(!app.running);
+        assert!(app.undo_handle.is_none());
+        assert!(app.transcript.iter().any(
+            |entry| matches!(entry, Entry::Info(text) if text.contains("foreground undo is not available"))
+        ));
     }
 
     #[test]
@@ -4710,6 +5313,74 @@ mod tests {
         let text = buffer_text(&app, 60, 12);
         assert!(text.contains("message-49"));
         assert!(!text.contains("GrokForge — type"));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_transcript_and_resumes_follow_at_latest() {
+        let mut app = test_app();
+        app.transcript
+            .push(Entry::Assistant("scrollable transcript".to_string()));
+
+        app.on_mouse(mouse(MouseEventKind::ScrollUp));
+        assert!(!app.follow);
+        assert_eq!(app.scroll, MOUSE_SCROLL_ROWS);
+
+        app.on_mouse(mouse(MouseEventKind::ScrollUp));
+        assert_eq!(app.scroll, MOUSE_SCROLL_ROWS * 2);
+
+        app.on_mouse(mouse(MouseEventKind::ScrollDown));
+        assert!(!app.follow);
+        assert_eq!(app.scroll, MOUSE_SCROLL_ROWS);
+
+        app.on_mouse(mouse(MouseEventKind::ScrollDown));
+        assert!(app.follow);
+        assert_eq!(app.scroll, 0);
+
+        // Follow mode owns offset zero; scrolling toward the latest transcript repairs stale state.
+        app.scroll = 99;
+        app.on_mouse(mouse(MouseEventKind::ScrollDown));
+        assert!(app.follow);
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_is_bounded_and_welcome_screen_stays_in_follow_mode() {
+        let mut app = test_app();
+        app.on_mouse(mouse(MouseEventKind::ScrollUp));
+        assert!(app.follow);
+        assert_eq!(app.scroll, 0);
+
+        app.streaming = Some("live response".to_string());
+        app.on_mouse(mouse(MouseEventKind::ScrollUp));
+        assert!(!app.follow);
+        assert_eq!(app.scroll, MOUSE_SCROLL_ROWS);
+
+        app.scroll = u16::MAX - 1;
+        app.on_mouse(mouse(MouseEventKind::ScrollUp));
+        assert_eq!(app.scroll, u16::MAX);
+    }
+
+    #[test]
+    fn mouse_click_drag_and_motion_events_are_state_preserving() {
+        let mut app = test_app();
+        app.transcript
+            .push(Entry::Assistant("existing transcript".to_string()));
+        app.composer = "keep this draft".to_string();
+        app.follow = false;
+        app.scroll = 7;
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+        ] {
+            app.on_mouse(mouse(kind));
+        }
+
+        assert_eq!(app.composer, "keep this draft");
+        assert!(!app.follow);
+        assert_eq!(app.scroll, 7);
     }
 
     #[test]

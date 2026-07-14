@@ -11,37 +11,83 @@
 //! come from `XAI_API_KEY` because stdin is the protocol channel (no password prompt). Session
 //! persistence, `session/load`, and client `fs`/`terminal` calls are intentionally deferred.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use grokforge_core::mcp_config::{
+    EditorMcpError, EditorStdioServer, MAX_EDITOR_MCP_ARGS, MAX_EDITOR_MCP_ENV,
+    MAX_EDITOR_MCP_SERVERS,
+};
 use grokforge_core::{
     Agent, Approver, RolloutWriter, Session, SessionConfig, ToolRegistry, TurnCancellation,
 };
 use grokforge_protocol::{ApprovalRequest, Decision, EventMsg, StopReason};
-use grokforge_xai::XaiClient;
+use grokforge_xai::{Effort, XaiClient, model_supports_effort};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 const PROTOCOL_VERSION: i64 = 1;
+const ACP_STDIO_SERVER_FIELDS: [&str; 5] = ["name", "command", "args", "env", "_meta"];
+const ACP_STDIO_REQUIRED_FIELDS: [&str; 4] = ["name", "command", "args", "env"];
+/// ACP clients can include editor buffers as embedded resources. Keep one prompt below the core's
+/// conservative context budget and prevent an untrusted client from making persistence allocate
+/// without bound before the model request is assembled.
+const MAX_ACP_PROMPT_BYTES: usize = 512 * 1024;
+/// Bound the complete newline-delimited JSON-RPC envelope before parsing. MCP declarations can be
+/// larger than a prompt because their per-server environment caps are aggregate, but a client can
+/// never make the ACP process buffer an unbounded line.
+const MAX_ACP_JSON_LINE_BYTES: usize = 4 * 1024 * 1024;
+/// A disconnected or broken editor must not leave a turn blocked on permission forever.
+const PERMISSION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Run the ACP agent server over stdio until the client closes stdin.
-pub async fn run(trust_project_mcp: bool) -> ExitCode {
+pub async fn run(
+    trust_project_mcp: bool,
+    trust_project_config: bool,
+    model_override: Option<String>,
+    effort_override: Option<String>,
+) -> ExitCode {
     // stdin is the JSON-RPC channel, so a password prompt is impossible: require `XAI_API_KEY`.
-    let api_key = match std::env::var("XAI_API_KEY") {
-        Ok(key) if !key.trim().is_empty() => key,
-        _ => {
+    let Some(api_key) = acp_api_key() else {
+        eprintln!(
+            "grokforge acp: set XAI_API_KEY in the agent's environment (stdin is the ACP channel, so interactive sign-in is unavailable)"
+        );
+        return ExitCode::from(3);
+    };
+    let startup_workspace = match std::env::current_dir().and_then(std::fs::canonicalize) {
+        Ok(path) if path.is_dir() => path,
+        Ok(path) => {
             eprintln!(
-                "grokforge acp: set XAI_API_KEY in the agent's environment (stdin is the ACP channel, so interactive sign-in is unavailable)"
+                "grokforge acp: current workspace is not a directory: {}",
+                path.display()
             );
-            return ExitCode::from(3);
+            return ExitCode::from(2);
+        }
+        Err(error) => {
+            eprintln!("grokforge acp: cannot resolve current workspace: {error}");
+            return ExitCode::from(2);
         }
     };
-    let base_url = std::env::var("XAI_BASE_URL").unwrap_or_else(|_| "https://api.x.ai".to_string());
+    let startup_settings = match grokforge_config::Config::load_with_project_config(
+        &startup_workspace,
+        trust_project_config,
+    ) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!(
+                "grokforge acp: configuration error: {}",
+                crate::sanitize_terminal(&error.to_string())
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let base_url = std::env::var("XAI_BASE_URL").unwrap_or(startup_settings.provider.grok.base_url);
     let client = match XaiClient::new(&base_url, api_key) {
         Ok(client) => client,
         Err(error) => {
@@ -52,12 +98,6 @@ pub async fn run(trust_project_mcp: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let model = "grok-build-0.1".to_string();
-    if let Err(code) = crate::validate_model_startup(&client, &model).await {
-        return code;
-    }
-    let context_window_tokens = client.model_context_window(&model).await;
-
     // Writer task: every outgoing message is one JSON line on stdout.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
     let writer = tokio::spawn(async move {
@@ -81,20 +121,30 @@ pub async fn run(trust_project_mcp: bool) -> ExitCode {
             next_id: AtomicI64::new(1),
         }),
         sessions: Mutex::new(HashMap::new()),
-        cancels: Mutex::new(HashMap::new()),
         client,
-        model,
-        context_window_tokens,
+        model_override,
+        effort_override,
         trust_project_mcp,
+        trust_project_config,
     });
 
     let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if line.trim().is_empty() {
+    let mut reader = BufReader::new(stdin);
+    loop {
+        let line = match read_bounded_json_line(&mut reader).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(error) => {
+                eprintln!("grokforge acp: invalid input: {error}");
+                drop(connection);
+                let _ = writer.await;
+                return ExitCode::from(2);
+            }
+        };
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+        let Ok(message) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
         // Handle each message on its own task so a long `session/prompt` never blocks reading the
@@ -105,6 +155,78 @@ pub async fn run(trust_project_mcp: bool) -> ExitCode {
     drop(connection);
     let _ = writer.await;
     ExitCode::SUCCESS
+}
+
+fn acp_api_key() -> Option<String> {
+    let key = std::env::var("XAI_API_KEY").ok()?;
+    if key.trim().is_empty() {
+        return None;
+    }
+    Some(key)
+}
+
+/// Read one newline-delimited ACP message without ever retaining more than the configured cap.
+/// Once a line overflows, the remainder is drained through its newline before returning the error
+/// so callers that choose to recover cannot desynchronize the transport.
+async fn read_bounded_json_line<R>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+    let mut overflowed = false;
+    loop {
+        let (consumed, ended, eof) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                (0, false, true)
+            } else if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+                if !overflowed {
+                    if line
+                        .len()
+                        .checked_add(newline)
+                        .is_none_or(|length| length > MAX_ACP_JSON_LINE_BYTES)
+                    {
+                        overflowed = true;
+                    } else {
+                        line.extend_from_slice(&available[..newline]);
+                    }
+                }
+                (newline + 1, true, false)
+            } else {
+                if !overflowed {
+                    if line
+                        .len()
+                        .checked_add(available.len())
+                        .is_none_or(|length| length > MAX_ACP_JSON_LINE_BYTES)
+                    {
+                        overflowed = true;
+                    } else {
+                        line.extend_from_slice(available);
+                    }
+                }
+                (available.len(), false, false)
+            }
+        };
+
+        if consumed > 0 {
+            reader.consume(consumed);
+        }
+        if ended || eof {
+            if overflowed {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("ACP JSON-RPC line exceeds {MAX_ACP_JSON_LINE_BYTES} bytes"),
+                ));
+            }
+            if eof && line.is_empty() {
+                return Ok(None);
+            }
+            if line.ends_with(b"\r") {
+                line.pop();
+            }
+            return Ok(Some(line));
+        }
+    }
 }
 
 /// The outgoing side plus outstanding agent→client requests. Held by both the [`Connection`] and
@@ -121,13 +243,45 @@ impl Shared {
     }
 
     /// Send an agent→client request and await its response message (or `None` if the connection
-    /// closes first).
-    async fn request(&self, method: &str, params: Value) -> Option<Value> {
+    /// closes or the client does not answer before the permission deadline).
+    async fn request(self: &Arc<Self>, method: &str, params: Value) -> Option<Value> {
+        self.request_with_timeout(method, params, PERMISSION_RESPONSE_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout(
+        self: &Arc<Self>,
+        method: &str,
+        params: Value,
+        response_timeout: Duration,
+    ) -> Option<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
-        rx.await.ok()
+        if self
+            .out_tx
+            .send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+            .is_err()
+        {
+            self.pending.lock().await.remove(&id);
+            return None;
+        }
+        // Keep expiry independent from this request future. The core deliberately drops an
+        // in-flight approval future when a turn is cancelled; this task still removes its sender
+        // at the deadline, so cancellation cannot leak a pending request forever.
+        let expiry = {
+            let shared = Arc::clone(self);
+            tokio::spawn(async move {
+                tokio::time::sleep(response_timeout).await;
+                shared.pending.lock().await.remove(&id);
+            })
+        };
+        let response = rx.await.ok();
+        expiry.abort();
+        // `resolve` normally removed the sender before delivering the response. This also closes
+        // the race where expiry and a response become ready together.
+        self.pending.lock().await.remove(&id);
+        response
     }
 
     async fn resolve(&self, id: i64, message: Value) {
@@ -139,12 +293,21 @@ impl Shared {
 
 struct Connection {
     shared: Arc<Shared>,
-    sessions: Mutex<HashMap<String, Arc<Mutex<SessionEntry>>>>,
-    cancels: Mutex<HashMap<String, TurnCancellation>>,
+    sessions: Mutex<HashMap<String, Arc<SessionSlot>>>,
     client: XaiClient,
-    model: String,
-    context_window_tokens: Option<u64>,
+    model_override: Option<String>,
+    effort_override: Option<String>,
     trust_project_mcp: bool,
+    trust_project_config: bool,
+}
+
+/// Per-session prompt serialization plus separately lockable cancellation state. A queued prompt
+/// must acquire `entry` before installing its token, so it cannot replace the token belonging to
+/// the currently running prompt. `session/cancel` only needs `active_prompt`, so it never waits for
+/// the long-lived turn guard.
+struct SessionSlot {
+    entry: Mutex<SessionEntry>,
+    active_prompt: Mutex<ActivePrompt>,
 }
 
 struct SessionEntry {
@@ -152,6 +315,35 @@ struct SessionEntry {
     session: Session,
     rollout: Option<RolloutWriter>,
     events_rx: mpsc::UnboundedReceiver<EventMsg>,
+}
+
+#[derive(Default)]
+struct ActivePrompt {
+    cancellation: Option<Arc<TurnCancellation>>,
+}
+
+impl ActivePrompt {
+    fn install(&mut self, cancellation: Arc<TurnCancellation>) {
+        self.cancellation = Some(cancellation);
+    }
+
+    fn cancel(&self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+    }
+
+    /// Clear only the token owned by the finishing prompt. Pointer identity prevents stale cleanup
+    /// from deleting a newer token if prompt scheduling changes in the future.
+    fn clear_if_owner(&mut self, owner: &Arc<TurnCancellation>) {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, owner))
+        {
+            self.cancellation = None;
+        }
+    }
 }
 
 impl Connection {
@@ -197,10 +389,42 @@ impl Connection {
             .pointer("/params/cwd")
             .and_then(Value::as_str)
             .ok_or((-32602, "session/new requires an absolute `cwd`".to_string()))?;
-        let workspace = std::fs::canonicalize(PathBuf::from(cwd))
-            .map_err(|error| (-32602, format!("invalid cwd: {error}")))?;
-        if !workspace.is_dir() {
-            return Err((-32602, "cwd is not a directory".to_string()));
+        let workspace = canonical_session_cwd(cwd).map_err(|message| (-32602, message))?;
+        // Validate the complete editor process list before model discovery or either editor/project
+        // MCP startup. Unsupported transports and malformed later entries therefore cannot arrive
+        // after an earlier stdio command has already executed.
+        let editor_mcp = parse_editor_mcp_servers(message).map_err(|message| (-32602, message))?;
+        let settings = grokforge_config::Config::load_with_project_config(
+            &workspace,
+            self.trust_project_config,
+        )
+        .map_err(|error| (-32602, format!("invalid GrokForge configuration: {error}")))?;
+        let model = self
+            .model_override
+            .clone()
+            .unwrap_or_else(|| settings.agent.default_model.clone());
+        let model_catalog = crate::model_catalog_startup(&self.client, &model)
+            .await
+            .map_err(|_| (-32002, format!("model `{model}` is unavailable")))?;
+        let selected_model = model_catalog.iter().find(|candidate| {
+            candidate.id == model || candidate.aliases.iter().any(|alias| alias == &model)
+        });
+        let active_model = selected_model.map_or(model, |candidate| candidate.id.clone());
+        let context_window_tokens = selected_model.and_then(|candidate| candidate.context_window);
+        let effort = match self.effort_override.as_deref() {
+            Some("auto") => None,
+            Some("low") => Some(Effort::Low),
+            Some("medium") => Some(Effort::Medium),
+            Some("high") => Some(Effort::High),
+            Some("xhigh") => Some(Effort::Xhigh),
+            Some(_) => return Err((-32602, "invalid reasoning effort".to_string())),
+            None => settings.agent.effort.map(configured_effort),
+        };
+        if effort.is_some_and(|effort| !model_supports_effort(&active_model, effort)) {
+            return Err((
+                -32602,
+                "reasoning effort `xhigh` requires an xAI multi-agent model".to_string(),
+            ));
         }
 
         let session_id = grokforge_protocol::SessionId::new().to_string();
@@ -211,6 +435,20 @@ impl Connection {
         });
 
         let mut registry = ToolRegistry::with_builtins();
+        if let Err(error) = grokforge_core::mcp_config::connect_and_register_editor(
+            &workspace,
+            editor_mcp,
+            &mut registry,
+        )
+        .await
+        {
+            let code = match &error {
+                EditorMcpError::Invalid(_) => -32602,
+                EditorMcpError::StartupTimeout => -32800,
+                _ => -32603,
+            };
+            return Err((code, error.to_string()));
+        }
         if self.trust_project_mcp {
             grokforge_core::mcp_config::connect_and_register_trusted(&workspace, &mut registry)
                 .await;
@@ -221,18 +459,28 @@ impl Connection {
         let agent =
             Agent::new(self.client.clone(), registry, sandbox, approver, events_tx).interactive();
 
-        let mut config = SessionConfig::new(workspace, self.model.clone());
-        config.context_window_tokens = self.context_window_tokens;
+        let mut config = SessionConfig::new(workspace, active_model);
+        config.plan_model = settings.agent.plan_model;
+        config.model_catalog = model_catalog;
+        config.context_window_tokens = context_window_tokens;
+        config.max_iterations = settings.agent.max_iterations;
+        config.auto_compact = settings.agent.auto_compact;
+        config.compaction_trigger_bytes = settings.agent.compaction_trigger_bytes;
+        config.compaction_keep_tail = settings.agent.compaction_keep_tail;
+        config.effort = effort;
         let session = Session::new(config);
 
         self.sessions.lock().await.insert(
             session_id.clone(),
-            Arc::new(Mutex::new(SessionEntry {
-                agent,
-                session,
-                rollout: None,
-                events_rx,
-            })),
+            Arc::new(SessionSlot {
+                entry: Mutex::new(SessionEntry {
+                    agent,
+                    session,
+                    rollout: None,
+                    events_rx,
+                }),
+                active_prompt: Mutex::new(ActivePrompt::default()),
+            }),
         );
         Ok(json!({ "sessionId": session_id }))
     }
@@ -246,23 +494,33 @@ impl Connection {
             self.respond_error(id, -32602, "session/prompt requires sessionId");
             return;
         };
-        let Some(entry_arc) = self.sessions.lock().await.get(&session_id).cloned() else {
+        let Some(slot) = self.sessions.lock().await.get(&session_id).cloned() else {
             self.respond_error(id, -32602, "unknown sessionId");
             return;
         };
-        let text = extract_prompt_text(message.pointer("/params/prompt"));
+        let text = match extract_prompt_text(message.pointer("/params/prompt")) {
+            Ok(text) => text,
+            Err(PromptTextError::TooLarge) => {
+                self.respond_error(
+                    id,
+                    -32602,
+                    &format!(
+                        "session/prompt text and embedded resources exceed the {MAX_ACP_PROMPT_BYTES}-byte limit"
+                    ),
+                );
+                return;
+            }
+        };
         if text.trim().is_empty() {
             self.respond(id, json!({ "stopReason": "end_turn" }));
             return;
         }
 
-        let cancel = TurnCancellation::new();
-        self.cancels
-            .lock()
-            .await
-            .insert(session_id.clone(), cancel.clone());
-
-        let mut entry = entry_arc.lock().await;
+        // Acquire prompt ownership before publishing the cancellation token. A second prompt for
+        // this session queues here and therefore cannot steal cancellation from the running turn.
+        let mut entry = slot.entry.lock().await;
+        let cancel = Arc::new(TurnCancellation::new());
+        slot.active_prompt.lock().await.install(Arc::clone(&cancel));
         let SessionEntry {
             agent,
             session,
@@ -283,16 +541,18 @@ impl Connection {
         while let Ok(event) = events_rx.try_recv() {
             self.emit_update(&session_id, event, &mut saw_delta);
         }
+        slot.active_prompt.lock().await.clear_if_owner(&cancel);
         drop(entry);
-        self.cancels.lock().await.remove(&session_id);
         self.respond(id, json!({ "stopReason": stop_reason(&stop) }));
     }
 
     async fn cancel(&self, message: &Value) {
-        if let Some(session_id) = message.pointer("/params/sessionId").and_then(Value::as_str)
-            && let Some(token) = self.cancels.lock().await.get(session_id)
-        {
-            token.cancel();
+        let Some(session_id) = message.pointer("/params/sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        let slot = self.sessions.lock().await.get(session_id).cloned();
+        if let Some(slot) = slot {
+            slot.active_prompt.lock().await.cancel();
         }
     }
 
@@ -376,6 +636,15 @@ impl Connection {
     }
 }
 
+fn configured_effort(effort: grokforge_config::Effort) -> Effort {
+    match effort {
+        grokforge_config::Effort::Low => Effort::Low,
+        grokforge_config::Effort::Medium => Effort::Medium,
+        grokforge_config::Effort::High => Effort::High,
+        grokforge_config::Effort::Xhigh => Effort::Xhigh,
+    }
+}
+
 /// An [`Approver`] that forwards each core approval request to the ACP client as a
 /// `session/request_permission` request and maps the selected option back to a [`Decision`].
 struct AcpApprover {
@@ -437,6 +706,119 @@ fn initialize_result() -> Value {
     })
 }
 
+/// Parse only the official ACP v1 stdio shape. The exact-key checks intentionally reject HTTP,
+/// SSE, and extension transport fields rather than guessing how to execute them.
+fn parse_editor_mcp_servers(message: &Value) -> Result<Vec<EditorStdioServer>, String> {
+    let Some(raw_servers) = message.pointer("/params/mcpServers") else {
+        return Ok(Vec::new());
+    };
+    let servers = raw_servers
+        .as_array()
+        .ok_or_else(|| "session/new `mcpServers` must be an array".to_string())?;
+    if servers.len() > MAX_EDITOR_MCP_SERVERS {
+        return Err(format!(
+            "session/new accepts at most {MAX_EDITOR_MCP_SERVERS} MCP servers"
+        ));
+    }
+
+    let mut parsed = Vec::with_capacity(servers.len());
+    let mut names = BTreeSet::new();
+    for (server_index, raw_server) in servers.iter().enumerate() {
+        let server = raw_server
+            .as_object()
+            .ok_or_else(|| format!("mcpServers[{server_index}] must be a stdio server object"))?;
+        if server
+            .keys()
+            .any(|key| !ACP_STDIO_SERVER_FIELDS.contains(&key.as_str()))
+        {
+            return Err(format!(
+                "mcpServers[{server_index}] contains an unsupported field; only stdio `name`, `command`, `args`, and `env` are accepted"
+            ));
+        }
+        if ACP_STDIO_REQUIRED_FIELDS
+            .iter()
+            .any(|field| !server.contains_key(*field))
+        {
+            return Err(format!(
+                "mcpServers[{server_index}] requires `name`, `command`, `args`, and `env`"
+            ));
+        }
+        let name = server["name"]
+            .as_str()
+            .ok_or_else(|| format!("mcpServers[{server_index}].name must be a string"))?;
+        let command = server["command"]
+            .as_str()
+            .ok_or_else(|| format!("mcpServers[{server_index}].command must be a string"))?;
+        let raw_args = server["args"].as_array().ok_or_else(|| {
+            format!("mcpServers[{server_index}].args must be an array of strings")
+        })?;
+        if raw_args.len() > MAX_EDITOR_MCP_ARGS {
+            return Err(format!(
+                "mcpServers[{server_index}].args accepts at most {MAX_EDITOR_MCP_ARGS} entries"
+            ));
+        }
+        let mut args = Vec::with_capacity(raw_args.len());
+        for (arg_index, argument) in raw_args.iter().enumerate() {
+            args.push(argument.as_str().ok_or_else(|| {
+                format!("mcpServers[{server_index}].args[{arg_index}] must be a string")
+            })?);
+        }
+
+        let raw_env = server["env"].as_array().ok_or_else(|| {
+            format!("mcpServers[{server_index}].env must be an array of name/value objects")
+        })?;
+        if raw_env.len() > MAX_EDITOR_MCP_ENV {
+            return Err(format!(
+                "mcpServers[{server_index}].env accepts at most {MAX_EDITOR_MCP_ENV} entries"
+            ));
+        }
+        let mut env = Vec::with_capacity(raw_env.len());
+        for (env_index, raw_entry) in raw_env.iter().enumerate() {
+            let entry = raw_entry.as_object().ok_or_else(|| {
+                format!("mcpServers[{server_index}].env[{env_index}] must be a name/value object")
+            })?;
+            if entry
+                .keys()
+                .any(|key| !matches!(key.as_str(), "name" | "value" | "_meta"))
+                || !entry.contains_key("name")
+                || !entry.contains_key("value")
+            {
+                return Err(format!(
+                    "mcpServers[{server_index}].env[{env_index}] accepts `name`, `value`, and optional `_meta`"
+                ));
+            }
+            let key = entry["name"].as_str().ok_or_else(|| {
+                format!("mcpServers[{server_index}].env[{env_index}].name must be a string")
+            })?;
+            let value = entry["value"].as_str().ok_or_else(|| {
+                format!("mcpServers[{server_index}].env[{env_index}].value must be a string")
+            })?;
+            env.push((key, value));
+        }
+
+        let declaration = EditorStdioServer::try_new(name, command, &args, &env)
+            .map_err(|error| format!("mcpServers[{server_index}]: {error}"))?;
+        if !names.insert(name) {
+            return Err("mcpServers names must be unique".to_string());
+        }
+        parsed.push(declaration);
+    }
+    Ok(parsed)
+}
+
+fn canonical_session_cwd(cwd: &str) -> Result<PathBuf, String> {
+    let requested = PathBuf::from(cwd);
+    if !requested.is_absolute() {
+        return Err("session/new requires an absolute `cwd`".to_string());
+    }
+    let workspace =
+        std::fs::canonicalize(&requested).map_err(|error| format!("invalid cwd: {error}"))?;
+    if !workspace.is_absolute() || !workspace.is_dir() {
+        return Err("cwd is not a canonical directory".to_string());
+    }
+    Ok(workspace)
+}
+
 /// Build the shared `agent_message_chunk` / `agent_thought_chunk` update body.
 fn chunk(session_update: &str, text: &str) -> Value {
     json!({ "sessionUpdate": session_update, "content": { "type": "text", "text": text } })
@@ -445,9 +827,14 @@ fn chunk(session_update: &str, text: &str) -> Value {
 /// Collect the text of an ACP prompt (an array of ContentBlock) into the plain string the core
 /// turn loop expects. Text and embedded `resource` file bodies are inlined; `resource_link`s are
 /// noted by URI.
-fn extract_prompt_text(prompt: Option<&Value>) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptTextError {
+    TooLarge,
+}
+
+fn extract_prompt_text(prompt: Option<&Value>) -> Result<String, PromptTextError> {
     let Some(blocks) = prompt.and_then(Value::as_array) else {
-        return String::new();
+        return Ok(String::new());
     };
     let mut out = String::new();
     for block in blocks {
@@ -455,34 +842,62 @@ fn extract_prompt_text(prompt: Option<&Value>) -> String {
             Some("text") => {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
                     if !out.is_empty() {
-                        out.push('\n');
+                        push_prompt_part(&mut out, "\n")?;
                     }
-                    out.push_str(text);
+                    push_prompt_part(&mut out, text)?;
                 }
             }
             Some("resource") => {
                 if let Some(resource) = block.get("resource") {
                     let uri = resource.get("uri").and_then(Value::as_str).unwrap_or("");
                     if let Some(text) = resource.get("text").and_then(Value::as_str) {
-                        out.push_str("\n\n<attachment path=\"");
-                        out.push_str(&uri.replace('"', "'"));
-                        out.push_str("\">\n");
-                        out.push_str(text);
-                        out.push_str("\n</attachment>\n");
+                        push_prompt_part(&mut out, "\n\n<attachment path=\"")?;
+                        push_prompt_attribute(&mut out, uri)?;
+                        push_prompt_part(&mut out, "\">\n")?;
+                        push_prompt_part(&mut out, text)?;
+                        push_prompt_part(&mut out, "\n</attachment>\n")?;
                     }
                 }
             }
             Some("resource_link") => {
                 if let Some(uri) = block.get("uri").and_then(Value::as_str) {
-                    out.push_str("\n[linked resource: ");
-                    out.push_str(uri);
-                    out.push(']');
+                    push_prompt_part(&mut out, "\n[linked resource: ")?;
+                    push_prompt_part(&mut out, uri)?;
+                    push_prompt_part(&mut out, "]")?;
                 }
             }
             _ => {}
         }
     }
-    out
+    Ok(out)
+}
+
+fn push_prompt_part(out: &mut String, value: &str) -> Result<(), PromptTextError> {
+    let total = out
+        .len()
+        .checked_add(value.len())
+        .ok_or(PromptTextError::TooLarge)?;
+    if total > MAX_ACP_PROMPT_BYTES {
+        return Err(PromptTextError::TooLarge);
+    }
+    out.try_reserve(value.len())
+        .map_err(|_| PromptTextError::TooLarge)?;
+    out.push_str(value);
+    Ok(())
+}
+
+/// Keep the synthetic attachment header on one line. Replacement characters are never wider than
+/// their source, but still flow through the same bounded append helper for a single size invariant.
+fn push_prompt_attribute(out: &mut String, value: &str) -> Result<(), PromptTextError> {
+    for character in value.chars() {
+        if character == '"' || character.is_control() {
+            push_prompt_part(out, "_")?;
+        } else {
+            let mut encoded = [0; 4];
+            push_prompt_part(out, character.encode_utf8(&mut encoded))?;
+        }
+    }
+    Ok(())
 }
 
 fn tool_kind(name: &str) -> &'static str {
@@ -525,7 +940,7 @@ mod tests {
             { "type": "resource_link", "uri": "file:///c.md" },
             { "type": "image", "data": "…", "mimeType": "image/png" }
         ]);
-        let out = extract_prompt_text(Some(&prompt));
+        let out = extract_prompt_text(Some(&prompt)).expect("bounded prompt");
         assert!(out.starts_with("explain this"));
         assert!(out.contains("<attachment path=\"file:///a/b.rs\">"));
         assert!(out.contains("fn x() {}"));
@@ -534,8 +949,293 @@ mod tests {
 
     #[test]
     fn empty_or_missing_prompt_is_empty() {
-        assert_eq!(extract_prompt_text(None), "");
-        assert_eq!(extract_prompt_text(Some(&json!([]))), "");
+        assert_eq!(extract_prompt_text(None).expect("missing prompt"), "");
+        assert_eq!(
+            extract_prompt_text(Some(&json!([]))).expect("empty prompt"),
+            ""
+        );
+    }
+
+    #[test]
+    fn prompt_text_and_resources_share_one_hard_byte_cap() {
+        let exact = json!([{ "type": "text", "text": "x".repeat(MAX_ACP_PROMPT_BYTES) }]);
+        assert_eq!(
+            extract_prompt_text(Some(&exact))
+                .expect("exact limit")
+                .len(),
+            MAX_ACP_PROMPT_BYTES
+        );
+
+        let over = json!([
+            { "type": "text", "text": "x".repeat(MAX_ACP_PROMPT_BYTES / 2) },
+            {
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///large.rs",
+                    "text": "y".repeat(MAX_ACP_PROMPT_BYTES / 2)
+                }
+            }
+        ]);
+        assert_eq!(
+            extract_prompt_text(Some(&over)),
+            Err(PromptTextError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn embedded_resource_attribute_stays_on_one_line() {
+        let prompt = json!([{
+            "type": "resource",
+            "resource": { "uri": "file:///bad\n\"name.rs", "text": "body" }
+        }]);
+        let out = extract_prompt_text(Some(&prompt)).expect("bounded prompt");
+        assert!(out.contains("<attachment path=\"file:///bad__name.rs\">"));
+    }
+
+    #[test]
+    fn session_cwd_must_be_absolute_and_resolves_to_a_directory() {
+        assert!(canonical_session_cwd("relative/project").is_err());
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let canonical = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
+        assert_eq!(
+            canonical_session_cwd(workspace.path().to_string_lossy().as_ref())
+                .expect("absolute directory"),
+            canonical
+        );
+
+        let file = workspace.path().join("not-a-directory");
+        std::fs::write(&file, "content").expect("fixture file");
+        assert!(canonical_session_cwd(file.to_string_lossy().as_ref()).is_err());
+    }
+
+    fn test_command_path() -> String {
+        std::env::current_exe()
+            .expect("current executable")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn session_new_with_mcp(servers: &Value) -> Value {
+        json!({ "params": { "mcpServers": servers } })
+    }
+
+    #[test]
+    fn parses_the_official_acp_stdio_mcp_shape() {
+        let message = session_new_with_mcp(&json!([{
+            "name": "Editor tools 🛠",
+            "command": test_command_path(),
+            "args": ["--stdio"],
+            "env": [{
+                "name": "DOCS-TOKEN",
+                "value": "explicit",
+                "_meta": { "editor": "test" }
+            }],
+            "_meta": { "editor": "test" }
+        }]));
+        assert_eq!(parse_editor_mcp_servers(&message).unwrap().len(), 1);
+        assert!(
+            parse_editor_mcp_servers(&json!({ "params": {} }))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_mcp_transports_and_fields() {
+        let command = test_command_path();
+        let unsupported = [
+            session_new_with_mcp(&json!({})),
+            session_new_with_mcp(&json!([{
+                "name": "remote",
+                "url": "https://example.invalid/mcp"
+            }])),
+            session_new_with_mcp(&json!([{
+                "name": "sse",
+                "command": command,
+                "args": [],
+                "env": [],
+                "transport": "sse"
+            }])),
+        ];
+        for message in unsupported {
+            assert!(parse_editor_mcp_servers(&message).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_or_oversized_mcp_entries() {
+        let command = test_command_path();
+        let malformed = [
+            session_new_with_mcp(&json!([{
+                "name": "relative",
+                "command": "python3",
+                "args": [],
+                "env": []
+            }])),
+            session_new_with_mcp(&json!([{
+                "name": "args",
+                "command": command,
+                "args": "--stdio",
+                "env": []
+            }])),
+            session_new_with_mcp(&json!([{
+                "name": "env",
+                "command": command,
+                "args": [],
+                "env": [{ "name": "BAD=NAME", "value": "x" }]
+            }])),
+            session_new_with_mcp(&json!([{
+                "name": "env",
+                "command": command,
+                "args": [],
+                "env": [{ "name": "OK", "value": "x", "secret": true }]
+            }])),
+            session_new_with_mcp(&json!([
+                { "name": "same", "command": command, "args": [], "env": [] },
+                { "name": "same", "command": command, "args": [], "env": [] }
+            ])),
+        ];
+        for message in malformed {
+            assert!(parse_editor_mcp_servers(&message).is_err());
+        }
+
+        let too_many_servers = (0..=MAX_EDITOR_MCP_SERVERS)
+            .map(|index| {
+                json!({
+                    "name": format!("server_{index}"),
+                    "command": command,
+                    "args": [],
+                    "env": []
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(parse_editor_mcp_servers(&session_new_with_mcp(&json!(too_many_servers))).is_err());
+        let too_many_args = vec!["x"; MAX_EDITOR_MCP_ARGS + 1];
+        assert!(
+            parse_editor_mcp_servers(&session_new_with_mcp(&json!([{
+                "name": "args",
+                "command": command,
+                "args": too_many_args,
+                "env": []
+            }])))
+            .is_err()
+        );
+        let too_many_env = (0..=MAX_EDITOR_MCP_ENV)
+            .map(|index| json!({ "name": format!("KEY_{index}"), "value": "x" }))
+            .collect::<Vec<_>>();
+        assert!(
+            parse_editor_mcp_servers(&session_new_with_mcp(&json!([{
+                "name": "env",
+                "command": command,
+                "args": [],
+                "env": too_many_env
+            }])))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_json_lines_are_bounded_and_overflow_is_fully_drained() {
+        let mut input = vec![b'x'; MAX_ACP_JSON_LINE_BYTES + 1];
+        input.extend_from_slice(b"\nnext\r\n");
+        let mut reader = BufReader::new(input.as_slice());
+
+        let error = read_bounded_json_line(&mut reader).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_bounded_json_line(&mut reader).await.unwrap(),
+            Some(b"next".to_vec())
+        );
+        assert_eq!(read_bounded_json_line(&mut reader).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn raw_json_line_accepts_the_exact_byte_limit() {
+        let mut input = vec![b'x'; MAX_ACP_JSON_LINE_BYTES];
+        input.push(b'\n');
+        let mut reader = BufReader::new(input.as_slice());
+
+        assert_eq!(
+            read_bounded_json_line(&mut reader)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            MAX_ACP_JSON_LINE_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn outgoing_request_times_out_and_removes_pending_sender() {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared {
+            out_tx,
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicI64::new(1),
+        });
+        let request = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move {
+                shared
+                    .request_with_timeout(
+                        "session/request_permission",
+                        json!({}),
+                        Duration::from_millis(10),
+                    )
+                    .await
+            })
+        };
+        let sent = out_rx.recv().await.expect("outgoing request");
+        let id = sent.get("id").and_then(Value::as_i64).expect("request id");
+        assert!(request.await.expect("request task").is_none());
+        assert!(!shared.pending.lock().await.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn cancelled_permission_future_still_expires_its_pending_sender() {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared {
+            out_tx,
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicI64::new(1),
+        });
+        let request = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move {
+                shared
+                    .request_with_timeout(
+                        "session/request_permission",
+                        json!({}),
+                        Duration::from_millis(10),
+                    )
+                    .await
+            })
+        };
+        let sent = out_rx.recv().await.expect("outgoing request");
+        let id = sent.get("id").and_then(Value::as_i64).expect("request id");
+        request.abort();
+        let _ = request.await;
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!shared.pending.lock().await.contains_key(&id));
+    }
+
+    #[test]
+    fn stale_prompt_cannot_clear_or_cancel_the_current_owner() {
+        let stale = Arc::new(TurnCancellation::new());
+        let current = Arc::new(TurnCancellation::new());
+        let mut active = ActivePrompt {
+            cancellation: Some(Arc::clone(&current)),
+        };
+
+        active.clear_if_owner(&stale);
+        active.cancel();
+        assert!(!stale.is_cancelled());
+        assert!(current.is_cancelled());
+
+        active.clear_if_owner(&current);
+        assert!(active.cancellation.is_none());
     }
 
     #[test]

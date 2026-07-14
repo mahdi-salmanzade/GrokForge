@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use grokforge_protocol::{ApprovalPolicy, NetworkMode, ResponseItem, SandboxMode, SessionId};
-use grokforge_xai::{Effort, ServerTool};
+use grokforge_xai::{Effort, ModelInfo, ServerTool};
 
 /// The default system prompt. Kept small on purpose (a bloated prompt burns tokens and cache).
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
@@ -17,6 +17,12 @@ Respect the sandbox and approval prompts. When the task is complete, give a shor
 pub struct SessionConfig {
     pub workspace_root: PathBuf,
     pub model: String,
+    /// Model used temporarily for interactive plan turns. Frontends may set this independently;
+    /// it is never written over the session's persisted active model.
+    pub plan_model: String,
+    /// Models advertised at startup. Kept in-memory so the TUI can validate `/model` switches
+    /// without another network request; empty when discovery was temporarily unavailable.
+    pub model_catalog: Vec<ModelInfo>,
     pub approval_policy: ApprovalPolicy,
     pub sandbox_mode: SandboxMode,
     /// Network capability granted to sandboxed commands for this session.
@@ -49,10 +55,11 @@ pub struct SessionConfig {
     pub context_window_tokens: Option<u64>,
 }
 
-/// Conservative bytes-per-token estimate. Real text is ~3.3–4.0 bytes/token; deliberately
-/// under-estimating means a given byte budget maps to *fewer* tokens, keeping the request safely
-/// under the model's token limit rather than risking a hard 400.
-const BYTES_PER_TOKEN: usize = 3;
+/// Worst-case serialized bytes per input token. Token-dense ASCII and source code can approach
+/// one token per byte, so using the more typical 3–4 bytes/token ratio would over-admit exactly
+/// the payloads a coding agent handles most often. At one byte/token, the number of tokenizer
+/// tokens cannot exceed the admitted UTF-8 request bytes.
+const WORST_CASE_BYTES_PER_TOKEN: usize = 1;
 /// Tokens reserved for the model's response so the input budget still leaves room to answer.
 const OUTPUT_RESERVE_TOKENS: u64 = 16_384;
 /// Fallback context window when the model's real window is unknown. Matches the smallest common
@@ -63,9 +70,12 @@ impl SessionConfig {
     /// A config for `workspace_root` and `model` with sensible defaults.
     #[must_use]
     pub fn new(workspace_root: PathBuf, model: impl Into<String>) -> Self {
+        let model = model.into();
         Self {
             workspace_root,
-            model: model.into(),
+            plan_model: model.clone(),
+            model,
+            model_catalog: Vec::new(),
             approval_policy: ApprovalPolicy::OnRequest,
             sandbox_mode: SandboxMode::WorkspaceWrite,
             network: NetworkMode::Isolated,
@@ -84,9 +94,9 @@ impl SessionConfig {
     }
 
     /// The maximum assembled-request size, in bytes, that stays under the model's input-token
-    /// budget: the context window minus a response reserve, at a conservative bytes/token ratio.
-    /// The whole serialized request body (system prompt, auto-context, tool defs, and history) is
-    /// held under this so the provider never rejects the turn with a prompt-too-long 400.
+    /// budget: the context window minus a response reserve, at a worst-case one-byte-per-token
+    /// ratio. The whole serialized request body (system prompt, auto-context, tool defs, and
+    /// history) is held under this so token-dense ASCII/code cannot evade the guard.
     #[must_use]
     pub fn input_budget_bytes(&self) -> usize {
         let window = self
@@ -95,7 +105,7 @@ impl SessionConfig {
         let input_tokens = window.saturating_sub(OUTPUT_RESERVE_TOKENS);
         usize::try_from(input_tokens)
             .unwrap_or(usize::MAX)
-            .saturating_mul(BYTES_PER_TOKEN)
+            .saturating_mul(WORST_CASE_BYTES_PER_TOKEN)
     }
 
     #[must_use]
@@ -173,13 +183,26 @@ mod tests {
         let mut config = SessionConfig::new(PathBuf::from("/tmp"), "m");
         // Unknown window → a non-zero conservative budget.
         let fallback = config.input_budget_bytes();
-        assert!(fallback > 0);
+        assert_eq!(
+            fallback,
+            usize::try_from(FALLBACK_CONTEXT_TOKENS - OUTPUT_RESERVE_TOKENS)
+                .unwrap()
+                .saturating_mul(WORST_CASE_BYTES_PER_TOKEN)
+        );
         // A larger advertised window yields a larger budget.
         config.context_window_tokens = Some(1_000_000);
         assert!(config.input_budget_bytes() > fallback);
         // A window at or below the output reserve clamps to zero rather than underflowing.
         config.context_window_tokens = Some(1);
         assert_eq!(config.input_budget_bytes(), 0);
+    }
+
+    #[test]
+    fn input_budget_allows_only_one_ascii_byte_per_available_token() {
+        let mut config = SessionConfig::new(PathBuf::from("/tmp"), "m");
+        config.context_window_tokens = Some(OUTPUT_RESERVE_TOKENS + 4_096);
+
+        assert_eq!(config.input_budget_bytes(), 4_096);
     }
 
     #[test]

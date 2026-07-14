@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use grokforge_protocol::{ResponseItem, SessionId};
+use grokforge_xai::Effort;
 use serde::{Deserialize, Serialize};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader,
@@ -20,6 +21,42 @@ const MAX_METADATA_RESULTS: usize = 1_000;
 const MAX_METADATA_WORKSPACE_BYTES: usize = 4 * 1024;
 const MAX_METADATA_MODEL_BYTES: usize = 256;
 const MAX_METADATA_PROMPT_BYTES: usize = 1024;
+
+/// Reasoning effort persisted independently of configuration defaults. `Auto` is explicit, while
+/// a missing field identifies legacy metadata that should still fall back to current config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PersistedEffort {
+    Auto,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl PersistedEffort {
+    #[must_use]
+    pub const fn from_runtime(effort: Option<Effort>) -> Self {
+        match effort {
+            None => Self::Auto,
+            Some(Effort::Low) => Self::Low,
+            Some(Effort::Medium) => Self::Medium,
+            Some(Effort::High) => Self::High,
+            Some(Effort::Xhigh) => Self::Xhigh,
+        }
+    }
+
+    #[must_use]
+    pub const fn effective(self) -> Option<Effort> {
+        match self {
+            Self::Auto => None,
+            Self::Low => Some(Effort::Low),
+            Self::Medium => Some(Effort::Medium),
+            Self::High => Some(Effort::High),
+            Self::Xhigh => Some(Effort::Xhigh),
+        }
+    }
+}
 
 /// The directory where session rollouts and metadata live (XDG data dir).
 pub fn sessions_dir() -> std::io::Result<PathBuf> {
@@ -110,6 +147,10 @@ pub struct SessionMeta {
     #[serde(default)]
     pub workspace_fingerprint: Option<String>,
     pub model: String,
+    /// `None` means legacy metadata with no persisted choice; `Some(Auto)` is an explicit
+    /// provider-default choice and must not inherit a later config value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<PersistedEffort>,
     pub created_unix: i64,
     /// Nanosecond tie-breaker for sessions created in the same second.
     #[serde(default)]
@@ -137,6 +178,7 @@ impl SessionMeta {
             workspace_identity,
             workspace_fingerprint,
             model,
+            effort: None,
             created_unix,
             created_unix_nanos,
             first_prompt: prompt
@@ -146,6 +188,14 @@ impl SessionMeta {
                 .take(120)
                 .collect(),
         }
+    }
+
+    /// Attach the session's current effort to newly created metadata. This stores explicit
+    /// provider-default (`None`) as `Auto`, preserving it across resume.
+    #[must_use]
+    pub fn with_effort(mut self, effort: Option<Effort>) -> Self {
+        self.effort = Some(PersistedEffort::from_runtime(effort));
+        self
     }
 
     /// The rollout file for this session.
@@ -206,6 +256,56 @@ impl SessionMeta {
         #[cfg(unix)]
         sync_directory(dir).await?;
         Ok(())
+    }
+
+    /// Persist a runtime model switch without changing the session's creation identity or first
+    /// prompt. The normal bounded/private metadata writer remains the only mutation path.
+    pub async fn update_model(
+        dir: &Path,
+        session: SessionId,
+        model: String,
+    ) -> std::io::Result<()> {
+        let mut meta = Self::for_update(dir, session).await?;
+        meta.model = model;
+        meta.write(dir, session).await
+    }
+
+    /// Persist a runtime effort switch, including explicit provider-default (`None`).
+    pub async fn update_effort(
+        dir: &Path,
+        session: SessionId,
+        effort: Option<Effort>,
+    ) -> std::io::Result<()> {
+        let mut meta = Self::for_update(dir, session).await?;
+        meta.effort = Some(PersistedEffort::from_runtime(effort));
+        meta.write(dir, session).await
+    }
+
+    /// Atomically persist a model switch and its required effort adjustment.
+    pub async fn update_model_and_effort(
+        dir: &Path,
+        session: SessionId,
+        model: String,
+        effort: Option<Effort>,
+    ) -> std::io::Result<()> {
+        let mut meta = Self::for_update(dir, session).await?;
+        meta.model = model;
+        meta.effort = Some(PersistedEffort::from_runtime(effort));
+        meta.write(dir, session).await
+    }
+
+    async fn for_update(dir: &Path, session: SessionId) -> std::io::Result<Self> {
+        let id = session.as_uuid().to_string();
+        Self::list(dir)
+            .await
+            .into_iter()
+            .find(|candidate| candidate.session_id == id)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "session metadata is unavailable",
+                )
+            })
     }
 
     /// List all session metadata in `dir`, newest first.
@@ -1228,6 +1328,83 @@ mod tests {
         assert!(!meta.first_prompt.contains("very-secret-password-value"));
         assert!(!meta.first_prompt.contains('\n'));
         assert!(!meta.first_prompt.contains('\u{1b}'));
+    }
+
+    #[tokio::test]
+    async fn metadata_model_switch_preserves_session_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionId::new();
+        let original = SessionMeta::new(
+            session,
+            PathBuf::from("/tmp"),
+            "grok-build-0.1".into(),
+            "first task",
+        )
+        .with_effort(Some(Effort::High));
+        original.write(dir.path(), session).await.unwrap();
+
+        SessionMeta::update_model(dir.path(), session, "grok-4.5".into())
+            .await
+            .unwrap();
+        let updated = SessionMeta::list(dir.path())
+            .await
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(updated.model, "grok-4.5");
+        assert_eq!(updated.effort, Some(PersistedEffort::High));
+        assert_eq!(updated.session_id, original.session_id);
+        assert_eq!(updated.first_prompt, original.first_prompt);
+        assert_eq!(updated.created_unix, original.created_unix);
+    }
+
+    #[tokio::test]
+    async fn metadata_persists_explicit_auto_and_runtime_effort_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionId::new();
+        let explicit_auto = SessionMeta::new(
+            session,
+            PathBuf::from("/tmp"),
+            "grok-build-0.1".into(),
+            "task",
+        )
+        .with_effort(None);
+        explicit_auto.write(dir.path(), session).await.unwrap();
+
+        let stored = SessionMeta::list(dir.path())
+            .await
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(stored.effort, Some(PersistedEffort::Auto));
+        assert_eq!(stored.effort.and_then(PersistedEffort::effective), None);
+
+        SessionMeta::update_effort(dir.path(), session, Some(Effort::Xhigh))
+            .await
+            .unwrap();
+        let updated = SessionMeta::list(dir.path())
+            .await
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(updated.effort, Some(PersistedEffort::Xhigh));
+        assert_eq!(
+            updated.effort.and_then(PersistedEffort::effective),
+            Some(Effort::Xhigh)
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_without_effort_keeps_the_fallback_marker() {
+        let json = r#"{
+            "session_id":"00000000-0000-0000-0000-000000000000",
+            "workspace":"/tmp",
+            "model":"grok-build-0.1",
+            "created_unix":0,
+            "first_prompt":""
+        }"#;
+        let legacy: SessionMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(legacy.effort, None);
     }
 
     #[cfg(unix)]

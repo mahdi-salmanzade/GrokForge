@@ -278,11 +278,24 @@ impl ToolDef {
         description: impl Into<String>,
         parameters: serde_json::Value,
     ) -> Self {
+        Self::function_with_metadata_redactions(name, description, parameters, 0)
+    }
+
+    /// Build a function definition whose dynamic metadata was redacted before egress. The count is
+    /// skipped on the wire and consumed only by GrokForge's context ledger.
+    #[must_use]
+    pub fn function_with_metadata_redactions(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+        metadata_redactions: usize,
+    ) -> Self {
         ToolDef::Function(FunctionTool {
             kind: "function",
             name: name.into(),
             description: description.into(),
             parameters,
+            metadata_redactions,
         })
     }
 
@@ -292,6 +305,15 @@ impl ToolDef {
         match self {
             ToolDef::Function(f) => Some(&f.name),
             ToolDef::Server(_) => None,
+        }
+    }
+
+    /// Number of secret-pattern matches removed from dynamic tool metadata.
+    #[must_use]
+    pub const fn metadata_redactions(&self) -> usize {
+        match self {
+            Self::Function(function) => function.metadata_redactions,
+            Self::Server(_) => 0,
         }
     }
 
@@ -319,6 +341,8 @@ pub struct FunctionTool {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+    #[serde(skip)]
+    metadata_redactions: usize,
 }
 
 /// Reasoning controls. `effort` is the primary cost/latency knob.
@@ -328,13 +352,23 @@ pub struct Reasoning {
 }
 
 /// Reasoning effort level. `Xhigh` is only accepted by the multi-agent model.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
     Low,
     Medium,
     High,
     Xhigh,
+}
+
+/// Whether an effort level is valid for the selected xAI model.
+///
+/// xAI currently reserves `xhigh` for the multi-agent model family. Keeping this check beside the
+/// wire type gives every frontend the same pre-egress rule instead of waiting for a billable API
+/// request to fail.
+#[must_use]
+pub fn model_supports_effort(model: &str, effort: Effort) -> bool {
+    effort != Effort::Xhigh || model.to_ascii_lowercase().contains("multi-agent")
 }
 
 #[cfg(test)]
@@ -358,6 +392,16 @@ mod tests {
         assert_eq!(v["input"][0]["type"], "message");
         assert_eq!(v["input"][0]["role"], "user");
         assert_eq!(v["input"][0]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn xhigh_is_reserved_for_multi_agent_models() {
+        assert!(!model_supports_effort("grok-4.5", Effort::Xhigh));
+        assert!(model_supports_effort(
+            "grok-4.20-multi-agent",
+            Effort::Xhigh
+        ));
+        assert!(model_supports_effort("grok-4.5", Effort::High));
     }
 
     #[test]

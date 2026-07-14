@@ -60,12 +60,16 @@ GrokForge is better when control matters:
 - Sandboxed shell commands with approval controls
 - Project skills in `.grokforge/skills/*/SKILL.md` and reusable slash commands in `.grokforge/commands/*.md`
 - Explicit opt-ins for Grok web search, X search, and code interpreter tools
-- Approval-gated MCP tools from reviewed project configuration via `--trust-project-mcp`
+- Approval-gated stdio MCP tools from reviewed project configuration via `--trust-project-mcp`, or
+  from validated ACP editor declarations
 - Read-only plan mode
 - Persistent sessions with resume support
 - Parallel subagents (up to 32 per turn) in isolated worktrees with scoped commits, shown live in a "PARALLEL AGENTS" panel
 - `@`-mention file/folder attachments and agent-managed persistent memory (`.grokforge/memory/`)
+- Typed global/project configuration, startup model validation, and live `/model` + `/effort`
+  controls
 - Editor embedding over ACP (Agent Client Protocol) via `grokforge acp` — Zed and other ACP clients
+- Generated shell completions for Bash, Zsh, Fish, Elvish, and PowerShell
 - A context ledger that accounts for the request body sent to Grok
 - Secret redaction, bounded output, and no telemetry
 
@@ -148,8 +152,42 @@ grokforge exec --code-interpreter -p "analyze these benchmark results"
 ```
 
 Inside the TUI, use `/help` to discover commands, `/skills` to inspect project guidance, and
-`/tools` to view or toggle hosted tools for the current session. A project command such as
-`.grokforge/commands/verify.md` becomes `/verify`.
+`/tools` to view or toggle hosted tools for the current session. `/model` lists the model catalog
+advertised by your endpoint and `/model <slug>` switches safely while keeping resume metadata in
+sync; `/effort` controls reasoning effort. A project command such as
+`.grokforge/commands/verify.md` becomes `/verify`. Quote attachment paths containing spaces, for
+example `@"docs/design notes.md"`.
+
+## Configuration
+
+GrokForge loads defaults, then the owner-controlled `~/.grokforge/config.toml`, and finally
+`GROKFORGE_CONFIG_*` environment overrides. A project's `.grokforge/config.toml` is ignored unless
+you explicitly pass `--trust-project-config`; it can select billable models, reasoning effort, and
+runtime limits. API keys and OAuth tokens never belong in either config file.
+
+```toml
+[provider.grok]
+base_url = "https://api.x.ai"
+
+[agent]
+default_model = "grok-build-0.1"
+plan_model = "grok-4.5"
+effort = "high" # low | medium | high | xhigh; omit for provider default
+max_iterations = 32
+auto_compact = true
+compaction_trigger_bytes = 400000
+compaction_keep_tail = 8
+```
+
+Project config may set only `[agent]` preferences, even when trusted. GrokForge rejects project
+attempts to redirect the provider endpoint or introduce sandbox/approval settings, and rejects a
+symlinked project config. The global file is accepted only from a private, owner-controlled
+`~/.grokforge` directory; on Unix it must be owned by the current user, have mode `0600` or
+stricter, be a regular non-symlink file, and have exactly one hard link. Its parent must be
+owner-only (`0700` or stricter). Provider URLs require HTTPS except for loopback development
+servers. Nested environment keys use double underscores, such as
+`GROKFORGE_CONFIG_AGENT__DEFAULT_MODEL`; the existing `XAI_BASE_URL` override remains supported and
+wins over the file.
 
 Useful commands:
 
@@ -158,6 +196,10 @@ grokforge doctor
 grokforge sessions
 grokforge resume
 grokforge exec --plan -p "plan the refactor"
+grokforge --model grok-4.5 --effort high
+grokforge completions zsh > ~/.zfunc/_grokforge
+# After reviewing .grokforge/config.toml in a trusted project:
+grokforge --trust-project-config
 # After reviewing .grokforge/mcp.json in a trusted project:
 grokforge --trust-project-mcp
 ```
@@ -172,10 +214,14 @@ Commands start with a stripped-down environment, Git metadata stays protected, c
 
 - Rich diff rendering and native-scrollback polish
 - The repository map and smarter automatic context selection
-- Foreground auto-commit and a practical undo workflow
+- Race-safe foreground undo plus redo
+- Image/PDF attachments and structured user questions
+- LSP diagnostics and formatter integration
+- Remote MCP transports and MCP OAuth (local stdio MCP works today)
 - Full session search
 - Native Windows enforcement
-- Signed installers and package-manager releases
+- Signed installers, package-manager releases, and self-upgrading
+- A general server/SDK and first-party web, desktop, or native IDE surfaces beyond ACP embedding
 
 ## Work on GrokForge
 

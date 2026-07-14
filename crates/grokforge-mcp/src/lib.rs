@@ -43,6 +43,22 @@ pub struct McpTool {
     pub description: String,
     #[serde(default, rename = "inputSchema")]
     pub input_schema: Value,
+    #[serde(default)]
+    execution: Option<McpToolExecution>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct McpToolExecution {
+    #[serde(default, rename = "taskSupport")]
+    task_support: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolsResult {
+    #[serde(default)]
+    tools: Vec<McpTool>,
+    #[serde(default, rename = "nextCursor")]
+    next_cursor: Option<String>,
 }
 
 /// A connection to an MCP server.
@@ -64,6 +80,10 @@ const MAX_JSON_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_LIST_PAGES: usize = 64;
 const MAX_DISCOVERED_TOOLS: usize = 256;
+const MAX_DISCOVERED_TOOL_METADATA_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOOL_NAME_BYTES: usize = 256;
+const MAX_TOOL_DESCRIPTION_BYTES: usize = 256 * 1024;
+const MAX_TOOL_SCHEMA_BYTES: usize = 1024 * 1024;
 
 /// An MCP server reached over stdio.
 pub struct StdioClient {
@@ -74,6 +94,7 @@ pub struct StdioClient {
     _child: Child,
     name: String,
     request_timeout: Duration,
+    supports_tools: bool,
 }
 
 /// Default bound for initialization, discovery, and tool calls. A broken local server must not
@@ -120,6 +141,53 @@ impl StdioClient {
         if command.trim().is_empty() {
             return Err(McpError::Spawn("<empty command>".to_string()));
         }
+        Self::connect_with_process_options(
+            name,
+            Path::new(command),
+            args,
+            cwd,
+            &[],
+            request_timeout,
+        )
+        .await
+    }
+
+    /// Connect an editor-supplied stdio server using an absolute executable and an explicit
+    /// environment. The child inherits none of GrokForge's ambient environment except the small
+    /// runtime allowlist below; entries in `env` are then applied exactly as requested by the ACP
+    /// client. Validation and canonicalization live in the higher-level core bridge.
+    pub async fn connect_in_with_env(
+        name: &str,
+        command: &Path,
+        args: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+    ) -> Result<Self, McpError> {
+        if !command.is_absolute() {
+            return Err(McpError::Spawn(command.to_string_lossy().into_owned()));
+        }
+        Self::connect_with_process_options(
+            name,
+            command,
+            args,
+            Some(cwd),
+            env,
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn connect_with_process_options(
+        name: &str,
+        command: &Path,
+        args: &[String],
+        cwd: Option<&Path>,
+        explicit_env: &[(String, String)],
+        request_timeout: Duration,
+    ) -> Result<Self, McpError> {
+        if command.as_os_str().is_empty() {
+            return Err(McpError::Spawn("<empty command>".to_string()));
+        }
         let mut process = tokio::process::Command::new(command);
         process
             .args(args)
@@ -145,6 +213,11 @@ impl StdioClient {
                 process.env(key, value);
             }
         }
+        // Explicit editor values are applied after the runtime allowlist, so an editor can choose
+        // a server-specific PATH/LANG without regaining access to any other ambient variables.
+        for (key, value) in explicit_env {
+            process.env(key, value);
+        }
         if let Some(cwd) = cwd {
             process.current_dir(cwd);
         }
@@ -152,7 +225,7 @@ impl StdioClient {
         process.process_group(0);
         let mut child = process
             .spawn()
-            .map_err(|_| McpError::Spawn(command.to_string()))?;
+            .map_err(|_| McpError::Spawn(command.to_string_lossy().into_owned()))?;
         let process_group = ProcessGroupGuard::new(child.id());
 
         let stdin = child
@@ -165,7 +238,7 @@ impl StdioClient {
             .ok_or_else(|| McpError::Protocol("no stdout".into()))?;
         let reader = BufReader::new(stdout);
 
-        let client = Self {
+        let mut client = Self {
             process_group,
             io: Mutex::new(Io {
                 stdin,
@@ -175,12 +248,13 @@ impl StdioClient {
             _child: child,
             name: name.to_string(),
             request_timeout,
+            supports_tools: false,
         };
-        client.initialize().await?;
+        client.supports_tools = client.initialize().await?;
         Ok(client)
     }
 
-    async fn initialize(&self) -> Result<(), McpError> {
+    async fn initialize(&self) -> Result<bool, McpError> {
         let params = json!({
             "protocolVersion": LATEST_PROTOCOL_VERSION,
             "capabilities": {},
@@ -203,8 +277,11 @@ impl StdioClient {
                 "initialize omitted required capabilities or serverInfo".into(),
             ));
         }
+        let supports_tools = result
+            .pointer("/capabilities/tools")
+            .is_some_and(Value::is_object);
         self.notify("notifications/initialized", json!({})).await?;
-        Ok(())
+        Ok(supports_tools)
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<(), McpError> {
@@ -265,11 +342,19 @@ impl StdioClient {
                 // Client and server request ids occupy independent namespaces. A server request
                 // may legitimately reuse our in-flight numeric id; capabilities are empty, so
                 // answer it explicitly instead of mistaking it for our response.
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "id": value.get("id").cloned().unwrap_or(Value::Null),
-                    "error": { "code": -32601, "message": "client method not supported" }
-                });
+                let response = if value.get("method").and_then(Value::as_str) == Some("ping") {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": value.get("id").cloned().unwrap_or(Value::Null),
+                        "result": {}
+                    })
+                } else {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": value.get("id").cloned().unwrap_or(Value::Null),
+                        "error": { "code": -32601, "message": "client method not supported" }
+                    })
+                };
                 write_line(&mut io.stdin, &response).await?;
                 continue;
             }
@@ -363,16 +448,13 @@ fn serialize_line(msg: &Value) -> Result<Vec<u8>, McpError> {
 #[async_trait]
 impl McpConnection for StdioClient {
     async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
-        #[derive(Deserialize)]
-        struct ToolsResult {
-            #[serde(default)]
-            tools: Vec<McpTool>,
-            #[serde(default, rename = "nextCursor")]
-            next_cursor: Option<String>,
+        if !self.supports_tools {
+            return Ok(Vec::new());
         }
         let operation = async {
             let mut tools = Vec::new();
             let mut cursor: Option<String> = None;
+            let mut metadata_bytes = 0_usize;
             for _page in 0..MAX_TOOL_LIST_PAGES {
                 let params = cursor
                     .as_ref()
@@ -384,7 +466,18 @@ impl McpConnection for StdioClient {
                         "tools/list exceeded the {MAX_DISCOVERED_TOOLS}-tool discovery cap"
                     )));
                 }
-                tools.extend(parsed.tools);
+                let mut page_tools = Vec::with_capacity(parsed.tools.len());
+                for tool in parsed.tools {
+                    if let Some(tool) = validate_discovered_tool(tool, &mut metadata_bytes)? {
+                        page_tools.push(tool);
+                    }
+                }
+                if tools.len().saturating_add(page_tools.len()) > MAX_DISCOVERED_TOOLS {
+                    return Err(McpError::Protocol(format!(
+                        "tools/list exceeded the {MAX_DISCOVERED_TOOLS}-tool discovery cap"
+                    )));
+                }
+                tools.extend(page_tools);
                 match parsed.next_cursor {
                     Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
                     Some(_) => {
@@ -421,6 +514,64 @@ impl McpConnection for StdioClient {
             Ok(out)
         }
     }
+}
+
+fn validate_discovered_tool(
+    tool: McpTool,
+    metadata_bytes: &mut usize,
+) -> Result<Option<McpTool>, McpError> {
+    if tool.name.is_empty()
+        || tool.name.len() > MAX_TOOL_NAME_BYTES
+        || tool.name.chars().any(char::is_control)
+    {
+        return Err(McpError::Protocol(format!(
+            "tools/list returned an invalid or overlong tool name (limit {MAX_TOOL_NAME_BYTES} bytes)"
+        )));
+    }
+    if tool.description.len() > MAX_TOOL_DESCRIPTION_BYTES {
+        return Err(McpError::Protocol(format!(
+            "tool `{}` description exceeded {MAX_TOOL_DESCRIPTION_BYTES} bytes",
+            tool.name
+        )));
+    }
+    let schema_bytes = serde_json::to_vec(&tool.input_schema)?;
+    if schema_bytes.len() > MAX_TOOL_SCHEMA_BYTES {
+        return Err(McpError::Protocol(format!(
+            "tool `{}` input schema exceeded {MAX_TOOL_SCHEMA_BYTES} bytes",
+            tool.name
+        )));
+    }
+    *metadata_bytes = metadata_bytes
+        .checked_add(tool.name.len())
+        .and_then(|total| total.checked_add(tool.description.len()))
+        .and_then(|total| total.checked_add(schema_bytes.len()))
+        .ok_or_else(|| McpError::Protocol("tools/list metadata is too large".to_string()))?;
+    if *metadata_bytes > MAX_DISCOVERED_TOOL_METADATA_BYTES {
+        return Err(McpError::Protocol(format!(
+            "tools/list metadata exceeded {MAX_DISCOVERED_TOOL_METADATA_BYTES} bytes"
+        )));
+    }
+    let task_support = tool
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.task_support.as_deref());
+    match task_support {
+        Some("required") => return Ok(None),
+        None | Some("forbidden" | "optional") => {}
+        Some(value) => {
+            return Err(McpError::Protocol(format!(
+                "tool `{}` declared unknown taskSupport `{value}`",
+                tool.name
+            )));
+        }
+    }
+    if tool.input_schema.get("type").and_then(Value::as_str) != Some("object") {
+        return Err(McpError::Protocol(format!(
+            "tool `{}` inputSchema root must declare type `object`",
+            tool.name
+        )));
+    }
+    Ok(Some(tool))
 }
 
 fn content_text(result: &Value) -> String {
@@ -562,7 +713,7 @@ for line in sys.stdin:
     msg=json.loads(line)
     mid=msg.get("id"); method=msg.get("method")
     if method=="initialize":
-        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}})
+        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"mock","version":"0"}}})
     elif method=="notifications/initialized":
         pass
     elif method=="tools/list":
@@ -582,6 +733,59 @@ for line in sys.stdin:
             .arg("--version")
             .output()
             .is_ok_and(|o| o.status.success())
+    }
+
+    fn python_executable() -> Option<std::path::PathBuf> {
+        let output = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8(output.stdout).ok()?;
+        std::fs::canonicalize(path.trim()).ok()
+    }
+
+    #[tokio::test]
+    async fn editor_connection_requires_absolute_command_and_passes_explicit_env() {
+        let workspace = tempfile::tempdir().unwrap();
+        let relative = StdioClient::connect_in_with_env(
+            "relative",
+            Path::new("python3"),
+            &[],
+            workspace.path(),
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(relative, McpError::Spawn(_)));
+
+        let Some(python) = python_executable() else {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        };
+        let script = r#"
+import json, os, sys
+def send(value): sys.stdout.write(json.dumps(value) + "\n"); sys.stdout.flush()
+for line in sys.stdin:
+    message=json.loads(line); request_id=message.get("id"); method=message.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":request_id,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"env","version":"0"}}})
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":request_id,"result":{"tools":[{"name":os.environ["GF_EXPLICIT"],"inputSchema":{"type":"object"}}]}})
+"#;
+        let client = StdioClient::connect_in_with_env(
+            "env",
+            &python,
+            &["-c".to_string(), script.to_string()],
+            workspace.path(),
+            &[("GF_EXPLICIT".to_string(), "delivered".to_string())],
+        )
+        .await
+        .unwrap();
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools[0].name, "delivered");
     }
 
     #[tokio::test]
@@ -642,16 +846,121 @@ def send(o): sys.stdout.write(json.dumps(o)+"\n"); sys.stdout.flush()
 for line in sys.stdin:
     msg=json.loads(line); mid=msg.get("id"); method=msg.get("method")
     if method=="initialize":
+        send({"jsonrpc":"2.0","id":mid,"method":"ping","params":{}})
+        ping_reply=json.loads(sys.stdin.readline())
+        if ping_reply.get("result") != {}: sys.exit(2)
         send({"jsonrpc":"2.0","id":mid,"method":"roots/list","params":{}})
         client_reply=json.loads(sys.stdin.readline())
         if client_reply.get("error",{}).get("code") != -32601: sys.exit(3)
-        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"interleave","version":"0"}}})
+        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"interleave","version":"0"}}})
     elif method=="notifications/initialized": pass
 "#;
         let client = StdioClient::connect("interleave", "python3", &["-c".into(), script.into()])
             .await
             .unwrap();
         drop(client);
+    }
+
+    #[tokio::test]
+    async fn resource_only_server_does_not_receive_tools_list() {
+        if !python_available() {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        }
+        let script = r#"
+import sys, json
+def send(o): sys.stdout.write(json.dumps(o)+"\n"); sys.stdout.flush()
+for line in sys.stdin:
+    msg=json.loads(line); mid=msg.get("id"); method=msg.get("method")
+    if method=="initialize":
+        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2025-11-25","capabilities":{"resources":{}},"serverInfo":{"name":"resources","version":"0"}}})
+    elif method=="notifications/initialized": pass
+    elif method=="tools/list":
+        send({"jsonrpc":"2.0","id":mid,"error":{"code":-32601,"message":"tools unsupported"}})
+"#;
+        let client = StdioClient::connect("resources", "python3", &["-c".into(), script.into()])
+            .await
+            .unwrap();
+        assert!(client.list_tools().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_required_tools_are_hidden_and_invalid_schemas_are_rejected() {
+        if !python_available() {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        }
+        let task_server = r#"
+import sys, json
+def send(o): sys.stdout.write(json.dumps(o)+"\n"); sys.stdout.flush()
+for line in sys.stdin:
+    msg=json.loads(line); mid=msg.get("id"); method=msg.get("method")
+    if method=="initialize":
+        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"tasks","version":"0"}}})
+    elif method=="notifications/initialized": pass
+    elif method=="tools/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"tools":[
+          {"name":"background_only","inputSchema":{"type":"object"},"execution":{"taskSupport":"required"}},
+          {"name":"ordinary","inputSchema":{"type":"object"},"execution":{"taskSupport":"optional"}}
+        ]}})
+"#;
+        let client = StdioClient::connect("tasks", "python3", &["-c".into(), task_server.into()])
+            .await
+            .unwrap();
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "ordinary");
+
+        let invalid_server = r#"
+import sys, json
+def send(o): sys.stdout.write(json.dumps(o)+"\n"); sys.stdout.flush()
+for line in sys.stdin:
+    msg=json.loads(line); mid=msg.get("id"); method=msg.get("method")
+    if method=="initialize":
+        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"invalid","version":"0"}}})
+    elif method=="notifications/initialized": pass
+    elif method=="tools/list":
+        send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"bad","inputSchema":{"type":"string"}}]}})
+"#;
+        let invalid =
+            StdioClient::connect("invalid", "python3", &["-c".into(), invalid_server.into()])
+                .await
+                .unwrap();
+        assert!(matches!(
+            invalid.list_tools().await,
+            Err(McpError::Protocol(message)) if message.contains("type `object`")
+        ));
+    }
+
+    #[tokio::test]
+    async fn paginated_tool_metadata_has_a_cumulative_byte_cap() {
+        if !python_available() {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        }
+        let server = r#"
+import sys, json
+def send(o): sys.stdout.write(json.dumps(o)+"\n"); sys.stdout.flush()
+for line in sys.stdin:
+    msg=json.loads(line); mid=msg.get("id"); method=msg.get("method")
+    if method=="initialize":
+        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"bytes","version":"0"}}})
+    elif method=="notifications/initialized": pass
+    elif method=="tools/list":
+        cursor=msg.get("params",{}).get("cursor")
+        count=16 if cursor is None else 1
+        tools=[{"name":"tool_"+str(i),"description":"x"*250000,"inputSchema":{"type":"object"}} for i in range(count)]
+        result={"tools":tools}
+        if cursor is None: result["nextCursor"]="second"
+        send({"jsonrpc":"2.0","id":mid,"result":result})
+"#;
+        let client = StdioClient::connect("bytes", "python3", &["-c".into(), server.into()])
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.list_tools().await,
+            Err(McpError::Protocol(message)) if message.contains("metadata exceeded")
+        ));
     }
 
     #[cfg(unix)]
@@ -725,7 +1034,7 @@ def send(o): sys.stdout.write(json.dumps(o)+"\n"); sys.stdout.flush()
 for line in sys.stdin:
     msg=json.loads(line); mid=msg.get("id"); method=msg.get("method")
     if method=="initialize":
-        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"pages","version":"0"}}})
+        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"pages","version":"0"}}})
     elif method=="notifications/initialized": pass
     elif method=="tools/list":
         cursor=int(msg.get("params",{}).get("cursor","0"))

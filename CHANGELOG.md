@@ -7,14 +7,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Real typed configuration with defaults, a securely opened owner-controlled
+  `~/.grokforge/config.toml`, an explicit `--trust-project-config` gate for the restricted project
+  `.grokforge/config.toml`, and `GROKFORGE_CONFIG_*` environment overrides. Repository config can
+  tune model/runtime preferences only after opt-in and cannot redirect the credential-bearing
+  provider endpoint or weaken sandbox/approval policy. The TUI, headless, resume, and doctor paths
+  now share these defaults.
+- Global `--model` and `--effort` overrides (including explicit `auto` and `xhigh`), plus `/model`
+  and `/effort` in the Forge Deck. `auto` clears a lower-precedence effort setting and selects the
+  provider default. The startup model catalog is fetched once, reused for context-window sizing,
+  and used to reject incompatible model/effort combinations before a request is sent. Successful
+  switches persist both settings for resume, while older session metadata remains compatible.
+  Interactive `/plan` turns temporarily use the configured plan model, its catalog context window,
+  and high effort, then restore the normal session settings even when the turn fails. Model catalog
+  UI data is no longer copied into every subagent session.
+- Real `grokforge completions` output for Bash, Zsh, Fish, Elvish, and PowerShell.
 - ACP (Agent Client Protocol) support via `grokforge acp`, so editors like Zed can embed GrokForge
   as an agent. It speaks JSON-RPC 2.0 over newline-delimited stdio as an additive frontend over the
-  same `Op`/`Event` seam the headless frontend uses (fulfilling ADR 0005's hedge — no core
-  changes). Protocol version 1: `initialize`, `session/new`, `session/prompt` with streaming
+  same `Op`/`Event` seam the headless frontend uses (fulfilling ADR 0005's hedge without a core
+  rearchitecture). Protocol version 1: `initialize`, `session/new`, `session/prompt` with streaming
   `session/update` notifications and a `stopReason` response, `session/cancel`, and
   `session/request_permission` bridged from the approval engine so the editor gates
   boundary-crossing actions. Credentials come from `XAI_API_KEY` (stdin is the protocol channel);
-  session persistence, `session/load`, and client `fs`/`terminal` calls are deferred.
+  the official ACP v1 stdio `mcpServers` declarations are validated, bounded, started with a
+  scrubbed environment, and registered atomically. Session persistence, `session/load`, remote MCP
+  transports, and client `fs`/`terminal` calls are deferred.
 - `@`-mention file and folder attachments. Typing `@path` in a prompt inlines that file (or the
   files under that folder) into the message as bounded `<attachment>` blocks, so it flows through
   the same redaction, ledger, and context-budget path as any other input — attaching a huge folder
@@ -22,6 +39,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reader (an `@path` cannot follow a symlink out of the workspace) and skip common secret files by
   default. The TUI adds an interactive fuzzy picker: type `@`, arrow-select a `.gitignore`-aware
   path suggestion, and Tab/Enter inserts it. `@`-expansion works in headless `exec` too.
+  Quoted mentions such as `@"docs/design notes.md"` support paths containing spaces and escaped
+  quotes without weakening the existing no-follow and size limits.
 - Agent-managed persistent memory under `.grokforge/memory/`. A new `remember` tool lets Grok save
   durable facts, preferences, and project conventions across sessions; notes without a topic go to
   the `MEMORY.md` index, and topic notes go to a slugged `<topic>.md` file linked from the index.
@@ -31,6 +50,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   memory in the TUI.
 
 ### Fixed
+- Closed check/read races for trusted project config by opening `.grokforge/config.toml` relative
+  to a no-follow directory descriptor and rejecting symlinks, hardlinks, and non-regular files.
+- Fixed the `@` picker so paths containing spaces, quotes, or backslashes are inserted with the
+  quoted/escaped syntax the attachment parser expects; terminal-hostile control-character paths
+  are no longer offered in the palette.
+- Hardened editor-supplied MCP against oversized discovery metadata, non-object tool schemas,
+  unsupported task-required tools, provider-name collisions after redaction, secret-bearing tool
+  metadata, unbounded ACP input lines, capability-negotiation mistakes, and missing protocol
+  `ping` replies.
+  Runtime MCP failures now use protocol-appropriate ACP error codes instead of the reserved
+  authentication-required code.
+- Hardened approval-free memory writes against symlink and hardlink redirection in every parent,
+  final target, and legacy temporary-file position by reusing the descriptor-relative atomic
+  workspace writer. Unsupported platforms fail closed.
+- Hardened ACP session concurrency and cancellation ownership, bounded prompt/embedded-resource
+  input to 512 KiB, required canonical absolute workspaces, and added permission-response expiry so
+  disconnected clients cannot leave an approval hung forever.
 - Bounded the assembled request to the model's real context window so a long session no longer
   overruns the provider's prompt-token limit and fails the whole turn with a hard `400`. The
   compaction trigger is now capped at an absolute, model-derived ceiling (the previous
@@ -38,7 +74,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a pre-send guard checks the exact serialized body size: if it still exceeds the budget it forces
   one compaction and, failing that, stops with an actionable message instead of a raw provider
   error. The budget uses the model's advertised context window from `GET /v1/models` (with a
-  conservative fallback) at a deliberately low bytes-per-token ratio for headroom.
+  conservative fallback) with a one-byte-per-token admission bound. Compaction now measures its
+  full serialized auxiliary request against the same budget before any provider egress.
 
 ## [0.2.0] - 2026-07-14
 
@@ -158,9 +195,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   selects per platform and reports capability honestly (`enforced` flag). Wired into both
   frontends. Verified end-to-end: under `--preset auto` the model's write outside the
   workspace is blocked by the kernel.
-- M6 git-native workflow (`grokforge-git` + core wiring): every mutating turn's edits become a
-  real commit from the trusted host process (never in the sandbox). `Git` shells out to the
-  `git` CLI for discovery/status/commit/undo/worktrees. Auto-commit stages **only the paths the
+- M6 git-native workflow (`grokforge-git` + core wiring): mutating turns in GrokForge-owned
+  isolated worktrees become real commits from the trusted host process (never in the sandbox).
+  Foreground/shared-worktree edits remain uncommitted until a race-safe edit journal lands. `Git`
+  shells out to the `git` CLI for discovery/status/commit/undo/worktrees. Auto-commit stages
+  **only the paths the
   agent touched** (a `TurnContext` collector fed by write_file/edit), attaches
   `Grokforge-Session`/`Grokforge-Turn` trailers, and neutralizes hooks (`--no-verify` + empty
   `hooksPath`). `undo_last` walks the session's contiguous trailer commits (`reset --keep` at the
@@ -188,8 +227,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   OS sandbox (which only confines shelled-out commands) — so a write outside the workspace, or any
   write in plan/read-only mode, could slip through. Now refused with a `FsWrite` denial. New tests
   cover both cases.
-- TUI slash commands: `/help`, `/plan <task>`, `/undo` (host-side git undo of the session's agent
-  commits), `/clear`, `/quit`.
+- TUI slash commands: `/help`, `/plan <task>`, `/undo` (host-side Git undo for isolated-worktree
+  session commits; foreground undo is not implemented), `/clear`, `/quit`.
 - **Sandbox correctness fixes (important):** (1) the Seatbelt self-test used an invalid SBPL
   operation (`process-exec*`), so `available()` always failed and every run silently fell back to
   the unenforced passthrough runner — Seatbelt is now correctly detected and active. (2)
@@ -200,8 +239,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - M11 (release readiness): `grokforge doctor` reports toolchain, the **actual** sandbox backend and
   whether it's enforced, git availability, and endpoint/telemetry status. `SECURITY.md` (privacy
   claim, what leaves the machine, per-platform sandboxing, threat model). Release workflow building
-  per-target binaries on tag. (macOS signing/notarization + Homebrew tap wired but pending
-  credentials.)
+  per-target binaries on tag. macOS artifacts remain unsigned; signing/notarization,
+  package-manager publishing, and a Homebrew tap are not implemented yet.
 - M9 MCP (Model Context Protocol): `grokforge-mcp` is a minimal, hand-rolled JSON-RPC 2.0 stdio
   client behind an internal `McpConnection` trait (chosen over pinning an unverified `rmcp`
   version). `initialize` handshake, `tools/list`, `tools/call`. Core `McpToolAdapter` exposes each

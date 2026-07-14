@@ -74,6 +74,11 @@ pub fn search_paths(workspace_root: &Path, query: &str, limit: usize) -> Vec<Str
             continue;
         }
         let mut display = relative.to_string_lossy().replace('\\', "/");
+        // Control characters cannot be represented by the quoted mention grammar and would also
+        // corrupt a terminal palette. Leave such unusual files accessible through explicit tools.
+        if display.chars().any(char::is_control) {
+            continue;
+        }
         if entry.file_type().is_some_and(|kind| kind.is_dir()) {
             display.push('/');
         }
@@ -104,8 +109,9 @@ pub fn search_paths(workspace_root: &Path, query: &str, limit: usize) -> Vec<Str
 }
 
 /// Extract `@path` mentions. A mention starts at `@` that begins the text or follows whitespace
-/// (so `user@host` is not a mention) and runs to the next whitespace; trailing sentence
-/// punctuation is trimmed.
+/// (so `user@host` is not a mention). Unquoted mentions run to the next whitespace; quoted forms
+/// (`@"path with spaces"` and `@'path with spaces'`) may contain whitespace and escape their
+/// matching quote or a backslash. Trailing sentence punctuation is trimmed from unquoted paths.
 fn parse_mentions(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
@@ -114,6 +120,20 @@ fn parse_mentions(text: &str) -> Vec<String> {
         let preceded_by_boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
         if bytes[i] == b'@' && preceded_by_boundary {
             let start = i + 1;
+            if matches!(bytes.get(start), Some(b'"' | b'\'')) {
+                let quote = bytes[start] as char;
+                if let Some((mention, end)) = parse_quoted_mention(text, start, quote) {
+                    if !mention.is_empty() {
+                        out.push(mention);
+                    }
+                    i = end;
+                    continue;
+                }
+                // An unterminated or malformed quoted mention is literal user text. Advance past
+                // the `@` only so a later, independent mention can still be discovered.
+                i += 1;
+                continue;
+            }
             let mut j = start;
             while j < bytes.len() && !bytes[j].is_ascii_whitespace() {
                 j += 1;
@@ -134,6 +154,58 @@ fn parse_mentions(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Decode one quoted mention. Only the matching quote and `\\` are escape sequences; preserving
+/// the backslash for every other character keeps ordinary path names lossless. A closing quote
+/// must be followed by whitespace, end-of-input, or ordinary sentence punctuation so malformed
+/// text such as `@"file"suffix` cannot attach an unintended partial path.
+fn parse_quoted_mention(text: &str, quote_at: usize, quote: char) -> Option<(String, usize)> {
+    let content_start = quote_at.checked_add(quote.len_utf8())?;
+    let content = text.get(content_start..)?;
+    let mut decoded = String::new();
+    let mut escaped = false;
+
+    for (relative, character) in content.char_indices() {
+        let absolute = content_start.checked_add(relative)?;
+        if escaped {
+            if character == quote || character == '\\' {
+                decoded.push(character);
+            } else {
+                decoded.push('\\');
+                decoded.push(character);
+            }
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == quote {
+            let end = absolute.checked_add(character.len_utf8())?;
+            if quoted_mention_boundary(text.get(end..).and_then(|tail| tail.chars().next())) {
+                return Some((decoded, end));
+            }
+            return None;
+        }
+        // Multiline quoted paths are surprising in a prompt and cannot name a normal picker item.
+        if matches!(character, '\n' | '\r') || character.is_control() {
+            return None;
+        }
+        decoded.push(character);
+    }
+    None
+}
+
+fn quoted_mention_boundary(next: Option<char>) -> bool {
+    next.is_none_or(|character| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}'
+            )
+    })
 }
 
 /// Read one attachment mention (a file, or the files under a folder) into `<attachment>` blocks,
@@ -298,6 +370,33 @@ mod tests {
         assert!(parse_mentions("no mentions here").is_empty());
     }
 
+    #[test]
+    fn parses_quoted_mentions_with_spaces_and_escaped_quotes() {
+        assert_eq!(
+            parse_mentions(r#"compare @"docs/first draft.md" please"#),
+            vec!["docs/first draft.md"]
+        );
+        assert_eq!(
+            parse_mentions(r"open @'docs/it\'s ready.md' now"),
+            vec!["docs/it's ready.md"]
+        );
+        assert_eq!(
+            parse_mentions(r#"open @"docs/a\"quote.md" now"#),
+            vec!["docs/a\"quote.md"]
+        );
+        assert_eq!(
+            parse_mentions(r#"open @"docs/a\\b.md" now"#),
+            vec![r"docs/a\b.md"]
+        );
+    }
+
+    #[test]
+    fn malformed_quoted_mentions_stay_literal() {
+        assert!(parse_mentions(r#"open @"unfinished path.md"#).is_empty());
+        assert!(parse_mentions(r#"open @"file.md"suffix"#).is_empty());
+        assert!(parse_mentions("open @\"line\nfeed\"").is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn expand_inlines_file_content_and_leaves_unknown_mentions() {
@@ -309,6 +408,24 @@ mod tests {
         assert!(out.contains("@nope.rs"));
         // Original text is preserved.
         assert!(out.starts_with("explain @src/lib.rs and @nope.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expand_inlines_quoted_paths_with_spaces_and_quotes() {
+        let dir = ws();
+        std::fs::write(dir.path().join("notes with spaces.txt"), "spaced content").unwrap();
+        std::fs::write(dir.path().join("quoted\"name.txt"), "quoted content").unwrap();
+
+        let out = expand(
+            dir.path(),
+            r#"explain @"notes with spaces.txt" and @"quoted\"name.txt""#,
+        );
+        assert!(out.contains("spaced content"));
+        assert!(out.contains("quoted content"));
+        assert!(out.contains("<attachment path=\"notes with spaces.txt\">"));
+        // Attribute sanitization remains the terminal/XML-like block boundary backstop.
+        assert!(out.contains("<attachment path=\"quoted_name.txt\">"));
     }
 
     #[cfg(unix)]
@@ -336,5 +453,14 @@ mod tests {
         assert!(hits.iter().any(|hit| hit == "src/lib.rs"), "got: {hits:?}");
         let folders = search_paths(dir.path(), "src", 10);
         assert!(folders.iter().any(|hit| hit == "src/"), "got: {folders:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_omits_paths_that_cannot_be_safely_rendered_or_quoted() {
+        let dir = ws();
+        std::fs::write(dir.path().join("bad\nname.txt"), "content").unwrap();
+        let hits = search_paths(dir.path(), "", 100);
+        assert!(!hits.iter().any(|hit| hit.contains('\n')));
     }
 }

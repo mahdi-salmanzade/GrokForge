@@ -2,9 +2,11 @@
 
 use std::process::ExitCode;
 
-use grokforge_core::{RolloutWriter, Session, SessionConfig, SessionMeta, sessions_dir};
+use grokforge_core::{
+    PersistedEffort, RolloutWriter, Session, SessionConfig, SessionMeta, sessions_dir,
+};
 use grokforge_protocol::{ApprovalPolicy, SandboxMode, SessionId};
-use grokforge_xai::XaiClient;
+use grokforge_xai::{Effort, XaiClient, model_supports_effort};
 
 /// Print the list of saved sessions.
 #[allow(clippy::print_literal)] // static column headers
@@ -45,7 +47,13 @@ pub async fn list() -> ExitCode {
 
 /// Resume a session: load its transcript and reopen the TUI continuing from it.
 #[allow(clippy::too_many_lines)]
-pub async fn resume(id: Option<String>, trust_project_mcp: bool) -> ExitCode {
+pub async fn resume(
+    id: Option<String>,
+    trust_project_mcp: bool,
+    trust_project_config: bool,
+    model_override: Option<String>,
+    effort_override: Option<String>,
+) -> ExitCode {
     let dir = match sessions_dir() {
         Ok(dir) => dir,
         Err(error) => {
@@ -66,7 +74,7 @@ pub async fn resume(id: Option<String>, trust_project_mcp: bool) -> ExitCode {
         metas.retain(|meta| project_root(&meta.workspace).is_some_and(|path| path == workspace));
     }
     let meta = match pick(&metas, id.as_deref()) {
-        Ok(meta) => meta,
+        Ok(meta) => meta.clone(),
         Err(PickError::NoMatch) => {
             eprintln!("no matching session found (see `grokforge sessions`)");
             return ExitCode::from(2);
@@ -124,11 +132,35 @@ pub async fn resume(id: Option<String>, trust_project_mcp: bool) -> ExitCode {
         eprintln!("saved workspace was replaced or no longer matches its Git metadata");
         return ExitCode::from(2);
     }
+    let settings = match grokforge_config::Config::load_with_project_config(
+        &workspace,
+        trust_project_config,
+    ) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!(
+                "configuration error: {}",
+                crate::sanitize_terminal(&error.to_string())
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let configured_effort = settings.agent.effort.map(configured_effort);
+    let resume_default = meta
+        .effort
+        .map_or(configured_effort, PersistedEffort::effective);
+    let persist_effort_override = effort_override.is_some();
+    let Ok(effort) = resolve_effort(effort_override.as_deref(), resume_default) else {
+        eprintln!("invalid --effort value (auto|low|medium|high|xhigh)");
+        return ExitCode::from(2);
+    };
+    let model = model_override.unwrap_or_else(|| meta.model.clone());
 
     let Some(api_key) = crate::credentials::resolve(false).await else {
         return ExitCode::from(3);
     };
-    let base_url = std::env::var("XAI_BASE_URL").unwrap_or_else(|_| "https://api.x.ai".to_string());
+    let base_url =
+        std::env::var("XAI_BASE_URL").unwrap_or_else(|_| settings.provider.grok.base_url.clone());
     let client = match XaiClient::new(&base_url, api_key) {
         Ok(c) => c,
         Err(e) => {
@@ -136,12 +168,30 @@ pub async fn resume(id: Option<String>, trust_project_mcp: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Err(code) = crate::validate_model_startup(&client, &meta.model).await {
-        return code;
+    let model_catalog = match crate::model_catalog_startup(&client, &model).await {
+        Ok(models) => models,
+        Err(code) => return code,
+    };
+    let selected_model = model_catalog.iter().find(|candidate| {
+        candidate.id == model || candidate.aliases.iter().any(|alias| alias == &model)
+    });
+    let active_model = selected_model.map_or(model, |candidate| candidate.id.clone());
+    let context_window_tokens = selected_model.and_then(|candidate| candidate.context_window);
+    if effort.is_some_and(|effort| !model_supports_effort(&active_model, effort)) {
+        eprintln!("reasoning effort `xhigh` requires an xAI multi-agent model");
+        return ExitCode::from(2);
     }
 
-    let config = SessionConfig::new(workspace, meta.model.clone())
+    let mut config = SessionConfig::new(workspace, active_model.clone())
         .with_policy(ApprovalPolicy::OnRequest, SandboxMode::WorkspaceWrite);
+    config.plan_model = settings.agent.plan_model.clone();
+    config.model_catalog = model_catalog;
+    config.context_window_tokens = context_window_tokens;
+    config.max_iterations = settings.agent.max_iterations;
+    config.auto_compact = settings.agent.auto_compact;
+    config.compaction_trigger_bytes = settings.agent.compaction_trigger_bytes;
+    config.compaction_keep_tail = settings.agent.compaction_keep_tail;
+    config.effort = effort;
     let session = match Session::with_id_and_history(config, &meta.session_id, items) {
         Ok(session) => session,
         Err(error) => {
@@ -149,6 +199,19 @@ pub async fn resume(id: Option<String>, trust_project_mcp: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let model_changed = active_model != meta.model;
+    let metadata_update = match (model_changed, persist_effort_override) {
+        (true, true) => {
+            SessionMeta::update_model_and_effort(&dir, session_id, active_model, effort).await
+        }
+        (true, false) => SessionMeta::update_model(&dir, session_id, active_model).await,
+        (false, true) => SessionMeta::update_effort(&dir, session_id, effort).await,
+        (false, false) => Ok(()),
+    };
+    if let Err(error) = metadata_update {
+        eprintln!("could not persist resumed runtime overrides: {error}");
+        return ExitCode::from(2);
+    }
 
     eprintln!(
         "resuming session {} ({} items)",
@@ -169,6 +232,30 @@ pub async fn resume(id: Option<String>, trust_project_mcp: bool) -> ExitCode {
             eprintln!("tui error: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn resolve_effort(
+    override_value: Option<&str>,
+    configured: Option<Effort>,
+) -> Result<Option<Effort>, ()> {
+    match override_value {
+        Some("auto") => Ok(None),
+        Some("low") => Ok(Some(Effort::Low)),
+        Some("medium") => Ok(Some(Effort::Medium)),
+        Some("high") => Ok(Some(Effort::High)),
+        Some("xhigh") => Ok(Some(Effort::Xhigh)),
+        Some(_) => Err(()),
+        None => Ok(configured),
+    }
+}
+
+fn configured_effort(effort: grokforge_config::Effort) -> Effort {
+    match effort {
+        grokforge_config::Effort::Low => Effort::Low,
+        grokforge_config::Effort::Medium => Effort::Medium,
+        grokforge_config::Effort::High => Effort::High,
+        grokforge_config::Effort::Xhigh => Effort::Xhigh,
     }
 }
 
@@ -216,6 +303,7 @@ mod tests {
             workspace_identity: None,
             workspace_fingerprint: None,
             model: "model".to_string(),
+            effort: None,
             created_unix: 0,
             created_unix_nanos: 0,
             first_prompt: String::new(),
@@ -240,6 +328,31 @@ mod tests {
         assert_eq!(
             pick(&metas, Some("abcd-1")).map(|m| m.session_id.as_str()),
             Ok("abcd-1")
+        );
+    }
+
+    #[test]
+    fn resume_effort_override_wins_over_configured_default() {
+        assert_eq!(
+            resolve_effort(Some("high"), Some(Effort::Low)),
+            Ok(Some(Effort::High))
+        );
+        assert_eq!(
+            resolve_effort(None, Some(Effort::Xhigh)),
+            Ok(Some(Effort::Xhigh))
+        );
+        assert_eq!(resolve_effort(Some("auto"), Some(Effort::High)), Ok(None));
+        assert_eq!(resolve_effort(Some("extreme"), None), Err(()));
+    }
+
+    #[test]
+    fn persisted_effort_beats_config_while_legacy_metadata_falls_back() {
+        let configured = Some(Effort::Low);
+        assert_eq!(PersistedEffort::High.effective(), Some(Effort::High));
+        assert_eq!(PersistedEffort::Auto.effective(), None);
+        assert_eq!(
+            None::<PersistedEffort>.map_or(configured, PersistedEffort::effective),
+            Some(Effort::Low)
         );
     }
 

@@ -69,6 +69,10 @@ pub enum XaiError {
     #[error("request body exceeds the {max}-byte safety limit")]
     RequestTooLarge { max: usize },
 
+    /// A locally assembled request uses a provider option the selected model cannot accept.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
     /// The API reported an error inside the stream (`error` / `response.failed` event).
     #[error("model reported error: {0}")]
     ApiStreamError(String),

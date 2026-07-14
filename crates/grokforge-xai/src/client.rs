@@ -13,7 +13,7 @@ use url::Url;
 
 use crate::error::XaiError;
 use crate::model::{ModelInfo, ModelsResponse};
-use crate::request::ResponsesRequest;
+use crate::request::{ResponsesRequest, model_supports_effort};
 use crate::stream::ResponseStream;
 
 #[derive(Debug, Clone, Copy)]
@@ -267,6 +267,16 @@ impl XaiClient {
     /// Serialize a request and return the body plus its exact byte length. Exposed so the
     /// context ledger can reconcile its per-source byte accounting against what is actually sent.
     pub fn serialize_request(req: &ResponsesRequest) -> Result<(Vec<u8>, usize), XaiError> {
+        if req
+            .reasoning
+            .as_ref()
+            .is_some_and(|reasoning| !model_supports_effort(&req.model, reasoning.effort))
+        {
+            return Err(XaiError::InvalidRequest(format!(
+                "reasoning effort `xhigh` is only supported by xAI multi-agent models, not `{}`",
+                req.model
+            )));
+        }
         let mut writer = CappedBody::new();
         if let Err(error) = serde_json::to_writer(&mut writer, req) {
             if writer.exceeded {
@@ -495,6 +505,7 @@ fn is_loopback_url(url: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request::Effort;
     use futures::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -610,6 +621,19 @@ mod tests {
         assert!(XaiClient::new("http://localhost:8080", "key").is_ok());
         assert!(XaiClient::new("http://127.0.0.1:8080", "key").is_ok());
         assert!(XaiClient::new("http://[::1]:8080", "key").is_ok());
+    }
+
+    #[test]
+    fn request_serialization_rejects_incompatible_xhigh_before_egress() {
+        let invalid = ResponsesRequest::new("grok-4.5", vec![]).with_reasoning(Effort::Xhigh);
+        assert!(matches!(
+            XaiClient::serialize_request(&invalid),
+            Err(XaiError::InvalidRequest(message)) if message.contains("multi-agent")
+        ));
+
+        let valid =
+            ResponsesRequest::new("grok-4.20-multi-agent", vec![]).with_reasoning(Effort::Xhigh);
+        assert!(XaiClient::serialize_request(&valid).is_ok());
     }
 
     #[test]

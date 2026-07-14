@@ -22,13 +22,13 @@ cargo deny check                       # license / advisory gate
 | Crate | Responsibility |
 |---|---|
 | `grokforge-protocol` | Serde-only shared vocabulary: `Op`/`Event`, approvals, `SandboxPolicy`, ledger, ids. Leaf crate, no tokio. **Append-only once released.** |
-| `grokforge-config` | figment config layering, provider config, price table. |
+| `grokforge-config` | Typed Figment layering for owner/project config plus provider and model/runtime defaults. Credentials stay in the host binary. |
 | `grokforge-xai` | In-house Grok client (`/v1/responses`), SSE streaming, model validation, request byte-accounting. |
-| `grokforge-core` | Agent loop, tools, approval engine, context assembler + redaction, compaction, sessions store, subagents. |
+| `grokforge-core` | Agent loop, tools, approval engine, attachments/memory, context assembler + redaction, compaction, sessions store, subagents. |
 | `grokforge-sandbox` | `SandboxPolicy` compilation, per-OS backends, denial classifier, process exec. |
 | `grokforge-git` | gix reads; git-CLI mutations from the host process only. |
-| `grokforge-context` | tree-sitter repo map, file search. |
-| `grokforge-mcp` | rmcp behind an internal trait. |
+| `grokforge-context` | Reserved seam for the planned tree-sitter repo map and file search; currently minimal. |
+| `grokforge-mcp` | Bounded stdio MCP client behind an internal trait. |
 | `grokforge-render` | Pure-function streaming markdown/diff render pipeline. |
 | `grokforge-tui` | ratatui frontend. |
 | `grokforge` | Binary: TUI + `exec` headless + subcommands. |

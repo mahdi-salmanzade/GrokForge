@@ -147,6 +147,12 @@ pub trait Tool: Send + Sync {
     /// The advertised interface.
     fn spec(&self) -> ToolSpec;
 
+    /// Secret-pattern matches removed from the advertised name, description, or schema. Built-ins
+    /// are static and default to zero; dynamic adapters override this for ledger accounting.
+    fn metadata_redactions(&self) -> usize {
+        0
+    }
+
     /// What approval this call needs, given its arguments and the turn context.
     fn approval(&self, args: &serde_json::Value, ctx: &TurnContext) -> ApprovalNeed;
 
@@ -154,7 +160,7 @@ pub trait Tool: Send + Sync {
     async fn invoke(&self, inv: ToolInvocation<'_>) -> ToolOutput;
 }
 
-/// The set of tools available to a session. Enforces the ≤200-tool xAI request cap.
+/// The set of tools available to a session. Enforces the provider tool-count cap.
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
@@ -194,6 +200,10 @@ impl ToolRegistry {
             tracing::warn!(tool = %name, "refusing to replace an existing or built-in tool");
             return;
         }
+        if self.tools.len() >= MAX_TOOLS {
+            tracing::warn!(tool = %name, limit = MAX_TOOLS, "refusing tool beyond registry limit");
+            return;
+        }
         match self.tools.entry(name) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(tool);
@@ -222,14 +232,26 @@ impl ToolRegistry {
     }
 
     fn defs_where(&self, keep: impl Fn(&ToolSpec) -> bool) -> Vec<ToolDef> {
-        let mut specs: Vec<ToolSpec> = self.specs().into_iter().filter(keep).collect();
+        let mut specs: Vec<(ToolSpec, usize)> = self
+            .tools
+            .values()
+            .map(|tool| (tool.spec(), tool.metadata_redactions()))
+            .filter(|(spec, _)| keep(spec))
+            .collect();
         // Built-ins are the agent's basic safety/repair surface; a large MCP registry must not
         // push `read_file`/`write_file` out of the provider's tool limit.
-        specs.sort_by_key(|spec| (!builtins::is_builtin(&spec.name), spec.name.clone()));
+        specs.sort_by_key(|(spec, _)| (!builtins::is_builtin(&spec.name), spec.name.clone()));
         specs
             .into_iter()
             .take(MAX_TOOLS)
-            .map(|s| ToolDef::function(s.name, s.description, s.parameters))
+            .map(|(spec, redactions)| {
+                ToolDef::function_with_metadata_redactions(
+                    spec.name,
+                    spec.description,
+                    spec.parameters,
+                    redactions,
+                )
+            })
             .collect()
     }
 }

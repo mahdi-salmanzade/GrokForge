@@ -13,7 +13,8 @@ mod tui;
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 
 /// Open-source terminal coding agent for Grok.
 #[derive(Debug, Parser)]
@@ -26,9 +27,21 @@ struct Cli {
     #[arg(short = 'p', long = "prompt", global = true)]
     prompt: Option<String>,
 
+    /// Model slug for TUI, `exec`, `resume`, and ACP sessions.
+    #[arg(long, global = true)]
+    model: Option<String>,
+
+    /// Reasoning effort for TUI, `exec`, `resume`, and ACP sessions.
+    #[arg(long, global = true, value_parser = ["auto", "low", "medium", "high", "xhigh"])]
+    effort: Option<String>,
+
     /// Trust `.grokforge/mcp.json` to execute local MCP server commands.
     #[arg(long, global = true)]
     trust_project_mcp: bool,
+
+    /// Trust `.grokforge/config.toml` to choose billable model and runtime settings.
+    #[arg(long, global = true)]
+    trust_project_config: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -41,9 +54,6 @@ enum Command {
         /// Approval + sandbox preset.
         #[arg(long, default_value = "auto", value_parser = ["readonly", "auto", "strict", "yolo"])]
         preset: String,
-        /// Model slug (defaults to grok-build-0.1).
-        #[arg(long)]
-        model: Option<String>,
         /// Emit NDJSON events instead of plain text.
         #[arg(long)]
         json: bool,
@@ -53,9 +63,6 @@ enum Command {
         /// Pre-grant a boundary: `network`, `write:<path>`, or `cmd:<prefix>`. Repeatable.
         #[arg(long = "allow")]
         allow: Vec<String>,
-        /// Reasoning effort: low, medium, or high.
-        #[arg(long, value_parser = ["low", "medium", "high"])]
-        effort: Option<String>,
         /// Plan mode: read-only tools + sandbox, produce a plan without changing anything.
         #[arg(long)]
         plan: bool,
@@ -69,8 +76,8 @@ enum Command {
         #[arg(long)]
         code_interpreter: bool,
         /// Maximum tool-call iterations within the turn.
-        #[arg(long, default_value_t = 32, value_parser = positive_u32)]
-        max_iterations: u32,
+        #[arg(long, value_parser = bounded_iterations)]
+        max_iterations: Option<u32>,
     },
     /// Resume a previous session.
     Resume {
@@ -93,8 +100,9 @@ enum Command {
     Acp,
     /// Print the shell completion script.
     Completions {
-        /// Target shell (bash, zsh, fish, powershell).
-        shell: String,
+        /// Target shell.
+        #[arg(value_enum)]
+        shell: Shell,
     },
     /// Developer diagnostics (hidden).
     #[command(hide = true)]
@@ -104,14 +112,14 @@ enum Command {
     },
 }
 
-fn positive_u32(value: &str) -> Result<u32, String> {
+fn bounded_iterations(value: &str) -> Result<u32, String> {
     let parsed = value
         .parse::<u32>()
         .map_err(|_| format!("`{value}` is not a valid positive integer"))?;
-    if parsed == 0 {
-        Err("value must be at least 1".to_string())
-    } else {
+    if (1..=256).contains(&parsed) {
         Ok(parsed)
+    } else {
+        Err("value must be between 1 and 256".to_string())
     }
 }
 
@@ -143,18 +151,46 @@ pub(crate) async fn validate_model_startup(
     client: &grokforge_xai::XaiClient,
     model: &str,
 ) -> Result<(), std::process::ExitCode> {
-    eprintln!("[model validation: GET /v1/models; no project context sent]");
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        client.validate_model(model),
-    )
-    .await
+    model_catalog_startup(client, model).await.map(|_| ())
+}
+
+/// Fetch and validate the startup model in one request. Frontends keep the returned catalog for
+/// model switching and context-window lookup instead of hitting `/v1/models` two or three times.
+pub(crate) async fn model_catalog_startup(
+    client: &grokforge_xai::XaiClient,
+    model: &str,
+) -> Result<Vec<grokforge_xai::ModelInfo>, std::process::ExitCode> {
+    if model.is_empty()
+        || model.len() > 160
+        || model.trim() != model
+        || model.chars().any(char::is_whitespace)
+        || model.chars().any(char::is_control)
     {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error @ grokforge_xai::XaiError::UnknownModel { .. })) => {
+        eprintln!("invalid model slug; expected 1-160 non-whitespace characters");
+        return Err(std::process::ExitCode::from(2));
+    }
+    eprintln!("[model validation: GET /v1/models; no project context sent]");
+    match tokio::time::timeout(std::time::Duration::from_secs(10), client.list_models()).await {
+        Ok(Ok(models))
+            if models.iter().any(|candidate| {
+                candidate.id == model || candidate.aliases.iter().any(|alias| alias == model)
+            }) =>
+        {
+            Ok(models)
+        }
+        Ok(Ok(models)) => {
+            let available = models
+                .iter()
+                .map(|candidate| candidate.id.as_str())
+                .take(32)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let suffix = if models.len() > 32 { ", …" } else { "" };
             eprintln!(
-                "model validation failed: {}",
-                sanitize_terminal(&error.to_string())
+                "model validation failed: model `{}` is not advertised; available: {}{}",
+                sanitize_terminal_line(model),
+                sanitize_terminal_line(&available),
+                suffix
             );
             Err(std::process::ExitCode::from(3))
         }
@@ -193,11 +229,11 @@ pub(crate) async fn validate_model_startup(
                 "warning: model validation was unavailable; continuing: {}",
                 sanitize_terminal(&error.to_string())
             );
-            Ok(())
+            Ok(Vec::new())
         }
         Err(_) => {
             eprintln!("warning: model validation timed out after 10 seconds; continuing");
-            Ok(())
+            Ok(Vec::new())
         }
     }
 }
@@ -210,9 +246,6 @@ enum DebugCommand {
     Api {
         /// Prompt to send.
         prompt: String,
-        /// Model slug.
-        #[arg(long, default_value = "grok-build-0.1")]
-        model: String,
     },
 }
 
@@ -225,29 +258,36 @@ async fn main() -> std::process::ExitCode {
             headless::run(headless::ExecArgs {
                 prompt: cli.prompt.unwrap_or_default(),
                 preset: "auto".to_string(),
-                model: None,
+                model: cli.model,
                 json: false,
                 cd: None,
                 allow: Vec::new(),
-                effort: None,
+                effort: cli.effort,
                 plan: false,
                 web_search: false,
                 x_search: false,
                 code_interpreter: false,
-                max_iterations: 32,
+                max_iterations: None,
                 trust_project_mcp: cli.trust_project_mcp,
+                trust_project_config: cli.trust_project_config,
             })
             .await
         }
-        None => tui::launch(cli.trust_project_mcp).await,
+        None => {
+            tui::launch(
+                cli.trust_project_mcp,
+                cli.trust_project_config,
+                cli.model,
+                cli.effort,
+            )
+            .await
+        }
         Some(Command::Exec {
             prompt,
             preset,
-            model,
             json,
             cd,
             allow,
-            effort,
             plan,
             web_search,
             x_search,
@@ -261,23 +301,41 @@ async fn main() -> std::process::ExitCode {
             headless::run(headless::ExecArgs {
                 prompt,
                 preset,
-                model,
+                model: cli.model,
                 json,
                 cd,
                 allow,
-                effort,
+                effort: cli.effort,
                 plan,
                 web_search,
                 x_search,
                 code_interpreter,
                 max_iterations,
                 trust_project_mcp: cli.trust_project_mcp,
+                trust_project_config: cli.trust_project_config,
             })
             .await
         }
-        Some(Command::Doctor) => doctor::run(),
-        Some(Command::Acp) => acp::run(cli.trust_project_mcp).await,
-        Some(Command::Resume { id }) => sessions::resume(id, cli.trust_project_mcp).await,
+        Some(Command::Doctor) => doctor::run(cli.trust_project_config),
+        Some(Command::Acp) => {
+            acp::run(
+                cli.trust_project_mcp,
+                cli.trust_project_config,
+                cli.model,
+                cli.effort,
+            )
+            .await
+        }
+        Some(Command::Resume { id }) => {
+            sessions::resume(
+                id,
+                cli.trust_project_mcp,
+                cli.trust_project_config,
+                cli.model,
+                cli.effort,
+            )
+            .await
+        }
         Some(Command::Sessions) => sessions::list().await,
         Some(Command::Login { subscription }) => {
             if subscription {
@@ -286,16 +344,20 @@ async fn main() -> std::process::ExitCode {
                 credentials::login()
             }
         }
-        Some(Command::Completions { .. }) => milestone("completions", "M11"),
+        Some(Command::Completions { shell }) => print_completions(shell),
         Some(Command::Debug {
-            cmd: DebugCommand::Api { prompt, model },
-        }) => debug::run_api(&prompt, &model).await,
+            cmd: DebugCommand::Api { prompt },
+        }) => {
+            let model = cli.model.as_deref().unwrap_or("grok-build-0.1");
+            debug::run_api(&prompt, model).await
+        }
     }
 }
 
-fn milestone(feature: &str, ms: &str) -> std::process::ExitCode {
-    eprintln!("{feature} lands in {ms} (see docs/design/03-roadmap.md)");
-    std::process::ExitCode::from(2)
+fn print_completions(shell: Shell) -> std::process::ExitCode {
+    let mut command = Cli::command();
+    clap_complete::generate(shell, &mut command, "grokforge", &mut std::io::stdout());
+    std::process::ExitCode::SUCCESS
 }
 
 #[cfg(test)]
@@ -312,15 +374,34 @@ mod tests {
     }
 
     #[test]
-    fn parser_rejects_zero_iterations_and_invalid_effort() {
+    fn parser_rejects_out_of_range_iterations_and_invalid_effort() {
         assert!(
             Cli::try_parse_from(["grokforge", "exec", "-p", "task", "--max-iterations", "0"])
                 .is_err()
         );
         assert!(
+            Cli::try_parse_from(["grokforge", "exec", "-p", "task", "--max-iterations", "257"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["grokforge", "exec", "-p", "task", "--max-iterations", "256"])
+                .is_ok()
+        );
+        assert!(
             Cli::try_parse_from(["grokforge", "exec", "-p", "task", "--effort", "extreme"])
                 .is_err()
         );
+        assert!(
+            Cli::try_parse_from(["grokforge", "exec", "-p", "task", "--effort", "auto"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn completions_accept_supported_shells_and_reject_unknown_ones() {
+        for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
+            assert!(Cli::try_parse_from(["grokforge", "completions", shell]).is_ok());
+        }
+        assert!(Cli::try_parse_from(["grokforge", "completions", "nushell"]).is_err());
     }
 
     #[test]
@@ -377,6 +458,47 @@ mod tests {
             let parsed = Cli::try_parse_from(args).expect("trusted startup form");
             assert!(parsed.trust_project_mcp);
         }
+    }
+
+    #[test]
+    fn project_config_trust_is_an_explicit_opt_in_for_runtime_startup_forms() {
+        let interactive = Cli::try_parse_from(["grokforge"]).expect("interactive defaults");
+        assert!(!interactive.trust_project_config);
+
+        let exec = Cli::try_parse_from(["grokforge", "exec", "-p", "task"]).expect("exec defaults");
+        assert!(!exec.trust_project_config);
+
+        let resume = Cli::try_parse_from(["grokforge", "resume"]).expect("resume defaults");
+        assert!(!resume.trust_project_config);
+
+        let doctor = Cli::try_parse_from(["grokforge", "doctor"]).expect("doctor defaults");
+        assert!(!doctor.trust_project_config);
+
+        for args in [
+            vec!["grokforge", "--trust-project-config"],
+            vec!["grokforge", "exec", "-p", "task", "--trust-project-config"],
+            vec!["grokforge", "resume", "--trust-project-config"],
+            vec!["grokforge", "doctor", "--trust-project-config"],
+        ] {
+            let parsed = Cli::try_parse_from(args).expect("trusted startup form");
+            assert!(parsed.trust_project_config);
+        }
+    }
+
+    #[test]
+    fn resume_accepts_global_model_and_effort_overrides() {
+        let parsed = Cli::try_parse_from([
+            "grokforge",
+            "resume",
+            "session-prefix",
+            "--model",
+            "grok-4.5",
+            "--effort",
+            "high",
+        ])
+        .expect("resume overrides");
+        assert_eq!(parsed.model.as_deref(), Some("grok-4.5"));
+        assert_eq!(parsed.effort.as_deref(), Some("high"));
     }
 
     #[test]

@@ -31,6 +31,17 @@ pub fn assemble(
 ) -> Result<Assembled, XaiError> {
     let mut input: Vec<InputItem> = Vec::new();
     let mut ledger = RequestLedger::default();
+    let tool_metadata_redactions = tool_defs.iter().fold(0_usize, |total, definition| {
+        total.saturating_add(definition.metadata_redactions())
+    });
+    if tool_metadata_redactions > 0 {
+        // Tool definitions are reconciled as serialized protocol bytes below. This zero-byte entry
+        // adds privacy provenance without double-counting their envelope bytes.
+        ledger.push(
+            LedgerEntry::new("mcp_tool_metadata", 0, "mcp")
+                .with_redactions(tool_metadata_redactions),
+        );
+    }
 
     // A configured system prompt is still user-controlled input and can contain pasted secrets.
     let system_prompt = Redactor::apply(&session.config.system_prompt);
@@ -432,6 +443,28 @@ mod tests {
             assembled.request.prompt_cache_key.as_deref(),
             Some(session.id.as_uuid().to_string().as_str())
         );
+        assert_eq!(assembled.ledger.total_bytes(), assembled.body_len);
+    }
+
+    #[test]
+    fn redacted_mcp_tool_metadata_has_explicit_ledger_provenance() {
+        let session = Session::new(SessionConfig::new(PathBuf::from("/tmp"), "m"));
+        let tools = vec![grokforge_xai::ToolDef::function_with_metadata_redactions(
+            "mcp__docs__search",
+            "Bearer [REDACTED:bearer-token]",
+            serde_json::json!({ "type": "object" }),
+            2,
+        )];
+        let assembled = assemble(&session, &[], &[], &[], tools).unwrap();
+        let entry = assembled
+            .ledger
+            .entries
+            .iter()
+            .find(|entry| entry.source == "mcp_tool_metadata")
+            .unwrap();
+
+        assert_eq!(entry.bytes, 0);
+        assert_eq!(entry.redactions, 2);
         assert_eq!(assembled.ledger.total_bytes(), assembled.body_len);
     }
 
