@@ -25,7 +25,7 @@ Synthesized from 5 research reports: **[xai-api]**, **[rust-stack]**, **[sandbox
 | Semantic index (post-MVP) | fastembed + usearch | 5.17.2 / 2.26.0 | Accept the ort rc pin; avoid sqlite-vec (upstream stalled) and lancedb (Arrow/DataFusion bloat) [rust-stack] |
 | Sandbox (Linux) | landlock + seccompiler | 0.4.5 / 0.5.0 | Only maintained, production-proven pair; birdcage archived+GPL, gaol/extrasafe dead [sandbox] |
 | Session storage | rusqlite or sqlx-sqlite, **size-capped rotating logs** | 0.9.x | codex pattern; explicitly avoid its unbounded-SQLite-log bug (640 TB/yr) [competitors] |
-| Secrets | keyring (per-platform stores + encrypted-file fallback), in `spawn_blocking` | 4.1.4 | v4 facade; headless Linux needs the file fallback [rust-stack] |
+| Secrets | Password-encrypted host file (Argon2id + ChaCha20-Poly1305); `XAI_API_KEY` override | argon2 0.5 / chacha20poly1305 0.10 | One explicit cross-platform location; no OS secret-store prompts; CI can remain non-interactive through the environment override |
 | Config | figment (defaults < file < env < flags) | 0.10.19 | Profile layering fits sandbox/approval modes; dormant-but-stable. Runner-up: plain toml+serde (codex style) — genuinely close [rust-stack] |
 | CLI | clap + clap_complete | 4.6.1 | Uncontested [rust-stack] |
 | PTY / exec | portable-pty | 0.9.0 | codex-validated [rust-stack] |

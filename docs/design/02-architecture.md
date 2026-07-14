@@ -10,7 +10,7 @@ Greenfield Rust workspace. The settled direction is a Grok-only client, OS-nativ
 
 ## 1. Cargo Workspace Layout
 
-Sixteen crates under `crates/`, all named `grokforge-*` except the binary crate `grokforge` (the `cli`). One published binary. Workspace-level `[workspace.dependencies]` pins the brief's versions (ratatui 0.30.2, crossterm 0.29, tokio 1.52, reqwest 0.13.4, eventsource-stream 0.2.3, gix 0.85, rmcp 2.2, rusqlite 0.9 bundled, landlock 0.4.5, seccompiler 0.5, portable-pty 0.9, figment 0.10.19, clap 4.6, nucleo, tree-sitter 0.26, text-splitter 0.32, syntect 5.3 + two-face, similar/diffy, insta, keyring 4.1).
+Sixteen crates under `crates/`, all named `grokforge-*` except the binary crate `grokforge` (the `cli`). One published binary. Workspace-level `[workspace.dependencies]` pins the brief's versions (ratatui 0.30.2, crossterm 0.29, tokio 1.52, reqwest 0.13.4, eventsource-stream 0.2.3, gix 0.85, rmcp 2.2, rusqlite 0.9 bundled, landlock 0.4.5, seccompiler 0.5, portable-pty 0.9, figment 0.10.19, clap 4.6, nucleo, tree-sitter 0.26, text-splitter 0.32, syntect 5.3 + two-face, similar/diffy, insta, argon2 0.5, chacha20poly1305 0.10).
 
 ```
 grokforge/
@@ -69,8 +69,8 @@ grokforge/
 - Modules: `op` (Submission/Op), `event` (Event/EventMsg), `items` (InputItem, ResponseItem, ContentBlock), `approval` (ApprovalRequest/Decision), `sandbox_policy` (SandboxPolicy, SandboxMode, NetworkMode, DenialClass), `plan` (PlanState/PlanStep), `ledger` (LedgerEntry), `usage` (Usage, CostBreakdown), `ids` (SessionId, TurnId, ToolCallId, ApprovalId, SubId — newtyped UUIDs).
 - *Boundary justification:* the codex "protocol" pattern — TUI, headless, and a future ACP/editor-embedding adapter all speak `Submission`/`Event` and never touch core internals. Fast-compiling leaf crate; frontends rebuild without recompiling the agent; protocol snapshot tests (insta on serde JSON) freeze the wire format.
 
-**`grokforge-config`** — figment layering (defaults < `~/.grokforge/config.toml` < project `.grokforge/config.toml` < env `GROKFORGE_*` < flags). Owns: `Config`, `ProviderConfig { base_url: Url, api_key_env, model_ids: ModelRoutingTable }` (base URL/models are **data**, per lock #2 and brief §2), approval/sandbox profile matrix, theme, MCP server declarations, AGENTS.md/skills/plugins discovery paths (`~/.grokforge/skills/`, `.grokforge/skills/`), keyring access (`keyring` in `spawn_blocking`).
-- *Justification:* config is consumed by literally every crate above the leaves; isolating it prevents figment/keyring from bleeding into `protocol`.
+**`grokforge-config`** — figment layering (defaults < `~/.grokforge/config.toml` < project `.grokforge/config.toml` < env `GROKFORGE_*` < flags). Owns: `Config`, `ProviderConfig { base_url: Url, api_key_env, model_ids: ModelRoutingTable }` (base URL/models are **data**, per lock #2 and brief §2), approval/sandbox profile matrix, theme, MCP server declarations, and AGENTS.md/skills/plugins discovery paths (`~/.grokforge/skills/`, `.grokforge/skills/`). Credential persistence is deliberately outside this crate.
+- *Justification:* config is consumed by literally every crate above the leaves; isolating it prevents figment and provider policy from bleeding into `protocol`.
 
 **`grokforge-xai`** — the in-house Grok client. **No internal deps** (takes a `ProviderConfig`-shaped struct it defines itself; `config` constructs it).
 - Modules: `client` (XaiClient), `responses` (request/response wire types for `POST /v1/responses`), `stream` (SSE via `reqwest::bytes_stream` + `eventsource-stream`, own reconnect/backoff), `models` (`GET /v1/models` validation), `error` (typed: rate-limit w/ retry-after, auth, retired-slug detection).
@@ -121,7 +121,8 @@ grokforge/
 - *Justification:* the existence of two frontends over one channel pair is the proof the protocol boundary works — cheap CI harness for end-to-end agent tests.
 
 **`grokforge` (cli)** — clap entry. Deps: `tui, headless, core, config, sandbox, exec`.
-- Subcommands: default = interactive TUI; `exec/-p` headless; `resume`/`fork`/`sessions`; `debug sandbox -- <cmd>`; `mcp list/test`; `completions`; hidden `__sandbox-helper` (arg0-style dispatch: applies Linux landlock+seccomp in-process pre-exec — checked **before** clap parsing).
+- Owns the host credential workflow: a non-empty `XAI_API_KEY` environment override, otherwise password-unlock `~/.grokforge/credentials.enc`, with interactive first-run setup in the TUI path. The file holds API-key and/or OAuth credentials encrypted with ChaCha20-Poly1305 under a password-derived Argon2id key; expired OAuth tokens are refreshed and re-sealed here. No credential storage API is exposed to the sandboxed agent.
+- Subcommands: default = interactive TUI; `exec/-p` headless; `resume`/`fork`/`sessions`; `login` (create or unlock the encrypted credential file); `debug sandbox -- <cmd>`; `mcp list/test`; `completions`; hidden `__sandbox-helper` (arg0-style dispatch: applies Linux landlock+seccomp in-process pre-exec — checked **before** clap parsing).
 
 ---
 

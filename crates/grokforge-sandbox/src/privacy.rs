@@ -6,6 +6,7 @@ use crate::ExecError;
 
 const MAX_PRIVACY_PATHS: usize = 512;
 const MAX_PRIVACY_SCAN_ENTRIES: usize = 100_000;
+const GROKFORGE_CREDENTIALS_PATH: &str = "GROKFORGE_CREDENTIALS_PATH";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PrivacyPath {
@@ -254,6 +255,38 @@ pub(crate) fn privacy_path_candidates(cwd: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// GrokForge-owned credential files are always private, including in danger mode. Unlike the
+/// ambient credential catalogue above, these paths belong to this process and must never be made
+/// readable to a model-invoked command. Keep the default location in the set even when the test /
+/// development override is active so a stale default file cannot become visible accidentally.
+pub(crate) fn grokforge_credential_path_candidates() -> Vec<PathBuf> {
+    let process_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    let override_path = std::env::var_os(GROKFORGE_CREDENTIALS_PATH).map(PathBuf::from);
+    credential_path_candidates(home.as_deref(), override_path.as_deref(), &process_cwd)
+}
+
+fn credential_path_candidates(
+    home: Option<&Path>,
+    override_path: Option<&Path>,
+    process_cwd: &Path,
+) -> Vec<PathBuf> {
+    let mut paths = vec![
+        home.unwrap_or(process_cwd)
+            .join(".grokforge/credentials.enc"),
+    ];
+    if let Some(path) = override_path.filter(|path| !path.as_os_str().is_empty()) {
+        paths.push(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            process_cwd.join(path)
+        });
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 fn known_privacy_paths(
     home: Option<&Path>,
     config_home: Option<&Path>,
@@ -413,6 +446,21 @@ mod tests {
         ] {
             assert!(paths.contains(&expected), "missing {}", expected.display());
         }
+    }
+
+    #[test]
+    fn grokforge_credentials_cover_default_and_override_locations() {
+        let home = Path::new("/home/alice");
+        let cwd = Path::new("/work/project");
+        let absolute_override = Path::new("/run/grokforge/test-credentials.enc");
+        let paths = credential_path_candidates(Some(home), Some(absolute_override), cwd);
+        assert!(paths.contains(&home.join(".grokforge/credentials.enc")));
+        assert!(paths.contains(&absolute_override.to_path_buf()));
+
+        let relative_override = Path::new("fixtures/credentials.enc");
+        let paths = credential_path_candidates(None, Some(relative_override), cwd);
+        assert!(paths.contains(&cwd.join(".grokforge/credentials.enc")));
+        assert!(paths.contains(&cwd.join(relative_override)));
     }
 
     #[cfg(unix)]

@@ -164,7 +164,7 @@ async fn run_session_ready(
         status_preset,
     );
     if let Some(warning) = auto_commit_warning {
-        app.push_info(warning);
+        app.set_startup_notice(warning);
     }
 
     let mut terminal = TerminalGuard::new(setup_terminal()?);

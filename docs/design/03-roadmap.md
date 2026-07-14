@@ -151,12 +151,12 @@ Two internal tracks, parallelizable: (a) shell/input, (b) render pipeline.
 
 **Deliverables**
 - rusqlite index over the M2 JSONL rollouts (list/search); `grokforge resume` (latest / `--last` / picker), session forking; resume preserves stable prefix + `x-grok-conv-id` for cache hits; vision caveat honored (stateless requests when images in context).
-- Secrets: keyring v4 (platform stores + encrypted-file fallback for headless Linux) in `spawn_blocking`; `grokforge login` stores the API key.
+- Secrets: one host-side password-encrypted file at `~/.grokforge/credentials.enc`; Argon2id derives the key from the password and a random salt, and ChaCha20-Poly1305 seals API-key and/or OAuth credentials. `XAI_API_KEY` remains the non-interactive override; `grokforge login` creates or unlocks the file.
 
 **Exit criteria**
 - Kill TUI mid-turn → `grokforge resume` restores transcript and continues the turn.
 - `grokforge sessions list` and search work; sqlite index rebuilds from JSONL if deleted.
-- Headless-Linux CI job (no DBus) exercises the encrypted-file keyring fallback.
+- A PTY test creates, unlocks, and rejects a wrong password for the encrypted credential file; a non-interactive test exercises the `XAI_API_KEY` override.
 
 ### M9 — MCP + plugins/skills conventions (M) — Lane C
 
@@ -240,7 +240,7 @@ GrokForge/
 - Steps: fmt check → `clippy --all-targets -- -D warnings` → `cargo nextest run --workspace` → `cargo deny check` → insta with `INSTA_UPDATE=no` (fails on pending snapshots).
 - **Sandbox job**: escape smoke suite on both Ubuntu kernels (asserting per-ABI `RulesetStatus`) and both macOS runners (Seatbelt self-test + denials). Windows job asserts the approval-only fallback path and WSL2 detection logic (unit-level; real WSL2 e2e is a documented manual/self-hosted check).
 - **Terminal-matrix job** (Linux): install tmux/Zellij/screen; run the TUI under each via the PTY harness, capture frames (`tmux capture-pane -e`), diff against goldens; assert no OSC 10/11 reply leakage into the input stream and scrollback integrity after `insert_before`. Per-PR for tmux; Zellij/screen/SSH-loopback in `nightly.yml` (heavier, flakier).
-- **Nightly**: live-API smoke (`XAI_API_KEY` secret; `#[ignore]`d tests) — catches xAI drift (risk #1) incl. model-slug validation and the code-execution type-string probe; full multiplexer matrix; headless-keyring job.
+- **Nightly**: live-API smoke (`XAI_API_KEY` secret; `#[ignore]`d tests) — catches xAI drift (risk #1) incl. model-slug validation and the code-execution type-string probe; full multiplexer matrix; encrypted-credential unlock job.
 
 **`release.yml`** — cargo-dist generated, plus a post-build step: rcodesign sign + notarize macOS artifacts (Developer ID cert + App Store Connect key in secrets), `spctl` verify, then publish installers, Homebrew tap PR, binstall-compatible artifact names. Watch item: cargo-dist cadence post-axo-shutdown (brief §1) — pin the version, budget for a fork/migration in Phase 2 if needed.
 

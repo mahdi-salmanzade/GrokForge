@@ -157,7 +157,7 @@ Semantics:
 | `/mcp` | List MCP servers (stdio/HTTP), health, tool counts, "egress not audited" flag; enable/disable; includes optional built-in xAI Docs server (`https://docs.x.ai/api/mcp`). |
 | `/skills` | List discovered skills/AGENTS.md-adjacent conventions (`.grokforge/skills/`, project + user scope); inspect one. |
 | `/init` | Scan repo (repo map, manifests, README) → generate `AGENTS.md` via structured outputs → present as diff → approve to write. |
-| `/login` | Manage API key: store/replace in OS keyring (encrypted-file fallback), re-validate via `GET /v1/models`. |
+| `/login` | Create or unlock the password-encrypted credential file, then replace the API key or subscription OAuth tokens. |
 | `/quit` (`/exit`) | Exit; prints session id + resume hint. |
 
 Cut for v0.1: `/web`, `/x` (server-side tools are model-invoked, config-toggled, ledger-metered — a `/tools` toggle command is **[post-v0.1]**), `/voice`, `/review` (a subagent role, not a command) **[post-v0.1]**, `/copy` (transcript `y` covers it), `/redo` **[post-v0.1]**.
@@ -344,7 +344,7 @@ CI example:
 Sequential wizard on first `grokforge` launch (each step skippable via flags/env; re-runnable via `grokforge setup`):
 
 1. **Welcome** — one screen: name, version, "MIT", the privacy promise ("the only network calls go to the API endpoint you configure — verify anytime with Ctrl+O").
-2. **API key** — `XAI_API_KEY` env detected → offer to store in the OS keyring (keyring crate, `spawn_blocking`; encrypted-file fallback on headless Linux, path printed); else masked paste prompt. Never written to config files.
+2. **Credentials** — a non-empty `XAI_API_KEY` environment value wins and skips file setup. Otherwise, set and confirm a GrokForge password, then choose subscription OAuth or a masked API-key prompt. Store the resulting credential in `~/.grokforge/credentials.enc`, sealed with ChaCha20-Poly1305 under an Argon2id-derived key; never write it to config files or an OS secret store. Later runs ask for the password to unlock the file.
 3. **Model validation** — spinner on `GET /v1/models`; table of available models (id, ctx, $/M in/out, reasoning); default suggestion `grok-build-0.1` (agentic) + `grok-4.5` (plan); any *configured* slug missing from the list gets a loud warning (retired slugs silently redirect and re-price — brief §2). Base URL shown as editable config, not a constant.
 4. **Sandbox self-test** — platform probes, results table:
    ```

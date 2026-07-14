@@ -10,11 +10,11 @@ pub async fn launch(trust_project_mcp: bool) -> ExitCode {
     let workspace = match canonical_workspace() {
         Ok(workspace) => workspace,
         Err(error) => {
-            eprintln!("cannot start TUI: {error}");
+            eprintln!("cannot start TUI: {}", crate::sanitize_terminal(&error));
             return ExitCode::from(2);
         }
     };
-    // Interactive: resolve env → keychain → hidden prompt (and save to keychain).
+    // Interactive: env override → password-unlock the encrypted file → first-run onboarding.
     let Some(api_key) = crate::credentials::resolve(true).await else {
         return ExitCode::from(3);
     };

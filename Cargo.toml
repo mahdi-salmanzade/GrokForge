@@ -58,7 +58,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 directories = "5"
-keyring = "3"
 rpassword = "7"
 
 # --- crypto (PKCE for xAI OAuth; password-encrypted credential file) ---
@@ -67,6 +66,7 @@ base64 = "0.22"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 getrandom = "0.2"
+zeroize = "1"
 
 # --- ids / time ---
 uuid = { version = "1", features = ["v4", "serde"] }

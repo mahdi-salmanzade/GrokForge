@@ -893,11 +893,13 @@ dependencies = [
  "grokforge-test-support",
  "grokforge-tui",
  "grokforge-xai",
+ "libc",
  "rpassword",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

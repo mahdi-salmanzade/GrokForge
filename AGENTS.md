@@ -22,7 +22,7 @@ cargo deny check                       # license / advisory gate
 | Crate | Responsibility |
 |---|---|
 | `grokforge-protocol` | Serde-only shared vocabulary: `Op`/`Event`, approvals, `SandboxPolicy`, ledger, ids. Leaf crate, no tokio. **Append-only once released.** |
-| `grokforge-config` | figment config layering, provider config, price table, keyring. |
+| `grokforge-config` | figment config layering, provider config, price table. |
 | `grokforge-xai` | In-house Grok client (`/v1/responses`), SSE streaming, model validation, request byte-accounting. |
 | `grokforge-core` | Agent loop, tools, approval engine, context assembler + redaction, compaction, sessions store, subagents. |
 | `grokforge-sandbox` | `SandboxPolicy` compilation, per-OS backends, denial classifier, process exec. |

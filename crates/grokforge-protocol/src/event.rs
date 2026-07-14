@@ -62,4 +62,29 @@ pub enum EventMsg {
     Error { message: String, recoverable: bool },
     /// The session has shut down.
     ShutdownComplete,
+
+    /// A subagent lane began running as part of a parallel `spawn_task` fan-out. `agent_id` is
+    /// the spawning tool call's id (stable for the lane's lifetime); `label` is a short preview
+    /// of the subtask prompt; `index`/`total` position the lane within the current batch.
+    SubagentStarted {
+        agent_id: String,
+        label: String,
+        index: usize,
+        total: usize,
+    },
+    /// An event produced by a running subagent, tagged with its lane so a frontend can render
+    /// per-agent progress instead of interleaving every subagent's stream into one transcript.
+    /// Accounting-relevant inner events (`TokenUsage`, `LedgerAppended`) are still folded into
+    /// global totals by frontends; the wrapper only changes attribution and display.
+    SubagentUpdate {
+        agent_id: String,
+        inner: Box<EventMsg>,
+    },
+    /// A subagent lane finished. `summary` is a one-line result and `ok` reflects clean
+    /// completion (committed cleanly, no leftover uncommitted work).
+    SubagentFinished {
+        agent_id: String,
+        ok: bool,
+        summary: String,
+    },
 }

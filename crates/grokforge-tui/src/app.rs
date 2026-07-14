@@ -8,6 +8,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +42,11 @@ const MAX_RENDER_TRANSCRIPT_BYTES: usize = 48 * 1024;
 const APPROVAL_PAGE_BYTES: usize = 8 * 1024;
 const MAX_PALETTE_ROWS: usize = 7;
 const REDRAW_INTERVAL: Duration = Duration::from_millis(33);
+/// Upper bound on tracked subagent lanes (the core caps a turn at 32 spawns; this defends the TUI
+/// against a misbehaving core emitting more).
+const MAX_AGENT_LANES: usize = 64;
+/// Most lanes rendered in the parallel-agents panel before collapsing the rest into a "+N more".
+const MAX_AGENT_PANEL_ROWS: u16 = 12;
 
 // GrokForge's UI palette. Explicit colors make the product identity consistent across terminal
 // themes; every foreground/background pair is intentionally high-contrast. The interface still
@@ -123,6 +129,26 @@ enum Entry {
     Git(String),
     Error(String),
     Info(String),
+}
+
+/// One parallel-subagent lane shown in the "PARALLEL AGENTS" panel. Built from `SubagentStarted`
+/// and updated by `SubagentUpdate`/`SubagentFinished`.
+#[derive(Debug)]
+struct AgentLane {
+    id: String,
+    label: String,
+    /// Zero-based position within its spawn batch (displayed 1-based).
+    index: usize,
+    total: usize,
+    activity: String,
+    tokens: u64,
+    status: LaneStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaneStatus {
+    Running,
+    Done { ok: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +322,9 @@ pub struct App {
     transcript: Vec<Entry>,
     transcript_bytes: usize,
     omitted_entries: usize,
+    /// A pre-turn safety notice must remain visible without counting as conversation content.
+    /// Otherwise a dirty-workspace warning suppresses the launch artwork before the first draw.
+    startup_notice: Option<String>,
     streaming: Option<String>,
     reasoning: Option<String>,
     composer: String,
@@ -305,6 +334,9 @@ pub struct App {
     scroll: u16,
     follow: bool,
     pending: Option<PendingApproval>,
+    /// Approval requests can arrive concurrently from parallel subagents. Only the front request
+    /// owns the modal; later requests wait here in arrival order until the user resolves it.
+    approval_queue: VecDeque<PendingApproval>,
     /// Sanitized and cached once when the request arrives. Full approval details remain visible;
     /// redraws do not repeatedly format or scan a potentially large command.
     approval_detail: Option<ApprovalDetail>,
@@ -321,6 +353,10 @@ pub struct App {
     available_skills: Vec<SkillDoc>,
     project_commands: Vec<CommandDoc>,
     display_mode: DisplayMode,
+    /// Live parallel-subagent lanes for the current turn (cleared when a new turn starts).
+    agents: Vec<AgentLane>,
+    /// Monotonic redraw tick used to animate the agent spinners.
+    frame: u64,
 
     // The channel stays open for the app's lifetime because `agent` (Arc) holds the sender.
     events_rx: mpsc::UnboundedReceiver<EventMsg>,
@@ -344,6 +380,7 @@ impl std::fmt::Debug for App {
             .field("transcript_len", &self.transcript.len())
             .field("running", &self.running)
             .field("has_pending_approval", &self.pending.is_some())
+            .field("queued_approvals", &self.approval_queue.len())
             .field("has_pending_undo", &self.undo_handle.is_some())
             .finish_non_exhaustive()
     }
@@ -381,6 +418,7 @@ impl App {
             transcript,
             transcript_bytes,
             omitted_entries,
+            startup_notice: None,
             streaming: None,
             reasoning: None,
             composer: String::new(),
@@ -388,6 +426,7 @@ impl App {
             scroll: 0,
             follow: true,
             pending: None,
+            approval_queue: VecDeque::new(),
             approval_detail: None,
             running: false,
             shutdown: ShutdownState::Active,
@@ -402,6 +441,8 @@ impl App {
             available_skills,
             project_commands,
             display_mode: DisplayMode::from_environment(),
+            agents: Vec::new(),
+            frame: 0,
             events_rx,
             approvals_rx,
             turn_handle: None,
@@ -411,8 +452,8 @@ impl App {
         }
     }
 
-    pub(crate) fn push_info(&mut self, message: impl Into<String>) {
-        self.push_entry(Entry::Info(message.into()));
+    pub(crate) fn set_startup_notice(&mut self, message: impl Into<String>) {
+        self.startup_notice = Some(bounded_text(&message.into(), MAX_ENTRY_BYTES));
     }
 
     fn push_entry(&mut self, entry: Entry) {
@@ -436,10 +477,7 @@ impl App {
         if let Some(cancellation) = &self.turn_cancellation {
             cancellation.cancel();
         }
-        if let Some(pending) = self.pending.take() {
-            let _ = pending.respond.send(Decision::Abort);
-        }
-        self.approval_detail = None;
+        self.abort_all_approvals();
         self.finish_quit_if_quiescent();
     }
 
@@ -475,6 +513,11 @@ impl App {
         while self.shutdown != ShutdownState::Ready {
             tokio::select! {
                 _ = redraw.tick() => {
+                    // Keep animating the parallel-agents spinners while any lane is still running.
+                    if self.has_running_agents() {
+                        self.frame = self.frame.wrapping_add(1);
+                        redraw_needed = true;
+                    }
                     if redraw_needed {
                         if let Err(error) = terminal.draw(|f| self.render(f)) {
                             self.request_quit();
@@ -685,11 +728,39 @@ impl App {
             let _ = pending.respond.send(Decision::Abort);
             return;
         }
+        self.approval_queue.push_back(pending);
+        self.activate_next_approval();
+    }
+
+    /// Promote the oldest queued request into the modal. Keeping this transition synchronous with
+    /// the previous decision means there is never a frame where a later request can overwrite an
+    /// unresolved one or accept composer input between consecutive approvals.
+    fn activate_next_approval(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        let Some(pending) = self.approval_queue.pop_front() else {
+            self.approval_detail = None;
+            return;
+        };
         self.approval_detail = Some(ApprovalDetail::new(safe_terminal_text(&format!(
             "reason: {}\nrequest: {:?}",
             pending.request.reason, pending.request.kind
         ))));
         self.pending = Some(pending);
+    }
+
+    /// Fail every outstanding request closed when the UI starts shutting down. Draining the queue
+    /// is essential for parallel subagents: otherwise their approval futures remain blocked after
+    /// the visible request is aborted.
+    fn abort_all_approvals(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            let _ = pending.respond.send(Decision::Abort);
+        }
+        while let Some(pending) = self.approval_queue.pop_front() {
+            let _ = pending.respond.send(Decision::Abort);
+        }
+        self.approval_detail = None;
     }
 
     fn on_approval_key(&mut self, key: KeyEvent) {
@@ -743,6 +814,7 @@ impl App {
         {
             self.approval_detail = None;
             let _ = pending.respond.send(decision);
+            self.activate_next_approval();
         }
     }
 
@@ -779,6 +851,7 @@ impl App {
         self.reasoning = None;
         self.active_tool = None;
         self.stream_retry = None;
+        self.agents.clear();
         let cancellation = TurnCancellation::new();
         self.turn_cancellation = Some(cancellation.clone());
         let agent = Arc::clone(&self.agent);
@@ -1199,11 +1272,86 @@ impl App {
                     self.finish_quit_if_quiescent();
                 }
             }
+            EventMsg::SubagentStarted {
+                agent_id,
+                label,
+                index,
+                total,
+            } => self.upsert_agent_lane(agent_id, &label, index, total),
+            EventMsg::SubagentUpdate { agent_id, inner } => {
+                self.on_subagent_update(&agent_id, &inner);
+            }
+            EventMsg::SubagentFinished {
+                agent_id,
+                ok,
+                summary,
+            } => {
+                if let Some(lane) = self.agent_lane_mut(&agent_id) {
+                    lane.status = LaneStatus::Done { ok };
+                    lane.activity = bounded_text(&safe_terminal_line(&summary), 100);
+                }
+            }
             EventMsg::SessionConfigured { .. }
             | EventMsg::TurnStarted { .. }
             | EventMsg::ToolOutputDelta { .. }
             | EventMsg::ApprovalRequested(_)
             | EventMsg::ShutdownComplete => {}
+        }
+    }
+
+    fn has_running_agents(&self) -> bool {
+        self.agents
+            .iter()
+            .any(|lane| matches!(lane.status, LaneStatus::Running))
+    }
+
+    fn agent_lane_mut(&mut self, id: &str) -> Option<&mut AgentLane> {
+        self.agents.iter_mut().find(|lane| lane.id == id)
+    }
+
+    fn upsert_agent_lane(&mut self, id: String, label: &str, index: usize, total: usize) {
+        let label = bounded_text(&safe_terminal_line(label), 64);
+        if let Some(lane) = self.agent_lane_mut(&id) {
+            lane.label = label;
+            lane.index = index;
+            lane.total = total;
+            lane.status = LaneStatus::Running;
+            lane.activity = "starting…".to_string();
+        } else if self.agents.len() < MAX_AGENT_LANES {
+            self.agents.push(AgentLane {
+                id,
+                label,
+                index,
+                total,
+                activity: "starting…".to_string(),
+                tokens: 0,
+                status: LaneStatus::Running,
+            });
+        }
+    }
+
+    /// Apply a lane-tagged subagent event: fold its accounting into the global totals (so cost and
+    /// privacy stay correct despite the per-lane attribution) and update the lane's live activity.
+    fn on_subagent_update(&mut self, agent_id: &str, inner: &EventMsg) {
+        match inner {
+            EventMsg::TokenUsage { usage } => {
+                self.usage.add(*usage);
+                let delta = usage.input_tokens.saturating_add(usage.output_tokens);
+                if let Some(lane) = self.agent_lane_mut(agent_id) {
+                    lane.tokens = lane.tokens.saturating_add(delta);
+                }
+            }
+            EventMsg::LedgerAppended(entry) => {
+                self.ledger_sources = self.ledger_sources.saturating_add(1);
+                self.ledger_bytes = self.ledger_bytes.saturating_add(entry.bytes);
+                self.ledger_redactions = self.ledger_redactions.saturating_add(entry.redactions);
+            }
+            _ => {}
+        }
+        if let Some(activity) = subagent_activity(inner)
+            && let Some(lane) = self.agent_lane_mut(agent_id)
+        {
+            lane.activity = activity;
         }
     }
 
@@ -1299,7 +1447,8 @@ impl App {
             .split(area);
 
         self.render_header(chunks[0], f);
-        self.render_transcript(chunks[1], f);
+        let transcript_area = self.render_agents_panel(chunks[1], f);
+        self.render_transcript(transcript_area, f);
         self.render_composer(chunks[2], f);
         self.render_status(chunks[3], f);
         self.render_slash_palette(chunks[1], f);
@@ -1308,6 +1457,120 @@ impl App {
             render_approval_modal(area, f, pending, detail);
         }
         apply_display_fallback(f, area, self.display_mode);
+    }
+
+    /// Render the live parallel-agents panel at the top of `area` (if any lanes exist and there is
+    /// room) and return the remaining area for the transcript. This is the "cool TUI" surface for
+    /// up to 32 subagents running at once: one animated row per lane with its activity and tokens.
+    fn render_agents_panel(&self, area: Rect, f: &mut ratatui::Frame) -> Rect {
+        if self.agents.is_empty() || area.height < 7 || area.width < 24 {
+            return area;
+        }
+        let running = self
+            .agents
+            .iter()
+            .filter(|lane| matches!(lane.status, LaneStatus::Running))
+            .count();
+        let done = self.agents.len() - running;
+
+        // Never let the panel eat more than roughly half the transcript region.
+        let max_rows = (area.height.saturating_sub(4) / 2).clamp(1, MAX_AGENT_PANEL_ROWS);
+        let shown = u16::try_from(self.agents.len())
+            .unwrap_or(u16::MAX)
+            .min(max_rows);
+        let overflow = u16::try_from(self.agents.len())
+            .unwrap_or(u16::MAX)
+            .saturating_sub(shown);
+        let inner_rows = shown + u16::from(overflow > 0);
+        let panel_height = inner_rows + 2;
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(panel_height), Constraint::Min(0)])
+            .split(area);
+        let panel = split[0];
+
+        let ascii = self.display_mode.ascii;
+        let bolt = if ascii { ">>" } else { "⚡" };
+        let title = format!(" {bolt} PARALLEL AGENTS · {running} running · {done} done ");
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .title(Span::styled(
+                title,
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(SURFACE_RAISED).fg(TEXT));
+        let inner = block.inner(panel);
+        f.render_widget(block, panel);
+
+        let mut lines: Vec<Line<'static>> = self
+            .agents
+            .iter()
+            .take(shown as usize)
+            .map(|lane| self.agent_lane_line(lane, inner.width))
+            .collect();
+        if overflow > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  … +{overflow} more agent(s)"),
+                Style::default().fg(MUTED),
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+        split[1]
+    }
+
+    fn agent_lane_line(&self, lane: &AgentLane, width: u16) -> Line<'static> {
+        let (glyph, color) = match lane.status {
+            LaneStatus::Running => (self.spinner_glyph(lane.index).to_string(), ACCENT_SOFT),
+            LaneStatus::Done { ok: true } => (
+                (if self.display_mode.ascii { "+" } else { "✓" }).to_string(),
+                SUCCESS,
+            ),
+            LaneStatus::Done { ok: false } => (
+                (if self.display_mode.ascii { "x" } else { "✗" }).to_string(),
+                DANGER,
+            ),
+        };
+        let pos = format!("{:>2}/{:<2}", lane.index + 1, lane.total);
+        let tokens = compact_tokens(lane.tokens);
+        let width = width as usize;
+        // Keep both useful columns visible even in the 22-cell interior of a 24-column panel.
+        // Everything outside label/activity is fixed chrome: glyph + spaces + position + tokens.
+        let fixed_width = display_width(&glyph)
+            .saturating_add(1)
+            .saturating_add(display_width(&pos))
+            .saturating_add(1)
+            .saturating_add(1)
+            .saturating_add(1)
+            .saturating_add(display_width(&tokens));
+        let flexible_width = width.saturating_sub(fixed_width);
+        let label_width = flexible_width.saturating_sub(4).min(22);
+        let activity_width = flexible_width.saturating_sub(label_width);
+        let label = pad_or_truncate(&lane.label, label_width);
+        let activity = pad_or_truncate(&lane.activity, activity_width);
+        Line::from(vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(color)),
+            Span::styled(format!("{pos} "), Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{label} "),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{activity} "), Style::default().fg(MUTED)),
+            Span::styled(tokens, Style::default().fg(FAINT)),
+        ])
+    }
+
+    fn spinner_glyph(&self, offset: usize) -> &'static str {
+        const ASCII: [&str; 4] = ["|", "/", "-", "\\"];
+        const BRAILLE: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frames: &[&str] = if self.display_mode.ascii {
+            &ASCII
+        } else {
+            &BRAILLE
+        };
+        let phase = usize::try_from(self.frame % frames.len() as u64).unwrap_or(0);
+        frames[phase.wrapping_add(offset) % frames.len()]
     }
 
     fn activity_state(&self) -> (String, Color) {
@@ -1437,10 +1700,16 @@ impl App {
         let content_width = content_area.width.max(1);
         if self.transcript.is_empty() && self.streaming.is_none() && self.reasoning.is_none() {
             render_welcome(content_area, f);
+            if let Some(notice) = &self.startup_notice {
+                render_startup_notice(content_area, notice, f);
+            }
             return;
         }
 
         let mut lines: Vec<Line<'static>> = Vec::new();
+        if let Some(notice) = &self.startup_notice {
+            push_startup_notice_lines(&mut lines, notice, content_width);
+        }
         // Keep redraw work and Paragraph's u16 scroll range bounded even when the retained
         // transcript is several MiB. The durable rollout still contains the complete history.
         // Only the short reasoning preview below is rendered live. Reserving the whole reasoning
@@ -2189,6 +2458,33 @@ fn render_welcome(area: Rect, f: &mut ratatui::Frame) {
     f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), compact);
 }
 
+fn render_startup_notice(area: Rect, notice: &str, f: &mut ratatui::Frame) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let line = Line::from(vec![
+        Span::styled("▲  ", Style::default().fg(WARNING)),
+        Span::styled(
+            safe_terminal_line(notice),
+            Style::default().fg(MUTED).bg(CANVAS),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().bg(CANVAS)),
+        first_row(area),
+    );
+}
+
+fn push_startup_notice_lines(lines: &mut Vec<Line<'static>>, notice: &str, width: u16) {
+    lines.push(Line::from(vec![
+        Span::styled("▲  STARTUP  ", Style::default().fg(WARNING)),
+        Span::styled(safe_terminal_line(notice), Style::default().fg(MUTED)),
+    ]));
+    if width > 0 {
+        lines.push(Line::from(""));
+    }
+}
+
 fn welcome_art_layout(area: Rect) -> Option<(&'static crate::brand::BrandArt, u16, u16)> {
     if area.width >= 116 && area.height >= 33 {
         return crate::brand::responsive(66, 33).map(|art| (art, 4, 46));
@@ -2707,6 +3003,68 @@ fn push_entry_lines(lines: &mut Vec<Line<'static>>, entry: &Entry, width: u16) {
     }
     if !matches!(entry, Entry::Tool { .. } | Entry::Reasoning(_)) {
         lines.push(Line::from(""));
+    }
+}
+
+/// Derive a compact, sanitized activity string for a subagent lane from one of its inner events.
+/// Returns `None` for events that carry no useful lane status.
+fn subagent_activity(inner: &EventMsg) -> Option<String> {
+    let text = match inner {
+        EventMsg::ToolCallBegin {
+            name, args_preview, ..
+        } => humanize_tool_call(name, args_preview),
+        EventMsg::ToolCallEnd { ok, .. } => {
+            if *ok { "tool done" } else { "tool failed" }.to_string()
+        }
+        EventMsg::ReasoningDelta { .. } => "thinking…".to_string(),
+        EventMsg::AgentMessageDelta { .. } | EventMsg::AgentMessageDone { .. } => {
+            "writing…".to_string()
+        }
+        EventMsg::StreamRetrying { attempt, .. } => format!("retrying (attempt {attempt})"),
+        EventMsg::Committed { .. } => "committed".to_string(),
+        EventMsg::Error { message, .. } => format!("error: {message}"),
+        _ => return None,
+    };
+    Some(bounded_text(&safe_terminal_line(&text), 100))
+}
+
+/// Pad with spaces or truncate (with an ellipsis) to exactly `width` terminal cells.
+fn pad_or_truncate(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let value_width = display_width(value);
+    if value_width <= width {
+        let mut out = value.to_string();
+        out.push_str(&" ".repeat(width - value_width));
+        out
+    } else {
+        let content_width = width.saturating_sub(1);
+        let mut out = String::new();
+        let mut used = 0usize;
+        for character in value.chars() {
+            let character_width = character.width().unwrap_or(0);
+            if used.saturating_add(character_width) > content_width {
+                break;
+            }
+            out.push(character);
+            used = used.saturating_add(character_width);
+        }
+        out.push('…');
+        out.push_str(&" ".repeat(width.saturating_sub(used.saturating_add(1))));
+        out
+    }
+}
+
+/// Human-friendly token count, e.g. `950`, `1.2k`, `3.4M`. Uses integer math to avoid float
+/// precision casts on large counts.
+fn compact_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{}.{}M", n / 1_000_000, (n % 1_000_000) / 100_000)
+    } else if n >= 1_000 {
+        format!("{}.{}k", n / 1_000, (n % 1_000) / 100)
+    } else {
+        format!("{n}")
     }
 }
 
@@ -3255,7 +3613,10 @@ mod tests {
     use ratatui::text::Line;
     use tokio::sync::mpsc;
 
-    use super::{App, ApprovalDetail, DisplayMode, Entry, MAX_COMPOSER_BYTES, TurnOutcome};
+    use super::{
+        AgentLane, App, ApprovalDetail, DisplayMode, Entry, LaneStatus, MAX_COMPOSER_BYTES,
+        TurnOutcome,
+    };
     use crate::approver::ChannelApprover;
 
     fn test_app() -> App {
@@ -3383,6 +3744,57 @@ mod tests {
         assert!(!conversation.contains("LOCAL-FIRST TERMINAL INTELLIGENCE"));
         assert!(!conversation.contains("WHAT ARE WE BUILDING?"));
         assert!(conversation.contains("Make this terminal unmistakably ours"));
+    }
+
+    #[test]
+    fn startup_safety_notice_does_not_suppress_the_ascii_welcome() {
+        let mut app = test_app();
+        app.set_startup_notice(
+            "auto-commit disabled: workspace had pre-existing uncommitted changes",
+        );
+
+        let frame = buffer_frame(&app, 168, 88);
+        assert!(frame.contains("LOCAL-FIRST TERMINAL INTELLIGENCE"));
+        assert!(frame.contains("auto-commit disabled"));
+        let art = crate::brand::responsive(66, 33).expect("full bundled brand art");
+        assert!(
+            art.lines()
+                .iter()
+                .map(|line| line.trim())
+                .filter(|fragment| fragment.len() >= 8)
+                .any(|fragment| frame.contains(fragment)),
+            "launch frame did not contain the bundled ASCII mark:\n{frame}"
+        );
+
+        app.transcript
+            .push(Entry::User("Start the audit".to_string()));
+        let conversation = buffer_frame(&app, 168, 88);
+        assert!(!conversation.contains("LOCAL-FIRST TERMINAL INTELLIGENCE"));
+        assert!(conversation.contains("auto-commit disabled"));
+        assert!(conversation.contains("Start the audit"));
+    }
+
+    #[test]
+    fn parallel_agent_rows_fit_narrow_terminals_and_wide_unicode() {
+        let app = test_app();
+        let lane = AgentLane {
+            id: "lane-1".to_string(),
+            label: "分析界面 and verify the renderer".to_string(),
+            index: 0,
+            total: 32,
+            activity: "检查 very long activity".to_string(),
+            tokens: 12_345,
+            status: LaneStatus::Running,
+        };
+
+        for width in [22, 30, 42, 80] {
+            let row = app.agent_lane_line(&lane, width);
+            assert!(
+                row.width() <= usize::from(width),
+                "agent row used {} cells in a {width}-cell panel: {row:?}",
+                row.width()
+            );
+        }
     }
 
     #[test]
@@ -3833,6 +4245,73 @@ mod tests {
         assert!(text.contains("approve"));
     }
 
+    #[tokio::test]
+    async fn concurrent_approval_requests_are_resolved_in_arrival_order() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        use grokforge_protocol::{ApprovalId, ApprovalKind, ApprovalRequest};
+        use tokio::sync::oneshot;
+
+        let mut app = test_app();
+        let (first_respond, first_wait) = oneshot::channel();
+        app.on_approval_request(crate::approver::PendingApproval {
+            request: ApprovalRequest {
+                id: ApprovalId::new(),
+                call_id: None,
+                kind: ApprovalKind::WriteFile {
+                    path: "/tmp/first".into(),
+                },
+                reason: "first concurrent request".to_string(),
+            },
+            respond: first_respond,
+        });
+        let (second_respond, second_wait) = oneshot::channel();
+        app.on_approval_request(crate::approver::PendingApproval {
+            request: ApprovalRequest {
+                id: ApprovalId::new(),
+                call_id: None,
+                kind: ApprovalKind::WriteFile {
+                    path: "/tmp/second".into(),
+                },
+                reason: "second concurrent request".to_string(),
+            },
+            respond: second_respond,
+        });
+
+        assert_eq!(
+            app.pending
+                .as_ref()
+                .map(|pending| pending.request.reason.as_str()),
+            Some("first concurrent request")
+        );
+        assert_eq!(app.approval_queue.len(), 1);
+        assert!(
+            app.approval_detail
+                .as_ref()
+                .is_some_and(|detail| detail.text.contains("first concurrent request"))
+        );
+
+        app.on_approval_key(KeyEvent::from(KeyCode::Char('y')));
+        assert_eq!(first_wait.await.expect("first decision"), Decision::Approve);
+        assert_eq!(
+            app.pending
+                .as_ref()
+                .map(|pending| pending.request.reason.as_str()),
+            Some("second concurrent request")
+        );
+        assert!(app.approval_queue.is_empty());
+        assert!(
+            app.approval_detail
+                .as_ref()
+                .is_some_and(|detail| detail.text.contains("second concurrent request"))
+        );
+
+        app.on_approval_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(second_wait.await.expect("second decision"), Decision::Deny);
+        assert!(app.pending.is_none());
+        assert!(app.approval_queue.is_empty());
+        assert!(app.approval_detail.is_none());
+    }
+
     #[test]
     fn narrow_approval_always_keeps_the_safe_deny_action_visible() {
         use grokforge_protocol::{ApprovalId, ApprovalKind, ApprovalRequest};
@@ -4185,5 +4664,42 @@ mod tests {
 
         assert_eq!(wait.await.expect("decision"), Decision::Abort);
         assert!(app.pending.is_none());
+        assert!(app.approval_queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn quitting_aborts_the_visible_and_every_queued_approval() {
+        use grokforge_protocol::{ApprovalId, ApprovalKind, ApprovalRequest};
+        use tokio::sync::oneshot;
+
+        let mut app = test_app();
+        let (first_respond, first_wait) = oneshot::channel();
+        let (second_respond, second_wait) = oneshot::channel();
+        for (reason, respond) in [
+            ("visible request", first_respond),
+            ("queued request", second_respond),
+        ] {
+            app.on_approval_request(crate::approver::PendingApproval {
+                request: ApprovalRequest {
+                    id: ApprovalId::new(),
+                    call_id: None,
+                    kind: ApprovalKind::WriteFile {
+                        path: format!("/tmp/{reason}").into(),
+                    },
+                    reason: reason.to_string(),
+                },
+                respond,
+            });
+        }
+
+        assert!(app.pending.is_some());
+        assert_eq!(app.approval_queue.len(), 1);
+        app.request_quit();
+
+        assert_eq!(first_wait.await.expect("visible decision"), Decision::Abort);
+        assert_eq!(second_wait.await.expect("queued decision"), Decision::Abort);
+        assert!(app.pending.is_none());
+        assert!(app.approval_queue.is_empty());
+        assert!(app.approval_detail.is_none());
     }
 }

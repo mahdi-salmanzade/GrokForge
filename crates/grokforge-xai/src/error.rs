@@ -60,7 +60,8 @@ pub enum XaiError {
     #[error("decode error: {0}")]
     Decode(#[source] serde_json::Error),
 
-    /// A configured API key could not be found (env or keychain) — the caller should prompt.
+    /// A configured bearer credential could not be found (environment or encrypted file) — the
+    /// caller should prompt when interactive.
     #[error("no xAI API key configured")]
     NoApiKey,
 

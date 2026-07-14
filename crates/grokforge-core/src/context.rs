@@ -139,49 +139,76 @@ pub fn assemble(
                 });
             }
             ResponseItem::ProviderOutput { item } => {
-                let bytes = serde_json::to_vec(item).map_or(0, |serialized| serialized.len());
-                let item_type = item
+                // Provider-native function calls are the ordinary stateless-continuation path.
+                // They carry the same model-generated arguments as `ResponseItem::ToolCall`, but
+                // nested inside the raw provider item, so redact that field before replay too.
+                // Keep every other provider field byte-for-byte intact (notably opaque reasoning
+                // state and provider ids).
+                let mut replay_item = item.clone();
+                let item_type = replay_item
                     .get("type")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
+                    .unwrap_or("unknown")
+                    .to_string();
+                let mut redactions = 0usize;
                 let source = if item_type == "function_call" {
-                    let call_id = item
+                    let call_id = replay_item
                         .get("call_id")
                         .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default();
-                    let name = item
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = replay_item
                         .get("name")
                         .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown");
-                    let arguments = item
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let redacted_arguments = replay_item
                         .get("arguments")
                         .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default();
-                    let label = tool_label(name, arguments);
-                    calls.insert(call_id.to_string(), label.clone());
+                        .map(Redactor::apply);
+                    let arguments = redacted_arguments
+                        .as_ref()
+                        .map_or("", |redacted| redacted.text.as_str());
+                    let label = tool_label(&name, arguments);
+                    calls.insert(call_id, label.clone());
+                    if let Some(redacted) = redacted_arguments {
+                        redactions = redacted.count;
+                        if let Some(arguments) = replay_item.get_mut("arguments") {
+                            *arguments = serde_json::Value::String(redacted.text);
+                        }
+                    }
                     format!("provider_output:{label}")
                 } else {
-                    format!("provider_output:{}", safe_label(item_type))
+                    format!("provider_output:{}", safe_label(&item_type))
                 };
-                ledger.push(LedgerEntry::new(source, bytes, "stateless continuation"));
-                input.push(InputItem::Raw(item.clone()));
+                let bytes =
+                    serde_json::to_vec(&replay_item).map_or(0, |serialized| serialized.len());
+                ledger.push(
+                    LedgerEntry::new(source, bytes, "stateless continuation")
+                        .with_redactions(redactions),
+                );
+                input.push(InputItem::Raw(replay_item));
             }
             ResponseItem::ToolCall {
                 id,
                 name,
                 arguments,
             } => {
-                let label = tool_label(name, arguments);
+                // Tool-call arguments can carry secrets (for example a shell command containing a
+                // token). Redact them before they re-enter the request body, and account the
+                // redactions in the ledger so byte reconciliation against the serialized body
+                // stays exact.
+                let red = Redactor::apply(arguments);
+                let label = tool_label(name, &red.text);
                 calls.insert(id.to_string(), label.clone());
-                ledger.push(LedgerEntry::new(
-                    format!("tool_call:{label}"),
-                    arguments.len(),
-                    "history",
-                ));
+                ledger.push(
+                    LedgerEntry::new(format!("tool_call:{label}"), red.text.len(), "history")
+                        .with_redactions(red.count),
+                );
                 input.push(InputItem::FunctionCall {
                     call_id: id.to_string(),
                     name: name.clone(),
-                    arguments: arguments.clone(),
+                    arguments: red.text,
                 });
             }
             ResponseItem::ToolResult {
@@ -420,6 +447,52 @@ mod tests {
         assert!(assembled.ledger.entries.iter().any(|entry| {
             entry.source == "history:compaction_summary" && entry.redactions == 5
         }));
+        assert_eq!(assembled.ledger.total_bytes(), assembled.body_len);
+    }
+
+    #[test]
+    fn provider_function_call_arguments_are_redacted_and_counted() {
+        let mut session = Session::new(SessionConfig::new(PathBuf::from("/tmp"), "m"));
+        let call_id = grokforge_protocol::ToolCallId::from_raw("call_secret");
+        let secret = "abcdefghijklmnopqrstuvwxyz123456";
+        let arguments = format!(
+            r#"{{"command":"curl -H 'Authorization: Bearer {secret}' https://example.test"}}"#
+        );
+        session.history.push(ResponseItem::ProviderOutput {
+            item: serde_json::json!({
+                "type": "function_call",
+                "id": "fc_secret",
+                "call_id": call_id.as_str(),
+                "name": "shell",
+                "arguments": arguments,
+            }),
+        });
+        session.history.push(ResponseItem::ToolResult {
+            id: call_id,
+            content: "done".to_string(),
+            is_error: false,
+            redactions: 0,
+        });
+
+        let assembled = assemble(&session, &[], &[], vec![]).unwrap();
+        let (body, _) = XaiClient::serialize_request(&assembled.request).unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains(secret));
+        assert!(body.contains("[REDACTED:bearer-token]"));
+        assert!(
+            assembled
+                .ledger
+                .entries
+                .iter()
+                .any(|entry| { entry.source == "provider_output:shell" && entry.redactions == 1 })
+        );
+        assert!(
+            assembled
+                .ledger
+                .entries
+                .iter()
+                .any(|entry| entry.source == "tool_result:shell")
+        );
         assert_eq!(assembled.ledger.total_bytes(), assembled.body_len);
     }
 

@@ -78,8 +78,8 @@ enum Command {
     },
     /// List and search past sessions.
     Sessions,
-    /// Store credentials in the OS keychain: an API key (default), or sign in with your
-    /// SuperGrok / X Premium+ subscription via `--subscription`.
+    /// Store credentials in the password-encrypted file: an API key (default), or sign in with
+    /// your SuperGrok / X Premium+ subscription via `--subscription`.
     Login {
         /// Sign in with your Grok subscription (OAuth) instead of pasting an API key.
         #[arg(long)]

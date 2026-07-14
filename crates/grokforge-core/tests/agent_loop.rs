@@ -129,6 +129,29 @@ fn parallel_tool_calls_then_done() -> Reply {
     ])
 }
 
+/// A single response that asks to spawn two subagents at once (exercises the parallel batch path).
+fn two_spawn_tasks() -> Reply {
+    Reply::sse_events(&[
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                "name": "spawn_task", "arguments": json!({"prompt":"task one"}).to_string()
+            }
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "type": "function_call", "id": "fc_2", "call_id": "call_2",
+                "name": "spawn_task", "arguments": json!({"prompt":"task two"}).to_string()
+            }
+        }),
+        json!({"type":"response.completed","response":{"status":"requires_action"}}),
+    ])
+}
+
 /// A response that just says something and ends the turn.
 fn final_text(text: &str) -> Reply {
     Reply::sse_events(&[
@@ -666,6 +689,102 @@ async fn subagent_runs_in_an_isolated_worktree_branch() {
             if content.contains("Subagent finished on branch"))
     });
     assert!(has_subagent_result, "parent should see the subagent result");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn spawns_multiple_subagents_in_parallel() {
+    // Requires git.
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: git unavailable");
+        return;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let ws = workspace.path();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(ws)
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@t.dev"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(ws.join("README"), "x\n").unwrap();
+    git(&["add", "README"]);
+    git(&["commit", "-qm", "init"]);
+
+    // Parent asks to spawn two subagents in one response; each subagent turn is a single
+    // final message (both scripts are equivalent, so the concurrent request order is irrelevant).
+    let mock = MockXai::builder()
+        .route("/v1/responses", two_spawn_tasks())
+        .route("/v1/responses", final_text("subtask one done"))
+        .route("/v1/responses", final_text("subtask two done"))
+        .route("/v1/responses", final_text("both subtasks delegated"))
+        .start()
+        .await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let agent = agent_for(&mock, tx);
+    let mut session = Session::new(
+        SessionConfig::new(ws.to_path_buf(), "grok-build-0.1").with_policy(
+            grokforge_protocol::ApprovalPolicy::Never,
+            SandboxMode::DangerFullAccess,
+        ),
+    );
+    let stop = agent
+        .run_turn(&mut session, "delegate two subtasks", &mut None)
+        .await;
+    assert_eq!(stop, StopReason::EndTurn);
+
+    // Each subagent got its own gf/agent/* branch.
+    let branches = String::from_utf8(git(&["branch", "--list", "gf/agent/*"]).stdout).unwrap();
+    let branch_count = branches
+        .lines()
+        .filter(|line| line.contains("gf/agent/"))
+        .count();
+    assert_eq!(
+        branch_count, 2,
+        "expected two subagent branches: {branches}"
+    );
+
+    // Both subagent results were recorded back into the parent transcript.
+    let result_count = session
+        .history
+        .iter()
+        .filter(|item| {
+            matches!(item, grokforge_protocol::ResponseItem::ToolResult { content, .. }
+                if content.contains("Subagent finished on branch"))
+        })
+        .count();
+    assert_eq!(
+        result_count, 2,
+        "parent should record both subagent results"
+    );
+
+    // Both lanes emitted a start and a finish, each tagged with the batch total.
+    let mut started = 0;
+    let mut finished = 0;
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            EventMsg::SubagentStarted { total, .. } => {
+                assert_eq!(total, 2);
+                started += 1;
+            }
+            EventMsg::SubagentFinished { ok, .. } => {
+                assert!(ok, "subagents completed cleanly");
+                finished += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(started, 2, "two SubagentStarted events");
+    assert_eq!(finished, 2, "two SubagentFinished events");
 }
 
 #[tokio::test]

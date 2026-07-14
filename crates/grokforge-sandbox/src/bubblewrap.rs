@@ -13,7 +13,8 @@ use grokforge_protocol::{NetworkMode, SandboxMode, SandboxPolicy};
 use crate::classifier::classify;
 use crate::exec::{CommandSpec, ExecError, ExecOutput, run_capture};
 use crate::privacy::{
-    privacy_path_candidates, validate_privacy_tree, validate_session_storage_aliases,
+    grokforge_credential_path_candidates, privacy_path_candidates, validate_privacy_tree,
+    validate_session_storage_aliases,
 };
 use crate::protected::validate_protected_tree;
 use crate::unreadable::discover_unreadable_paths;
@@ -663,7 +664,18 @@ fn is_below_hidden_runtime_root(path: &Path) -> bool {
 }
 
 fn mask_mounts(policy: &SandboxPolicy, command: &CommandSpec) -> Result<Vec<MaskMount>, ExecError> {
+    mask_mounts_with_credentials(policy, command, grokforge_credential_path_candidates())
+}
+
+fn mask_mounts_with_credentials(
+    policy: &SandboxPolicy,
+    command: &CommandSpec,
+    credential_paths: Vec<PathBuf>,
+) -> Result<Vec<MaskMount>, ExecError> {
     let mut candidates = discover_unreadable_paths(policy, &command.cwd)?;
+    // GrokForge's own encrypted credentials remain private even when danger mode intentionally
+    // stops masking unrelated ambient host credentials.
+    candidates.extend(credential_paths);
     if policy.mode != SandboxMode::DangerFullAccess {
         validate_session_storage_aliases(&command.cwd)?;
         candidates.extend(privacy_path_candidates(&command.cwd));
@@ -896,6 +908,31 @@ mod tests {
                 .windows(2)
                 .any(|args| args == ["--tmpfs", private.as_str()])
         );
+    }
+
+    #[test]
+    fn danger_policy_always_masks_grokforge_credentials() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let private = tempfile::tempdir().expect("private");
+        let credentials = private.path().join("credentials.enc");
+        std::fs::write(&credentials, "encrypted credentials").expect("credentials fixture");
+        let policy = SandboxPolicy::danger_full_access(workspace.path());
+        let command = spec(workspace.path().to_path_buf());
+        let masks = mask_mounts_with_credentials(&policy, &command, vec![credentials.clone()])
+            .expect("prepare credential mask");
+        let credentials = canonical(&credentials);
+        assert!(
+            masks
+                .iter()
+                .any(|mask| !mask.is_dir && mask.path == credentials)
+        );
+        let wrapped =
+            BubblewrapRunner::wrap(&policy, &command, &masks, Path::new("/usr/bin/bwrap"));
+        assert!(wrapped.args.windows(3).any(|args| {
+            args[0] == "--ro-bind"
+                && args[1] == "/dev/null"
+                && Path::new(&args[2]) == credentials.as_path()
+        }));
     }
 
     #[test]

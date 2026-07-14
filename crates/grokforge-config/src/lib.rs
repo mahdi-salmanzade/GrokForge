@@ -1,4 +1,4 @@
-//! `grokforge-config` — Config layering (figment), provider config, price table, and keyring access.
+//! `grokforge-config` — Config layering (figment), provider config, and price table.
 //!
 //! Stub: implemented in M1/M2. See docs/design/03-roadmap.md.
 

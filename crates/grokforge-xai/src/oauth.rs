@@ -13,6 +13,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,6 +25,9 @@ const SCOPE: &str = "openid profile email offline_access grok-cli:access api:acc
 const PREFERRED_PORT: u16 = 56121;
 /// Refresh a little before the token actually expires.
 const REFRESH_SKEW: Duration = Duration::from_secs(120);
+/// OAuth token responses are tiny JSON documents. Bound the collected body so a broken or
+/// compromised token endpoint cannot consume unbounded memory before parsing fails.
+const TOKEN_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 
 /// Errors from the OAuth flow.
 #[derive(Debug, thiserror::Error)]
@@ -102,12 +106,26 @@ struct TokenResponse {
     expires_in: Option<i64>,
 }
 
-fn tokens_from(resp: TokenResponse) -> OAuthTokens {
-    OAuthTokens {
+fn tokens_from(resp: TokenResponse) -> Result<OAuthTokens, OAuthError> {
+    if resp.access_token.trim().is_empty() {
+        return Err(OAuthError::Token(
+            "token response contained an empty access_token".to_string(),
+        ));
+    }
+    let expires_in = resp.expires_in.unwrap_or(3600);
+    if expires_in <= 0 {
+        return Err(OAuthError::Token(
+            "token response contained a non-positive expires_in".to_string(),
+        ));
+    }
+    let expires_at = now_unix().checked_add(expires_in).ok_or_else(|| {
+        OAuthError::Token("token expiry is outside the supported range".to_string())
+    })?;
+    Ok(OAuthTokens {
         access_token: resp.access_token,
         refresh_token: resp.refresh_token,
-        expires_at: now_unix() + resp.expires_in.unwrap_or(3600),
-    }
+        expires_at,
+    })
 }
 
 /// Run the interactive browser sign-in. Prints (and tries to open) the authorization URL,
@@ -164,9 +182,25 @@ pub async fn login() -> Result<OAuthTokens, OAuthError> {
     tokens
 }
 
+/// Build the HTTP client used for the OAuth token endpoints. It applies a connect timeout and an
+/// overall request timeout so a stuck or malicious `auth.x.ai` cannot hang credential refresh (and
+/// thus the whole agent loop) indefinitely. Mirrors the timeout strategy of the main API client.
+fn token_client() -> Result<reqwest::Client, OAuthError> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(30))
+        // Authorization codes, PKCE verifiers, and refresh tokens live in the form body. A 307 or
+        // 308 redirect can replay that body, so never follow token-endpoint redirects.
+        .redirect(reqwest::redirect::Policy::none())
+        // Proxy environment variables are not an explicit GrokForge credential-egress boundary.
+        .no_proxy()
+        .build()
+        .map_err(OAuthError::Http)
+}
+
 /// Exchange a refresh token for a fresh access token.
 pub async fn refresh(refresh_token: &str) -> Result<OAuthTokens, OAuthError> {
-    let client = reqwest::Client::new();
+    let client = token_client()?;
     let resp = client
         .post(TOKEN_URL)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -185,7 +219,7 @@ async fn exchange_code(
     redirect_uri: &str,
     verifier: &str,
 ) -> Result<OAuthTokens, OAuthError> {
-    let client = reqwest::Client::new();
+    let client = token_client()?;
     let resp = client
         .post(TOKEN_URL)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -203,16 +237,37 @@ async fn exchange_code(
 
 async fn parse_token_response(resp: reqwest::Response) -> Result<OAuthTokens, OAuthError> {
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    if resp
+        .content_length()
+        .is_some_and(|length| length > TOKEN_RESPONSE_MAX_BYTES as u64)
+    {
+        return Err(OAuthError::Token(format!(
+            "token response exceeds the {TOKEN_RESPONSE_MAX_BYTES}-byte safety limit"
+        )));
+    }
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > TOKEN_RESPONSE_MAX_BYTES {
+            return Err(OAuthError::Token(format!(
+                "token response exceeds the {TOKEN_RESPONSE_MAX_BYTES}-byte safety limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
     if !status.is_success() {
         return Err(OAuthError::Token(format!(
             "{status}: {}",
-            body.chars().take(300).collect::<String>()
+            String::from_utf8_lossy(&body)
+                .chars()
+                .take(300)
+                .collect::<String>()
         )));
     }
     let parsed: TokenResponse =
-        serde_json::from_str(&body).map_err(|e| OAuthError::Token(e.to_string()))?;
-    Ok(tokens_from(parsed))
+        serde_json::from_slice(&body).map_err(|e| OAuthError::Token(e.to_string()))?;
+    tokens_from(parsed)
 }
 
 /// Wait for the loopback redirect carrying `code` + `state`. The success page is only shown when
@@ -309,36 +364,40 @@ impl CallbackPage {
         &'static str,
         &'static str,
         &'static str,
+        &'static str,
     ) {
         match self {
             Self::Success => (
                 "success",
-                "Signed in",
-                "Authentication complete",
-                "You're all set.",
-                "GrokForge is signed in and ready to build. You can close this tab and return to your terminal.",
+                "Authorized",
+                "xAI authorization complete",
+                "Back to the forge.",
+                "xAI approved this session. Return to your terminal to finish secure local setup and confirm whether your credentials were saved.",
+                "Close this tab, then follow the final status in your terminal.",
             ),
             Self::Denied => (
                 "denied",
                 "Sign-in stopped",
                 "Authentication stopped",
-                "No changes made.",
-                "Sign-in was cancelled or could not be completed. Return to your terminal to try again whenever you're ready.",
+                "Forge paused.",
+                "xAI cancelled or could not complete authorization. Your terminal has the details, and no new credentials were saved.",
+                "Close this tab and return to your terminal to try again.",
             ),
             Self::Waiting => (
                 "waiting",
                 "Waiting for sign-in",
                 "Authorization pending",
-                "Almost there.",
-                "Complete sign-in in the xAI window. GrokForge is still waiting in your terminal.",
+                "Finish with xAI.",
+                "This is the local callback, not the xAI sign-in window. Complete authorization with xAI; GrokForge is still waiting in your terminal.",
+                "This page will not update. Return to xAI to finish signing in, or check your terminal for details.",
             ),
         }
     }
 
     fn terminal_line(self) -> &'static str {
         match self {
-            Self::Success => "identity connected",
-            Self::Denied => "sign-in cancelled",
+            Self::Success => "xAI authorization complete",
+            Self::Denied => "authorization not completed",
             Self::Waiting => "awaiting authorization",
         }
     }
@@ -353,9 +412,9 @@ impl CallbackPage {
 
     fn terminal_state(self) -> &'static str {
         match self {
-            Self::Success => "ready",
-            Self::Denied => "no changes made",
-            Self::Waiting => "listening on localhost",
+            Self::Success => "finish in terminal",
+            Self::Denied => "return to terminal",
+            Self::Waiting => "terminal still waiting",
         }
     }
 }
@@ -384,13 +443,14 @@ fn callback_http_response(page: CallbackPage) -> String {
 }
 
 fn callback_page(page: CallbackPage) -> String {
-    let (state, title, eyebrow, heading, message) = page.copy();
+    let (state, title, eyebrow, heading, message, handoff) = page.copy();
     CALLBACK_PAGE_TEMPLATE
         .replace("__STATE__", state)
         .replace("__TITLE__", title)
         .replace("__EYEBROW__", eyebrow)
         .replace("__HEADING__", heading)
         .replace("__MESSAGE__", message)
+        .replace("__HANDOFF__", handoff)
         .replace("__TERMINAL_ICON__", page.terminal_icon())
         .replace("__TERMINAL_LINE__", page.terminal_line())
         .replace("__TERMINAL_STATE__", page.terminal_state())
@@ -401,17 +461,27 @@ const CALLBACK_PAGE_TEMPLATE: &str = include_str!("oauth_callback.html");
 /// Read an HTTP request head (up to the blank line), tolerating idle/speculative connections
 /// via a short per-connection read timeout so a silent preconnect can't stall the flow.
 async fn read_request_head(sock: &mut tokio::net::TcpStream) -> String {
+    const MAX_HEAD_BYTES: usize = 8192;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 2048];
+    // A single absolute deadline for the whole head, so a slow-drip client cannot reset a
+    // per-read timeout indefinitely and pin the (local-only) loopback accept loop.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), sock.read(&mut tmp)).await {
+        // Enforce the size cap before reading so the buffer never overshoots by a full chunk.
+        if buf.len() >= MAX_HEAD_BYTES {
+            break;
+        }
+        let remaining = MAX_HEAD_BYTES - buf.len();
+        let read_len = remaining.min(tmp.len());
+        match tokio::time::timeout_at(deadline, sock.read(&mut tmp[..read_len])).await {
             Ok(Ok(n)) if n > 0 => {
                 buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 8192 {
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
                     break;
                 }
             }
-            // EOF, read error, or idle-connection timeout — stop reading this connection.
+            // EOF, read error, or the absolute deadline elapsed — stop reading this connection.
             _ => break,
         }
     }
@@ -492,6 +562,128 @@ mod tests {
     }
 
     #[test]
+    fn token_response_requires_a_usable_token_and_bounded_expiry() {
+        assert!(
+            tokens_from(TokenResponse {
+                access_token: "   ".to_string(),
+                refresh_token: None,
+                expires_in: Some(3600),
+            })
+            .is_err()
+        );
+        assert!(
+            tokens_from(TokenResponse {
+                access_token: "access".to_string(),
+                refresh_token: None,
+                expires_in: Some(0),
+            })
+            .is_err()
+        );
+        assert!(
+            tokens_from(TokenResponse {
+                access_token: "access".to_string(),
+                refresh_token: None,
+                expires_in: Some(i64::MAX),
+            })
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn token_client_does_not_follow_redirects_with_secret_form_bodies() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind redirect server");
+        let address = listener.local_addr().expect("redirect server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("initial token request");
+            let mut request = vec![0u8; 4096];
+            let read = socket.read(&mut request).await.expect("read token request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains("refresh_token=secret-refresh"));
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{address}/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write redirect");
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_ok()
+        });
+
+        let response = token_client()
+            .expect("token client")
+            .post(format!("http://{address}/token"))
+            .form(&[("refresh_token", "secret-refresh")])
+            .send()
+            .await
+            .expect("redirect response");
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert!(!server.await.expect("redirect server task"));
+    }
+
+    #[tokio::test]
+    async fn token_response_body_is_bounded() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind token server");
+        let address = listener.local_addr().expect("token server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("token request");
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await.expect("read token request");
+            let body = vec![b'x'; TOKEN_RESPONSE_MAX_BYTES + 1];
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write token headers");
+            // The client may reject from Content-Length before consuming the body and close early.
+            let _ = socket.write_all(&body).await;
+        });
+
+        let response = token_client()
+            .expect("token client")
+            .get(format!("http://{address}/token"))
+            .send()
+            .await
+            .expect("token response");
+        let error = parse_token_response(response)
+            .await
+            .expect_err("oversized token body must fail");
+        assert!(error.to_string().contains("safety limit"));
+        server.await.expect("token server task");
+    }
+
+    #[tokio::test]
+    async fn callback_request_head_stops_at_the_exact_byte_cap() {
+        const EXPECTED_CAP: usize = 8192;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind callback reader");
+        let address = listener.local_addr().expect("callback reader address");
+        let reader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("callback connection");
+            read_request_head(&mut socket).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect callback reader");
+        let oversized = vec![b'a'; EXPECTED_CAP + 4096];
+        let _ = client.write_all(&oversized).await;
+        let _ = client.shutdown().await;
+
+        let request = reader.await.expect("callback reader task");
+        assert_eq!(request.len(), EXPECTED_CAP);
+    }
+
+    #[test]
     fn percent_decode_handles_encodings() {
         assert_eq!(percent_decode("a%2Fb%20c"), "a/b c");
         assert_eq!(percent_decode("plain"), "plain");
@@ -517,20 +709,34 @@ mod tests {
         let success = callback_page(CallbackPage::Success);
         assert!(success.starts_with("<!doctype html>"));
         assert!(success.contains("data-state=\"success\""));
-        assert!(success.contains("GrokForge is signed in and ready to build"));
-        assert!(success.contains("identity connected"));
+        assert!(success.contains("Back to the forge"));
+        assert!(success.contains("confirm whether your credentials were saved"));
+        assert!(success.contains("xAI authorization complete"));
+        assert!(!success.contains("You're all set"));
+        assert!(!success.contains("ready to build"));
         assert!(success.contains("fill=\"#ff5a1f\""));
         assert!(success.contains("prefers-reduced-motion"));
+        assert!(success.contains("<kbd class=\"key\">⌘W</kbd>"));
+        assert!(success.contains("<kbd class=\"key\">Ctrl+W</kbd>"));
+        assert!(success.contains("follow the final status in your terminal"));
 
         let denied = callback_page(CallbackPage::Denied);
         assert!(denied.contains("data-state=\"denied\""));
-        assert!(denied.contains("Sign-in was cancelled"));
-        assert!(denied.contains("no changes made"));
+        assert!(denied.contains("no new credentials were saved"));
+        assert!(denied.contains("authorization not completed"));
+        assert!(denied.contains("return to terminal"));
+        assert!(denied.contains("return to your terminal to try again"));
 
         let waiting = callback_page(CallbackPage::Waiting);
         assert!(waiting.contains("data-state=\"waiting\""));
-        assert!(waiting.contains("Complete sign-in in the xAI window"));
-        assert!(waiting.contains("listening on localhost"));
+        assert!(waiting.contains("not the xAI sign-in window"));
+        assert!(waiting.contains("terminal still waiting"));
+        assert!(waiting.contains("This page will not update"));
+
+        for page in [&success, &denied, &waiting] {
+            assert!(page.contains("Served locally by GrokForge at 127.0.0.1"));
+            assert!(page.contains("This page loads no remote assets"));
+        }
 
         for page in [success, denied, waiting] {
             assert!(
@@ -648,5 +854,7 @@ mod tests {
         assert!(!body.contains("src=\"http"));
         assert!(!body.contains("href=\"http"));
         assert!(body.contains("href=\"data:image/svg+xml"));
+        assert!(body.contains(".visual { min-height: 18.5rem;"));
+        assert!(body.contains(".visual { min-height: 18rem;"));
     }
 }

@@ -6,11 +6,71 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- Replaced OS-keychain credential storage with one password-encrypted file at
+  `~/.grokforge/credentials.enc`. On first interactive use, GrokForge asks the user to set and
+  confirm a password, then choose subscription OAuth or an xAI API key; later runs unlock the file
+  with that password. The key is derived with Argon2id and a fresh random salt, and the credential
+  payload is encrypted and authenticated with ChaCha20-Poly1305 and a fresh nonce (`0600`
+  permissions on Unix). Wrong passwords or altered ciphertext are rejected. Expired OAuth tokens
+  are refreshed and re-sealed with the same password, while `XAI_API_KEY` continues to override
+  stored credentials without prompting so non-interactive CI remains practical. This removes all
+  credential-flow use of platform secret stores, specifically to eliminate recurring macOS
+  Keychain-access prompts and make storage and unlock behavior explicit and consistent; the
+  corresponding tradeoff is that a forgotten password requires deleting the file and signing in
+  again.
+- Subagents now fan out in parallel and the per-turn cap was raised from 8 to 32. When the model
+  requests several `spawn_task` calls in one response, they run concurrently — each in its own git
+  worktree with a fresh sibling agent (depth cap 1). Admission (the approval gate and worktree
+  creation) stays serialized so approvals remain ordered and concurrent `git worktree add` calls
+  cannot race the repository ref locks; the subagent turns then execute at the same time and their
+  results are recorded back into the parent transcript in the original call order. The interactive
+  TUI gains a live "PARALLEL AGENTS" panel — one animated row per lane showing its status, current
+  activity, and token use. Subagent events are tagged per lane so up to 32 concurrent streams no
+  longer interleave into one transcript, while their token and privacy accounting still folds into
+  the global totals.
+
+### Fixed
+- Codebase audit hardening. OAuth token exchange and refresh now use a timeout-bounded HTTP client
+  that refuses redirects and environment proxies, bounds response bodies, validates token and
+  expiry fields, and propagates body-read failures instead of masking them as an empty body; the
+  loopback callback reader enforces an absolute deadline and an exact request-head size cap.
+  Tool-call arguments—including provider-native function-call history—are redacted before they
+  re-enter the model request body, with the redactions accounted in the context ledger so byte
+  reconciliation stays exact. Git filter neutralization also disables a repository-configured
+  `smudge` driver's `required` flag for defense in depth. The bearer- and basic-auth redaction
+  patterns gained word-boundary anchors. On Unix the credentials directory is created owner-only
+  (`0700`), passwords are held in memory that is zeroized on drop, and the derived key and decrypted
+  credential bytes are scrubbed on every exit path. The TUI launch error path is terminal-sanitized.
+- Hardened the encrypted credential file so Unix writes are created owner-only and atomically
+  replace the previous file instead of writing first and applying `0600` permissions afterward.
+  Unsupported, malformed, oversized, or billing-ambiguous envelopes are rejected; Unix also
+  rejects linked paths and files readable by group or other users. Argon2id parameters are pinned
+  for the v1 format, new passwords require at least 12 characters, and failure to discover the home
+  directory no longer falls back to writing in the current project. The native macOS/Linux sandbox
+  masks the file from model-run commands even in full-access mode. This closes the permission
+  window and blocks model-command reads of the encrypted secret.
+- Made API-key and subscription logins mutually exclusive. Choosing one now clears the other, so a
+  successful subscription sign-in cannot accidentally continue using and billing a previously
+  stored API key. Refresh persistence failures are also surfaced instead of silently discarded.
+- Refined the local OAuth callback page with accurate pre-save wording, compact responsive sizing,
+  distinct success/denial/waiting guidance, accessible non-wrapping keyboard hints, and factual
+  local-only privacy copy. The page now sends users back to the terminal for the authoritative save
+  result instead of claiming setup is complete before encrypted persistence finishes.
+- Fixed the launch identity screen disappearing whenever a dirty workspace disabled auto-commit.
+  Startup safety notices now remain visible without being mistaken for conversation history, so the
+  bundled ASCII mark still renders until the first real prompt. The parallel-agent panel also fits
+  narrow terminals and measures wide Unicode labels by terminal-cell width instead of character
+  count.
+- Queued simultaneous subagent approvals in arrival order. A later request can no longer replace
+  an unresolved approval and silently deny it; quitting aborts both the visible request and every
+  queued request so no agent remains blocked on a hidden prompt.
+
 ### Added
 - A complete GrokForge visual refresh: an adaptive branded TUI with a calm high-contrast palette,
   compact welcome state, human-readable tool and Git activity, live reasoning/retry/usage/privacy
-  status, discoverable capabilities, and a responsive approval sheet that keeps the safe denial
-  action visible on narrow terminals.
+  status, semantic Markdown rendering, discoverable capabilities, and a responsive approval sheet
+  that keeps the safe denial action visible on narrow terminals.
 - A self-contained branded OAuth callback experience for success, cancellation, and waiting states.
   Callback state is validated before accepting a code, success is shown only after token exchange,
   and all terminal-facing authentication errors are sanitized to one line.

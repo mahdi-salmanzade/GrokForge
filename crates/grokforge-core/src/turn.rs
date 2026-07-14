@@ -26,7 +26,10 @@ use crate::skills;
 use crate::store::RolloutWriter;
 use crate::tools::{MAX_TOOLS, ToolInvocation, ToolOutput, ToolRegistry, TurnContext};
 
-const MAX_SUBAGENTS_PER_TURN: usize = 8;
+/// Upper bound on subagents a single turn may spawn. `spawn_task` calls that the model emits in
+/// one response run concurrently (each in its own git worktree); this caps the fan-out so a turn
+/// cannot launch an unbounded number of parallel API loops and worktrees.
+const MAX_SUBAGENTS_PER_TURN: usize = 32;
 /// Bound both retained transcript text and the amount of delta state a frontend may queue for a
 /// single response. This stays comfortably below the rollout line limit after JSON escaping.
 const MAX_RESPONSE_TEXT_BYTES: usize = 8 * 1024 * 1024;
@@ -135,6 +138,74 @@ impl<T> Drop for AbortOnDrop<T> {
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
+    }
+}
+
+/// A subagent prepared by [`Agent::setup_subagent`] and ready to run concurrently with its
+/// siblings. It owns everything the run needs so the parent's `&Session` is not borrowed during
+/// the parallel phase.
+struct SubagentJob {
+    /// The spawning tool call's id, used as the stable lane id in per-agent events.
+    call_id: ToolCallId,
+    /// Short preview of the subtask prompt, shown as the lane label.
+    label: String,
+    prompt: String,
+    git: grokforge_git::Git,
+    worktree: std::path::PathBuf,
+    branch: String,
+    base: String,
+    sub_agent: Agent,
+    sub_session: Session,
+    sub_rollout: Option<RolloutWriter>,
+    sub_rx: tokio::sync::mpsc::UnboundedReceiver<EventMsg>,
+}
+
+/// Outcome of admitting a single `spawn_task` call before the parallel run.
+enum SpawnAdmit {
+    /// Approved and announced; carries the parsed arguments for setup.
+    Approved(serde_json::Value),
+    /// Rejected with a failure output already recorded in the transcript.
+    Rejected,
+    /// The user aborted the turn during approval.
+    Abort,
+    /// A durable write failed; the turn must end with an error.
+    Error,
+}
+
+/// Remove a subagent's worktree, ignoring errors (best-effort cleanup on a setup failure path).
+async fn remove_worktree(git: grokforge_git::Git, worktree: std::path::PathBuf) {
+    let _ = tokio::task::spawn_blocking(move || git.worktree_remove(&worktree)).await;
+}
+
+/// A compact one-line label for a subagent lane, derived from its prompt.
+fn subagent_label(prompt: &str) -> String {
+    const MAX_LABEL_CHARS: usize = 56;
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > MAX_LABEL_CHARS {
+        let truncated: String = collapsed.chars().take(MAX_LABEL_CHARS - 1).collect();
+        format!("{truncated}…")
+    } else {
+        collapsed
+    }
+}
+
+/// A short status line for a finished subagent lane, derived from its tool output.
+fn summarize_subagent(branch: &str, output: &ToolOutput) -> String {
+    const MAX_CHARS: usize = 100;
+    let first = output
+        .content()
+        .lines()
+        .find(|line| !line.trim().is_empty());
+    let base = match first {
+        Some(line) => line.trim().to_string(),
+        None if output.is_error() => "subagent failed".to_string(),
+        None => format!("finished on {branch}"),
+    };
+    if base.chars().count() > MAX_CHARS {
+        let truncated: String = base.chars().take(MAX_CHARS - 1).collect();
+        format!("{truncated}…")
+    } else {
+        base
     }
 }
 
@@ -657,26 +728,55 @@ impl Agent {
                 grokforge_xai::StopReason::EndTurn | grokforge_xai::StopReason::ToolCalls => {}
             }
 
-            for (_, call_id, name, arguments) in response.tool_calls {
-                auto_commit_has_exclusive_ownership &= tool_preserves_auto_commit_ownership(&name);
+            let calls = response.tool_calls;
+            let mut cursor = 0;
+            while cursor < calls.len() {
+                // Subagent spawns that the model requested together run concurrently: gather the
+                // maximal run of `spawn_task` calls and dispatch them as one parallel batch. Every
+                // other tool runs sequentially in place (mutating tools must serialize).
+                if calls[cursor].2 == crate::tools::builtins::SPAWN_TASK {
+                    let start = cursor;
+                    while cursor < calls.len()
+                        && calls[cursor].2 == crate::tools::builtins::SPAWN_TASK
+                    {
+                        cursor += 1;
+                    }
+                    match self
+                        .run_spawn_batch(
+                            session,
+                            rollout,
+                            &ctx,
+                            &calls[start..cursor],
+                            &raw_call_ids,
+                            offered_tools.contains(crate::tools::builtins::SPAWN_TASK),
+                            &mut spawned,
+                            &mut auto_commit_has_exclusive_ownership,
+                            cancellation,
+                        )
+                        .await
+                    {
+                        ToolCallFlow::Continue => {}
+                        ToolCallFlow::Abort => break 'agent StopReason::Interrupted,
+                        ToolCallFlow::Error => break 'agent StopReason::Error,
+                    }
+                    continue;
+                }
+
+                let (_, call_id, name, arguments) = &calls[cursor];
+                cursor += 1;
+                auto_commit_has_exclusive_ownership &= tool_preserves_auto_commit_ownership(name);
                 let record_call = !raw_call_ids.contains(call_id.as_str());
-                let spawn_allowed = if name == crate::tools::builtins::SPAWN_TASK {
-                    spawned += 1;
-                    spawned <= MAX_SUBAGENTS_PER_TURN
-                } else {
-                    true
-                };
                 match self
                     .run_tool_call(
                         session,
                         rollout,
                         &ctx,
-                        call_id,
-                        &name,
-                        &arguments,
+                        call_id.clone(),
+                        name,
+                        arguments,
                         record_call,
-                        offered_tools.contains(&name),
-                        spawn_allowed,
+                        offered_tools.contains(name),
+                        true,
                         cancellation,
                     )
                     .await
@@ -1168,140 +1268,407 @@ impl Agent {
         }
     }
 
-    /// Run a subagent in an isolated git worktree with a fresh sibling agent (depth cap 1). The
-    /// subagent's commits land on a `gf/agent/<id>` branch for the parent/user to review or merge;
-    /// we do not auto-merge (conflict resolution is a later enhancement).
+    /// Admit and then concurrently run a batch of `spawn_task` calls that the model requested in
+    /// one response. Admission (recording the raw call, cap/offer checks, and the approval gate)
+    /// runs sequentially so approvals stay ordered and the parent session is mutated one call at a
+    /// time. Worktree setup also runs sequentially so concurrent `git worktree add` invocations
+    /// cannot race on the repository's ref locks. The subagent turns then run in parallel — each in
+    /// its own worktree with a fresh sibling agent (depth cap 1) — and their outputs are recorded
+    /// back into the parent transcript in the original call order. Commits land on `gf/agent/<id>`
+    /// branches for the parent/user to review or merge; we do not auto-merge.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_spawn_batch(
+        &self,
+        session: &mut Session,
+        rollout: &mut Option<RolloutWriter>,
+        ctx: &TurnContext,
+        batch: &[(usize, ToolCallId, String, String)],
+        raw_call_ids: &BTreeSet<String>,
+        offered: bool,
+        spawned: &mut usize,
+        auto_commit_has_exclusive_ownership: &mut bool,
+        cancellation: &TurnCancellation,
+    ) -> ToolCallFlow {
+        // Phase 1 — admission (sequential). Rejections record their failure here; approved calls
+        // carry their parsed arguments forward. Setup is deferred to phase 2 so that a user abort
+        // mid-approval cannot leave already-created worktrees behind.
+        let mut approved: Vec<(ToolCallId, serde_json::Value)> = Vec::new();
+        for (_, call_id, _name, arguments) in batch {
+            *auto_commit_has_exclusive_ownership &=
+                tool_preserves_auto_commit_ownership(crate::tools::builtins::SPAWN_TASK);
+            let record_call = !raw_call_ids.contains(call_id.as_str());
+            *spawned += 1;
+            let spawn_allowed = *spawned <= MAX_SUBAGENTS_PER_TURN;
+            match self
+                .admit_spawn_task(
+                    session,
+                    rollout,
+                    ctx,
+                    call_id,
+                    arguments,
+                    record_call,
+                    offered,
+                    spawn_allowed,
+                    cancellation,
+                )
+                .await
+            {
+                SpawnAdmit::Approved(args) => approved.push((call_id.clone(), args)),
+                SpawnAdmit::Rejected => {}
+                SpawnAdmit::Abort => return ToolCallFlow::Abort,
+                SpawnAdmit::Error => return ToolCallFlow::Error,
+            }
+        }
+        if approved.is_empty() {
+            return ToolCallFlow::Continue;
+        }
+
+        // Phase 2 — worktree setup (sequential; serializes the git ref-lock mutations).
+        let mut jobs: Vec<SubagentJob> = Vec::new();
+        for (call_id, args) in &approved {
+            match self.setup_subagent(session, args, call_id.clone()).await {
+                Ok(job) => jobs.push(job),
+                Err(output) => {
+                    if self
+                        .finish_tool_call(session, rollout, call_id.clone(), output)
+                        .await
+                        .is_err()
+                    {
+                        return ToolCallFlow::Error;
+                    }
+                }
+            }
+        }
+        if jobs.is_empty() {
+            return ToolCallFlow::Continue;
+        }
+
+        // Phase 3 — run every admitted subagent concurrently. Each internally spawns its own API
+        // loop task, so these run in true parallel; `join_all` drives their per-lane event drains.
+        let call_ids: Vec<ToolCallId> = jobs.iter().map(|job| job.call_id.clone()).collect();
+        let total = jobs.len();
+        let outputs = futures::future::join_all(
+            jobs.into_iter()
+                .enumerate()
+                .map(|(index, job)| self.run_subagent_job(job, index, total, cancellation)),
+        )
+        .await;
+
+        // Phase 4 — record the outputs back into the parent transcript in original call order.
+        for (call_id, output) in call_ids.into_iter().zip(outputs) {
+            if self
+                .finish_tool_call(session, rollout, call_id, output)
+                .await
+                .is_err()
+            {
+                return ToolCallFlow::Error;
+            }
+        }
+        ToolCallFlow::Continue
+    }
+
+    /// Record the raw `spawn_task` call, run the cap/offer/depth checks and the approval gate, and
+    /// (on approval) announce the tool call. Failures are recorded immediately; the return value
+    /// tells [`Self::run_spawn_batch`] whether to continue, abort, or fail the turn.
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_spawn_task(
+        &self,
+        session: &mut Session,
+        rollout: &mut Option<RolloutWriter>,
+        ctx: &TurnContext,
+        call_id: &ToolCallId,
+        arguments: &str,
+        record_call: bool,
+        offered: bool,
+        spawn_allowed: bool,
+        cancellation: &TurnCancellation,
+    ) -> SpawnAdmit {
+        let spawn = crate::tools::builtins::SPAWN_TASK;
+        if record_call
+            && self
+                .record(
+                    session,
+                    rollout,
+                    ResponseItem::ToolCall {
+                        id: call_id.clone(),
+                        name: spawn.to_string(),
+                        arguments: arguments.to_string(),
+                    },
+                )
+                .await
+                .is_err()
+        {
+            return SpawnAdmit::Error;
+        }
+        if cancellation.is_cancelled() {
+            return match self
+                .finish_tool_call(
+                    session,
+                    rollout,
+                    call_id.clone(),
+                    ToolOutput::failure("[turn interrupted by user before tool execution]"),
+                )
+                .await
+            {
+                Ok(()) => SpawnAdmit::Abort,
+                Err(()) => SpawnAdmit::Error,
+            };
+        }
+        if !offered {
+            return self
+                .reject_spawn(
+                    session,
+                    rollout,
+                    call_id,
+                    format!("tool `{spawn}` is not available in this turn's advertised tool set"),
+                )
+                .await;
+        }
+        if !self.allow_subagents || !spawn_allowed {
+            let message = if self.allow_subagents {
+                format!("at most {MAX_SUBAGENTS_PER_TURN} subagents may be spawned in one turn")
+            } else {
+                "subagents cannot spawn further subagents".to_string()
+            };
+            return self.reject_spawn(session, rollout, call_id, message).await;
+        }
+        let args: serde_json::Value =
+            serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+        let Some(tool) = self.registry.get(spawn) else {
+            return self
+                .reject_spawn(session, rollout, call_id, format!("unknown tool `{spawn}`"))
+                .await;
+        };
+        let need = tool.approval(&args, ctx);
+        if let Gate::Ask(kind) = gate(
+            session.config.approval_policy,
+            session.config.sandbox_mode,
+            &need,
+        ) {
+            let decision = self
+                .request_approval(call_id, kind, spawn, format!("run `{spawn}`"), cancellation)
+                .await;
+            if decision == Decision::Abort {
+                return match self
+                    .finish_tool_call(
+                        session,
+                        rollout,
+                        call_id.clone(),
+                        ToolOutput::failure("[turn aborted by user]"),
+                    )
+                    .await
+                {
+                    Ok(()) => SpawnAdmit::Abort,
+                    Err(()) => SpawnAdmit::Error,
+                };
+            }
+            if !decision.is_approved() {
+                let feedback = match decision {
+                    Decision::DenyWithFeedback(f) => f,
+                    _ => "denied".to_string(),
+                };
+                return self
+                    .reject_spawn(session, rollout, call_id, format!("[not run: {feedback}]"))
+                    .await;
+            }
+        }
+        self.emit(EventMsg::ToolCallBegin {
+            call_id: call_id.clone(),
+            name: spawn.to_string(),
+            args_preview: preview(arguments),
+            sandboxed: false,
+        });
+        SpawnAdmit::Approved(args)
+    }
+
+    async fn reject_spawn(
+        &self,
+        session: &mut Session,
+        rollout: &mut Option<RolloutWriter>,
+        call_id: &ToolCallId,
+        message: String,
+    ) -> SpawnAdmit {
+        match self
+            .finish_tool_call(
+                session,
+                rollout,
+                call_id.clone(),
+                ToolOutput::failure(message),
+            )
+            .await
+        {
+            Ok(()) => SpawnAdmit::Rejected,
+            Err(()) => SpawnAdmit::Error,
+        }
+    }
+
+    /// Create the isolated worktree, session, rollout, and metadata for one approved subagent and
+    /// return a [`SubagentJob`] ready to run. On any failure the partially created worktree is
+    /// removed and a failure output is returned for the caller to record.
+    #[allow(clippy::too_many_lines)]
+    async fn setup_subagent(
+        &self,
+        session: &Session,
+        args: &serde_json::Value,
+        call_id: ToolCallId,
+    ) -> Result<SubagentJob, ToolOutput> {
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if prompt.is_empty() {
+            return Err(ToolOutput::failure(
+                "spawn_task requires a non-empty `prompt`",
+            ));
+        }
+        let workspace = session.config.workspace_root.clone();
+        let Some(git) = grokforge_git::Git::discover(&workspace) else {
+            return Err(ToolOutput::failure("subagents require a git repository"));
+        };
+        let base = git.head_sha().unwrap_or_else(|_| "HEAD".to_string());
+        let id = ToolCallId::new().to_string();
+        let worktrees = match crate::store::prepare_worktrees_dir().await {
+            Ok(worktrees) => worktrees,
+            Err(error) => {
+                tracing::warn!(%error, "secure subagent worktree storage is unavailable");
+                return Err(ToolOutput::failure(
+                    "secure private subagent worktree storage is unavailable",
+                ));
+            }
+        };
+        let worktree = worktrees.join(&id);
+        let branch = format!("gf/agent/{id}");
+
+        let (git_c, wt_c, br_c, base_c) =
+            (git.clone(), worktree.clone(), branch.clone(), base.clone());
+        match tokio::task::spawn_blocking(move || git_c.worktree_add(&wt_c, &br_c, &base_c)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, branch, "could not create private subagent worktree");
+                return Err(ToolOutput::failure(
+                    "could not create private subagent worktree",
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, branch, "subagent worktree task failed");
+                return Err(ToolOutput::failure("subagent worktree task failed"));
+            }
+        }
+
+        // Each subagent turn runs with its own event channel so its stream can be tagged per lane.
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sub_agent = self.for_subagent(sub_tx);
+        let mut sub_config =
+            crate::session::SessionConfig::new(worktree.clone(), session.config.model.clone())
+                .with_policy(
+                    session.config.approval_policy,
+                    // Even a yolo parent does not broaden a child into sibling worktrees.
+                    SandboxMode::WorkspaceWrite,
+                );
+        sub_config.effort = session.config.effort;
+        sub_config
+            .enabled_server_tools
+            .clone_from(&session.config.enabled_server_tools);
+        sub_config
+            .system_prompt
+            .clone_from(&session.config.system_prompt);
+        sub_config.max_iterations = session.config.max_iterations;
+        sub_config.compaction_trigger_bytes = session.config.compaction_trigger_bytes;
+        sub_config.compaction_keep_tail = session.config.compaction_keep_tail;
+        sub_config.auto_compact = session.config.auto_compact;
+        sub_config.network = session.config.network;
+        // This dedicated worktree gives the subagent exclusive path ownership, which is the
+        // precondition for race-safe auto-commit. Keep its default auto-commit enabled even
+        // when the parent disabled auto-commit.
+        sub_config.isolated_worktree = true;
+        let sub_session = crate::session::Session::new(sub_config);
+        let sessions = match crate::store::sessions_dir() {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(%error, branch, "secure subagent session storage is unavailable");
+                remove_worktree(git, worktree).await;
+                return Err(ToolOutput::failure(
+                    "secure subagent session storage is unavailable; no model call was made",
+                ));
+            }
+        };
+        let sub_writer = match RolloutWriter::create(&sessions, sub_session.id).await {
+            Ok(writer) => writer,
+            Err(error) => {
+                tracing::warn!(%error, branch, "subagent persistence is unavailable");
+                remove_worktree(git, worktree).await;
+                return Err(ToolOutput::failure(
+                    "subagent persistence unavailable; no model call was made",
+                ));
+            }
+        };
+        let meta = crate::store::SessionMeta::new(
+            sub_session.id,
+            worktree.clone(),
+            session.config.model.clone(),
+            &prompt,
+        );
+        if let Err(error) = meta.write(&sessions, sub_session.id).await {
+            tracing::warn!(%error, branch, "subagent metadata could not be persisted");
+            drop(sub_writer);
+            remove_worktree(git, worktree).await;
+            return Err(ToolOutput::failure(
+                "subagent metadata could not be persisted; no model call was made",
+            ));
+        }
+        Ok(SubagentJob {
+            call_id,
+            label: subagent_label(&prompt),
+            prompt,
+            git,
+            worktree,
+            branch,
+            base,
+            sub_agent,
+            sub_session,
+            sub_rollout: Some(sub_writer),
+            sub_rx,
+        })
+    }
+
+    /// Run one prepared subagent to completion, streaming its events tagged with its lane id and
+    /// returning the tool output to record in the parent transcript.
     ///
     /// Declared with a boxed `+ Send` return type (not `async fn`) to break the async-recursion
-    /// auto-trait cycle `run_turn -> run_tool_call -> spawn_subagent -> run_turn`.
-    #[allow(clippy::too_many_lines)]
-    fn spawn_subagent<'a>(
+    /// auto-trait cycle `run_turn -> run_spawn_batch -> run_subagent_job -> run_turn`. Without the
+    /// type-erased boundary the compiler cannot prove this future is `Send`.
+    fn run_subagent_job<'a>(
         &'a self,
-        session: &'a Session,
-        args: &'a serde_json::Value,
+        job: SubagentJob,
+        index: usize,
+        total: usize,
         cancellation: &'a TurnCancellation,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolOutput> + Send + 'a>> {
         Box::pin(async move {
-            let prompt = args
-                .get("prompt")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if prompt.is_empty() {
-                return ToolOutput::failure("spawn_task requires a non-empty `prompt`");
-            }
-            let workspace = session.config.workspace_root.clone();
-            let Some(git) = grokforge_git::Git::discover(&workspace) else {
-                return ToolOutput::failure("subagents require a git repository");
-            };
-            let base = git.head_sha().unwrap_or_else(|_| "HEAD".to_string());
-            let id = ToolCallId::new().to_string();
-            let worktrees = match crate::store::prepare_worktrees_dir().await {
-                Ok(worktrees) => worktrees,
-                Err(error) => {
-                    tracing::warn!(%error, "secure subagent worktree storage is unavailable");
-                    return ToolOutput::failure(
-                        "secure private subagent worktree storage is unavailable",
-                    );
-                }
-            };
-            let worktree = worktrees.join(&id);
-            let branch = format!("gf/agent/{id}");
+            let SubagentJob {
+                call_id,
+                label,
+                prompt,
+                git,
+                worktree,
+                branch,
+                base,
+                sub_agent,
+                mut sub_session,
+                mut sub_rollout,
+                mut sub_rx,
+            } = job;
+            let agent_id = call_id.to_string();
+            self.emit(EventMsg::SubagentStarted {
+                agent_id: agent_id.clone(),
+                label,
+                index,
+                total,
+            });
 
-            let (git_c, wt_c, br_c, base_c) =
-                (git.clone(), worktree.clone(), branch.clone(), base.clone());
-            match tokio::task::spawn_blocking(move || git_c.worktree_add(&wt_c, &br_c, &base_c))
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, branch, "could not create private subagent worktree");
-                    return ToolOutput::failure("could not create private subagent worktree");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, branch, "subagent worktree task failed");
-                    return ToolOutput::failure("subagent worktree task failed");
-                }
-            }
-
-            // Run the subagent turn in the worktree with its own event channel.
-            let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel();
-            let sub_agent = self.for_subagent(sub_tx);
-            let mut sub_config =
-                crate::session::SessionConfig::new(worktree.clone(), session.config.model.clone())
-                    .with_policy(
-                        session.config.approval_policy,
-                        // Even a yolo parent does not broaden a child into sibling worktrees.
-                        SandboxMode::WorkspaceWrite,
-                    );
-            sub_config.effort = session.config.effort;
-            sub_config
-                .enabled_server_tools
-                .clone_from(&session.config.enabled_server_tools);
-            sub_config
-                .system_prompt
-                .clone_from(&session.config.system_prompt);
-            sub_config.max_iterations = session.config.max_iterations;
-            sub_config.compaction_trigger_bytes = session.config.compaction_trigger_bytes;
-            sub_config.compaction_keep_tail = session.config.compaction_keep_tail;
-            sub_config.auto_compact = session.config.auto_compact;
-            sub_config.network = session.config.network;
-            // This dedicated worktree gives the subagent exclusive path ownership, which is the
-            // precondition for race-safe auto-commit. Keep its default auto-commit enabled even
-            // when the parent disabled auto-commit.
-            sub_config.isolated_worktree = true;
-            let mut sub_session = crate::session::Session::new(sub_config);
-            let sessions = match crate::store::sessions_dir() {
-                Ok(sessions) => sessions,
-                Err(error) => {
-                    tracing::warn!(%error, branch, "secure subagent session storage is unavailable");
-                    let (git_cleanup, worktree_cleanup) = (git.clone(), worktree.clone());
-                    let _ = tokio::task::spawn_blocking(move || {
-                        git_cleanup.worktree_remove(&worktree_cleanup)
-                    })
-                    .await;
-                    return ToolOutput::failure(
-                        "secure subagent session storage is unavailable; no model call was made",
-                    );
-                }
-            };
-            let sub_writer = match RolloutWriter::create(&sessions, sub_session.id).await {
-                Ok(writer) => writer,
-                Err(error) => {
-                    tracing::warn!(%error, branch, "subagent persistence is unavailable");
-                    let (git_cleanup, worktree_cleanup) = (git.clone(), worktree.clone());
-                    let _ = tokio::task::spawn_blocking(move || {
-                        git_cleanup.worktree_remove(&worktree_cleanup)
-                    })
-                    .await;
-                    return ToolOutput::failure(
-                        "subagent persistence unavailable; no model call was made",
-                    );
-                }
-            };
-            let meta = crate::store::SessionMeta::new(
-                sub_session.id,
-                worktree.clone(),
-                session.config.model.clone(),
-                &prompt,
-            );
-            if let Err(error) = meta.write(&sessions, sub_session.id).await {
-                tracing::warn!(%error, branch, "subagent metadata could not be persisted");
-                drop(sub_writer);
-                let (git_cleanup, worktree_cleanup) = (git.clone(), worktree.clone());
-                let _ = tokio::task::spawn_blocking(move || {
-                    git_cleanup.worktree_remove(&worktree_cleanup)
-                })
-                .await;
-                return ToolOutput::failure(
-                    "subagent metadata could not be persisted; no model call was made",
-                );
-            }
-            let mut sub_rollout = Some(sub_writer);
             let sub_cancellation = cancellation.clone();
-            // Box with an explicit `+ Send` trait object to break the async-recursion type cycle
-            // (run_turn -> spawn_subagent -> run_turn).
             let sub_fut: std::pin::Pin<Box<dyn std::future::Future<Output = StopReason> + Send>> =
                 Box::pin(async move {
                     sub_agent
@@ -1319,86 +1686,98 @@ impl Agent {
                 if let EventMsg::AgentMessageDone { text } = &ev {
                     final_text.clone_from(text);
                 }
-                // Subagent API bytes and usage are still part of this user-visible operation.
-                self.emit(ev);
+                // Tag every subagent event with its lane so the frontend renders per-agent
+                // progress rather than interleaving 32 streams into one transcript.
+                // Accounting-relevant inner events (token usage, ledger) are still folded into
+                // global totals by frontends.
+                self.emit(EventMsg::SubagentUpdate {
+                    agent_id: agent_id.clone(),
+                    inner: Box::new(ev),
+                });
             }
-            let sub_stop = match handle.join().await {
-                Ok(stop) => stop,
-                Err(e) => {
-                    tracing::warn!(error = %e, branch, "subagent task failed");
-                    return ToolOutput::failure(format!(
-                        "subagent task failed; private recovery worktree for branch `{branch}` was preserved"
-                    ));
-                }
-            };
-
-            // Never force-remove uncommitted edits. A failed auto-commit (for example missing git
-            // identity) must leave recoverable work in place for the user.
-            let (git_d, wt_d, base_d) = (git.clone(), worktree.clone(), base.clone());
-            let inspection = tokio::task::spawn_blocking(move || {
-                let worktree_git = grokforge_git::Git::discover(&wt_d)
-                    .ok_or_else(|| "could not inspect subagent worktree".to_string())?;
-                let dirty = worktree_git.is_dirty().map_err(|e| e.to_string())?;
-                let diff = worktree_git
-                    .diff_stat(&format!("{base_d}..HEAD"))
-                    .map_err(|e| e.to_string())?;
-                if !dirty {
-                    git_d.worktree_remove(&wt_d).map_err(|e| e.to_string())?;
-                }
-                Ok::<_, String>((diff, dirty))
-            })
-            .await;
-            let (diff, dirty) = match inspection {
-                Ok(Ok(result)) => result,
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, branch, "subagent inspection failed");
-                    return ToolOutput::failure(format!(
-                        "subagent inspection failed; private recovery worktree for branch `{branch}` was preserved"
-                    ));
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, branch, "subagent inspection task failed");
-                    return ToolOutput::failure(format!(
-                        "subagent inspection task failed; private recovery worktree for branch `{branch}` was preserved"
-                    ));
-                }
-            };
-
-            if dirty {
-                return ToolOutput::failure(format!(
-                    "subagent left uncommitted changes; its private recovery worktree was preserved on branch `{branch}` (locate it with `git worktree list`)"
-                ));
-            }
-            if sub_stop != StopReason::EndTurn {
-                return ToolOutput::failure(format!(
-                    "subagent stopped with {sub_stop:?}; committed changes remain on branch `{branch}`"
-                ));
-            }
-
-            let changes = if diff.trim().is_empty() {
-                "(no changes)".to_string()
-            } else {
-                diff.trim().to_string()
-            };
-            ToolOutput::success(format!(
-                "Subagent finished on branch `{branch}` (review or merge it manually).\n\nResult:\n{final_text}\n\nChanges:\n{changes}"
-            ))
+            let output = self
+                .finalize_subagent(git, worktree, &branch, &base, handle, &final_text)
+                .await;
+            self.emit(EventMsg::SubagentFinished {
+                agent_id,
+                ok: !output.is_error(),
+                summary: summarize_subagent(&branch, &output),
+            });
+            output
         })
     }
 
-    async fn handle_spawn_task(
+    /// Join the subagent task, inspect its worktree, and build the tool output. Never force-removes
+    /// uncommitted edits: a failed auto-commit (for example a missing git identity) leaves
+    /// recoverable work in place on the agent branch.
+    async fn finalize_subagent(
         &self,
-        session: &mut Session,
-        rollout: &mut Option<RolloutWriter>,
-        call_id: ToolCallId,
-        arguments: &str,
-        cancellation: &TurnCancellation,
-    ) -> Result<(), ()> {
-        let args: serde_json::Value =
-            serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
-        let output = self.spawn_subagent(session, &args, cancellation).await;
-        self.finish_tool_call(session, rollout, call_id, output)
-            .await
+        git: grokforge_git::Git,
+        worktree: std::path::PathBuf,
+        branch: &str,
+        base: &str,
+        handle: AbortOnDrop<StopReason>,
+        final_text: &str,
+    ) -> ToolOutput {
+        let sub_stop = match handle.join().await {
+            Ok(stop) => stop,
+            Err(e) => {
+                tracing::warn!(error = %e, branch, "subagent task failed");
+                return ToolOutput::failure(format!(
+                    "subagent task failed; private recovery worktree for branch `{branch}` was preserved"
+                ));
+            }
+        };
+
+        let base_d = base.to_string();
+        let inspection = tokio::task::spawn_blocking(move || {
+            let worktree_git = grokforge_git::Git::discover(&worktree)
+                .ok_or_else(|| "could not inspect subagent worktree".to_string())?;
+            let dirty = worktree_git.is_dirty().map_err(|e| e.to_string())?;
+            let diff = worktree_git
+                .diff_stat(&format!("{base_d}..HEAD"))
+                .map_err(|e| e.to_string())?;
+            if !dirty {
+                git.worktree_remove(&worktree).map_err(|e| e.to_string())?;
+            }
+            Ok::<_, String>((diff, dirty))
+        })
+        .await;
+        let (diff, dirty) = match inspection {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, branch, "subagent inspection failed");
+                return ToolOutput::failure(format!(
+                    "subagent inspection failed; private recovery worktree for branch `{branch}` was preserved"
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, branch, "subagent inspection task failed");
+                return ToolOutput::failure(format!(
+                    "subagent inspection task failed; private recovery worktree for branch `{branch}` was preserved"
+                ));
+            }
+        };
+
+        if dirty {
+            return ToolOutput::failure(format!(
+                "subagent left uncommitted changes; its private recovery worktree was preserved on branch `{branch}` (locate it with `git worktree list`)"
+            ));
+        }
+        if sub_stop != StopReason::EndTurn {
+            return ToolOutput::failure(format!(
+                "subagent stopped with {sub_stop:?}; committed changes remain on branch `{branch}`"
+            ));
+        }
+
+        let changes = if diff.trim().is_empty() {
+            "(no changes)".to_string()
+        } else {
+            diff.trim().to_string()
+        };
+        ToolOutput::success(format!(
+            "Subagent finished on branch `{branch}` (review or merge it manually).\n\nResult:\n{final_text}\n\nChanges:\n{changes}"
+        ))
     }
 
     async fn request_approval(
@@ -1645,24 +2024,8 @@ impl Agent {
             elevated = exceeds;
         }
 
-        // The subagent tool is runtime-owned because it needs the Agent itself. It still passes
-        // through the approval gate above (git worktree/branch mutation + an additional API loop).
-        if name == crate::tools::builtins::SPAWN_TASK {
-            self.emit(EventMsg::ToolCallBegin {
-                call_id: call_id.clone(),
-                name: name.to_string(),
-                args_preview: preview(arguments),
-                sandboxed: false,
-            });
-            if self
-                .handle_spawn_task(session, rollout, call_id, arguments, cancellation)
-                .await
-                .is_err()
-            {
-                return ToolCallFlow::Error;
-            }
-            return ToolCallFlow::Continue;
-        }
+        // `spawn_task` is dispatched separately (see `run_spawn_batch`) so a whole batch of
+        // subagents runs concurrently; it does not reach this per-tool invocation path.
 
         if elevated
             && !approved_write_targets.is_empty()

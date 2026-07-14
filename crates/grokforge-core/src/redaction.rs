@@ -65,12 +65,12 @@ fn compile_rules() -> Result<Vec<Rule>, regex::Error> {
         },
         Rule {
             name: "basic-auth",
-            re: Regex::new(r"(?i)basic\s+([A-Za-z0-9+/]{8,}={0,2})")?,
+            re: Regex::new(r"(?i)\bbasic\s+([A-Za-z0-9+/]{8,}={0,2})")?,
             group: 1,
         },
         Rule {
             name: "bearer-token",
-            re: Regex::new(r"(?i)bearer\s+([A-Za-z0-9._\-]{20,})")?,
+            re: Regex::new(r"(?i)\bbearer\s+([A-Za-z0-9._\-]{20,})")?,
             group: 1,
         },
         // KEY=secret / api_key: "secret" style assignments with a long value.

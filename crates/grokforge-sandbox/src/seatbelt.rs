@@ -17,8 +17,8 @@ use grokforge_protocol::{NetworkMode, SandboxMode, SandboxPolicy};
 use crate::classifier::classify;
 use crate::exec::{CommandSpec, ExecError, ExecOutput, run_capture};
 use crate::privacy::{
-    PrivacyPath, prepare_privacy_candidates, privacy_path_candidates,
-    validate_session_storage_aliases,
+    PrivacyPath, grokforge_credential_path_candidates, prepare_privacy_candidates,
+    privacy_path_candidates, validate_session_storage_aliases,
 };
 use crate::protected::validate_existing_protected_trees;
 use crate::unreadable::discover_unreadable_paths;
@@ -394,12 +394,13 @@ impl SeatbeltRunner {
         let private_paths = tokio::task::spawn_blocking(move || {
             validate_existing_protected_trees(&protected_paths)?;
             validate_confined_trees(&policy_for_scan, &cwd)?;
-            let mut candidates = discover_unreadable_paths(&policy_for_scan, &cwd)?;
-            if include_privacy {
-                validate_session_storage_aliases(&cwd)?;
-                candidates.extend(privacy_path_candidates(&cwd));
-            }
-            prepare_privacy_candidates(candidates, &cwd, &workspace_roots)
+            prepare_command_private_paths(
+                &policy_for_scan,
+                &cwd,
+                &workspace_roots,
+                include_privacy,
+                grokforge_credential_path_candidates(),
+            )
         })
         .await
         .map_err(|error| {
@@ -432,6 +433,24 @@ impl SeatbeltRunner {
         out.denial = classify(policy, &out);
         Ok(out)
     }
+}
+
+fn prepare_command_private_paths(
+    policy: &SandboxPolicy,
+    cwd: &Path,
+    workspace_roots: &[PathBuf],
+    include_ambient_privacy: bool,
+    credential_paths: Vec<PathBuf>,
+) -> Result<Vec<PrivacyPath>, ExecError> {
+    let mut candidates = discover_unreadable_paths(policy, cwd)?;
+    // This is GrokForge's own secret store, so keep it private even in danger mode. Danger mode
+    // only opts out of the broader ambient-host credential catalogue below.
+    candidates.extend(credential_paths);
+    if include_ambient_privacy {
+        validate_session_storage_aliases(cwd)?;
+        candidates.extend(privacy_path_candidates(cwd));
+    }
+    prepare_privacy_candidates(candidates, cwd, workspace_roots)
 }
 
 #[async_trait]
@@ -485,6 +504,33 @@ mod tests {
             timeout: Duration::from_secs(10),
             cancellation: None,
         }
+    }
+
+    #[test]
+    fn danger_profile_always_denies_grokforge_credentials() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let private = tempfile::tempdir().expect("private");
+        let credentials = private.path().join("credentials.enc");
+        std::fs::write(&credentials, "encrypted credentials").expect("credentials fixture");
+        let policy = SandboxPolicy::danger_full_access(workspace.path());
+        let private_paths = prepare_command_private_paths(
+            &policy,
+            workspace.path(),
+            &policy.writable_roots,
+            false,
+            vec![credentials.clone()],
+        )
+        .expect("prepare private credentials");
+        let command = spec("/bin/true", &[], workspace.path().to_path_buf());
+        let wrapped = SeatbeltRunner::wrap(&policy, &command, None, &private_paths)
+            .expect("wrap Seatbelt command");
+        let credentials = canonical(&credentials);
+        assert!(wrapped.args.iter().any(|arg| {
+            arg.strip_prefix("SECRET")
+                .and_then(|value| value.split_once('='))
+                .is_some_and(|(_, path)| path == credentials)
+        }));
+        assert!(wrapped.args[1].contains("(deny file-read* (subpath (param \"SECRET0\")))"));
     }
 
     #[tokio::test]

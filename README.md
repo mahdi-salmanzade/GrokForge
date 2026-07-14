@@ -6,9 +6,50 @@
 
 GrokForge exists because using Grok from a terminal should feel like a serious development tool, not a chat window wired to `sh`.
 
-Today it can read and edit project files, inspect Git state, run commands, keep a session going, use project-defined workflows, and hand isolated work to a subagent. When an action needs to cross a safety boundary, GrokForge stops and asks.
+Today it can read and edit project files, inspect Git state, run commands, keep a session going, use project-defined workflows, and hand isolated work to subagents that run in parallel. When an action needs to cross a safety boundary, GrokForge stops and asks.
 
 This is a pre-release project. The execution and safety paths are in place, and the adaptive TUI now exposes tool activity, approvals, reasoning, retries, token use, and privacy accounting. Automatic context selection, richer rendering, and distribution still need work.
+
+## Why I built GrokForge
+
+> I believe I should know exactly what code is running on my own machine. Anything less is
+> complete BS.
+>
+> — [XBToshi](https://x.com/XBToshi/status/2076521420017045618?s=20)
+
+I built GrokForge because, for my work, I believe Grok 4.5 is the best model available right
+now—and I love using it. [xAI built Grok 4.5](https://x.ai/news/grok-4-5) specifically for coding,
+agentic tasks, and knowledge work. I wanted to give that model family a serious terminal
+environment without turning my own machine or repository into a black box. The code that reads
+files, runs commands, handles credentials, changes Git state, and sends context to a model should
+be code I can inspect.
+
+### Why GrokForge is different
+
+GrokForge is better when control matters:
+
+- **Audit the whole thing.** GrokForge is an MIT-licensed Rust workspace you can inspect,
+  compile, modify, and run yourself. It has no telemetry.
+- **Account for model requests.** Every first-party model request body goes through the context
+  ledger, which attributes source bytes, records redactions, and reconciles them to the serialized
+  request.
+- **See what the agent is doing.** Tool activity, reasoning, approvals, retries, token use,
+  subagents, request-byte totals, and redaction totals stay visible in the TUI.
+- **Fail closed by default.** Normally sandboxed commands use Seatbelt on macOS or validated
+  Bubblewrap on Linux, with workspace-confined writes, protected Git metadata, isolated networking,
+  and a scrubbed environment. If the requested confinement cannot be enforced, the command does not
+  run.
+- **Choose every extra capability.** Hosted web search, X search, and code interpreter stay off
+  until enabled. Project MCP servers do not start without explicit trust.
+- **Own your credentials.** API keys and OAuth tokens live in one documented, password-encrypted
+  local file—not an opaque OS secret store. On native macOS and Linux, model-run commands cannot
+  read it even in full-access mode.
+- **Parallelize without sharing a workspace.** Up to 32 subagents can work concurrently in
+  separate private Git worktrees with scoped, reviewable changes; GrokForge never silently merges
+  them.
+- **Keep workflows with the repository.** Skills and reusable slash commands live beside the code,
+  and typing `/` opens the local Forge Deck without sending command templates to the model just for
+  browsing them.
 
 ## What works today
 
@@ -21,19 +62,9 @@ This is a pre-release project. The execution and safety paths are in place, and 
 - Approval-gated MCP tools from reviewed project configuration via `--trust-project-mcp`
 - Read-only plan mode
 - Persistent sessions with resume support
-- Isolated subagent worktrees with scoped commits
+- Parallel subagents (up to 32 per turn) in isolated worktrees with scoped commits, shown live in a "PARALLEL AGENTS" panel
 - A context ledger that accounts for the request body sent to Grok
 - Secret redaction, bounded output, and no telemetry
-
-## Why another Grok CLI?
-
-Because Grok deserves a CLI built for real repositories, not a thin wrapper around an API call.
-
-Three constraints shape the implementation:
-
-- Normal shell commands cannot write outside the workspace or use the network.
-- Sandboxed commands cannot modify Git metadata.
-- If the requested sandbox cannot be enforced, the command does not run.
 
 ## Build it
 
@@ -47,18 +78,45 @@ cargo build --release
 
 ## Signing in
 
-Just run it — GrokForge sets up credentials on first launch:
+Just run it — GrokForge sets up credentials on the first interactive launch when
+`XAI_API_KEY` is not already set:
 
 ```sh
 ./target/release/grokforge
 ```
 
-On first launch it asks you to **set a password**, then how you want to connect:
+On that first launch:
 
-- **[1] Your Grok subscription** (SuperGrok / X Premium+) — signs in through your browser (OAuth); usage bills against your subscription, no API key needed. *xAI currently limits subscription API access to the SuperGrok **Heavy** tier; other tiers may get a 403 until xAI lifts that.*
-- **[2] An xAI API key** — paste a key from [console.x.ai](https://console.x.ai) (pay-as-you-go; new developer accounts also get free monthly credits via the data-sharing program).
+1. Set and confirm a GrokForge password of at least 12 characters.
+2. Choose how you want to connect:
+   - **[1] Your Grok subscription** (SuperGrok / X Premium+) — signs in through your browser
+     (OAuth); usage bills against your subscription, no API key needed. *xAI currently limits
+     subscription API access to the SuperGrok **Heavy** tier; other tiers may get a 403 until xAI
+     lifts that.*
+   - **[2] An xAI API key** — paste a key from
+     [console.x.ai](https://console.x.ai) (pay-as-you-go; new developer accounts also get free
+     monthly credits via the data-sharing program).
 
-Your credentials are then encrypted with your password (Argon2id + ChaCha20-Poly1305) and written to `~/.grokforge/credentials.enc` — **nothing is stored in the OS keychain or any system secret store**. On later runs you enter the password to unlock. You can also set things up ahead of time:
+GrokForge stores the active API key or OAuth tokens in `~/.grokforge/credentials.enc`. A fresh
+random salt is combined with your password through Argon2id to derive the encryption key; a fresh
+random nonce and ChaCha20-Poly1305 then encrypt and authenticate the credential payload. On Unix,
+the file is restricted to the owner with `0600` permissions. The password itself is not stored.
+
+Choosing a new login method replaces the previous one, so switching to subscription OAuth cannot
+silently keep billing an older API key. When the native macOS or Linux sandbox is active, the
+encrypted credential file is also masked from model-run commands—even in full-access mode.
+
+On later runs, enter the same password to unlock the file. An incorrect password—or a modified or
+corrupt ciphertext—is rejected because authenticated decryption fails. When subscription tokens
+expire and a refresh token is available, GrokForge refreshes them and seals the updated tokens with
+the same password.
+
+Earlier builds delegated credential storage to the OS keychain. GrokForge no longer calls any OS
+keychain or system secret-store API; this avoids the recurring macOS Keychain-access prompts and
+makes the credential location and unlock behavior consistent across platforms. The tradeoff is that
+there is no password recovery: if you forget it, remove the encrypted file and sign in again.
+
+You can also set things up ahead of time:
 
 ```sh
 grokforge login                 # store an xAI API key (password-encrypted on disk)
@@ -66,7 +124,10 @@ grokforge login --subscription  # sign in with your SuperGrok / X Premium+ subsc
 export XAI_API_KEY=your_key     # or just use an environment variable (best for CI, no password)
 ```
 
-Resolution order is `XAI_API_KEY` env → the encrypted file (unlocked with your password) → interactive setup. Run `grokforge doctor` to see which credential is active and whether the sandbox is enforced.
+Resolution order is `XAI_API_KEY` env → the encrypted file (unlocked with your password) →
+interactive setup. The environment variable always wins and requires no password, which keeps CI
+and other non-interactive runs usable. Run `grokforge doctor` to see which credential is active and
+whether the sandbox is enforced.
 
 Run one task without opening the TUI:
 
@@ -104,7 +165,7 @@ Commands start with a stripped-down environment, Git metadata stays protected, c
 
 ## Still being built
 
-- Rich Markdown and diff rendering
+- Rich diff rendering and native-scrollback polish
 - The repository map and smarter automatic context selection
 - Foreground auto-commit and a practical undo workflow
 - Full session search

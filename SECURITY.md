@@ -10,8 +10,8 @@ The built-in model client sends requests only to the API endpoint you configure 
 `XAI_BASE_URL` (default `https://api.x.ai`). GrokForge has no telemetry code path. You provide the
 API key with `XAI_API_KEY`, or store an API key / subscription OAuth tokens in a password-encrypted
 file at `~/.grokforge/credentials.enc` (Argon2id key derivation from your password plus a random
-salt, sealed with ChaCha20-Poly1305, `0600` permissions). GrokForge does **not** use the OS keychain
-or any system secret store.
+salt, sealed with ChaCha20-Poly1305, `0600` permissions on Unix). GrokForge does **not** use the OS
+keychain or any system secret store.
 
 Each first-party model request body is assembled through the context-ledger path. The ledger
 reconciles its source entries to the byte length of the exact serialized JSON body and records
@@ -32,6 +32,12 @@ as untrusted model input and review resulting actions.
 
 ## What leaves your machine
 
+Subscription sign-in opens an xAI authorization URL at `https://auth.x.ai` in your browser and
+exchanges the returned authorization code—or a stored refresh token—with xAI's token endpoint.
+Those OAuth requests contain authentication material but no repository or conversation context;
+the loopback callback listens only on `127.0.0.1`, validates an unguessable state value, and the
+token client does not follow redirects.
+
 Model context is redacted before the request body is serialized:
 
 - **Pattern redaction is on by default.** Context sources such as user input, repository
@@ -42,6 +48,9 @@ Model context is redacted before the request body is serialized:
   `*.pem`, `*.key`, and common credential files. The command sandbox also tries to enforce these
   rules: Seatbelt combines read/write profile rules with bounded physical-target discovery, while
   bubblewrap masks only existing matches found during a bounded workspace scan.
+- **GrokForge's encrypted credential file is a permanent sandbox exception.** The native macOS and
+  Linux backends deny or mask both the default file and `GROKFORGE_CREDENTIALS_PATH`, even when
+  full-access mode disables the broader ambient-secret catalogue.
 - **Project skill catalogs are automatic context.** For each safely discovered
   `.grokforge/skills/*/SKILL.md`, GrokForge sends the bounded skill name, relative path, and
   frontmatter description through the redaction and ledger path. The instruction body remains

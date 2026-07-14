@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Config layering (figment), provider config, price table, and keyring access."
+description = "Config layering (figment), provider config, and price table."
 
 [lints]
 workspace = true

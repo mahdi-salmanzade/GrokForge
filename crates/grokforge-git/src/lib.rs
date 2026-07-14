@@ -183,6 +183,10 @@ impl Git {
                 let driver = &key[..key.len() - ".clean".len()];
                 command.arg("-c").arg(format!("{driver}.required=false"));
             }
+            if lowercase.ends_with(".smudge") {
+                let driver = &key[..key.len() - ".smudge".len()];
+                command.arg("-c").arg(format!("{driver}.required=false"));
+            }
             if lowercase.ends_with(".process") {
                 let driver = &key[..key.len() - ".process".len()];
                 command.arg("-c").arg(format!("{driver}.required=false"));

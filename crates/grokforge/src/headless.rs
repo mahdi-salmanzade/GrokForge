@@ -133,7 +133,8 @@ pub async fn run(args: ExecArgs) -> ExitCode {
         None => None,
     };
 
-    // Headless: env → keychain (no prompt, so scripts/CI stay non-interactive).
+    // Headless: env override → unlock an existing encrypted file when attached to a terminal.
+    // First-run onboarding stays disabled so scripts and CI never create credentials implicitly.
     let Some(api_key) = crate::credentials::resolve(false).await else {
         return ExitCode::from(3);
     };
@@ -259,7 +260,7 @@ pub async fn run(args: ExecArgs) -> ExitCode {
                 }
             }
             Some(ev) = rx.recv() => {
-                if matches!(ev, EventMsg::Error { .. }) {
+                if is_error_event(&ev) {
                     had_error = true;
                 }
                 emit(&ev, json);
@@ -271,7 +272,7 @@ pub async fn run(args: ExecArgs) -> ExitCode {
     // The agent's sender is dropped before its task joins, so this drains every FIFO event that
     // preceded TurnComplete even if the join branch won the final select race.
     while let Some(ev) = rx.recv().await {
-        if matches!(ev, EventMsg::Error { .. }) {
+        if is_error_event(&ev) {
             had_error = true;
         }
         emit(&ev, json);
@@ -324,6 +325,76 @@ fn emit(ev: &EventMsg, json: bool) {
         }
         EventMsg::Error { message, .. } => {
             eprintln!("[error] {}", crate::sanitize_terminal(message));
+        }
+        EventMsg::SubagentStarted {
+            label,
+            index,
+            total,
+            ..
+        } => {
+            eprintln!(
+                "[agent {}/{}] {}",
+                index + 1,
+                total,
+                crate::sanitize_terminal_line(label)
+            );
+        }
+        EventMsg::SubagentUpdate { agent_id, inner } => emit_subagent_plain(agent_id, inner),
+        EventMsg::SubagentFinished { ok, summary, .. } => {
+            eprintln!(
+                "[agent {}] {}",
+                if *ok { "done" } else { "failed" },
+                crate::sanitize_terminal(summary)
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Whether an event (including one wrapped inside a subagent lane) reports an error, so headless
+/// exit-code accounting stays correct despite the per-lane attribution.
+fn is_error_event(ev: &EventMsg) -> bool {
+    match ev {
+        EventMsg::Error { .. } => true,
+        EventMsg::SubagentUpdate { inner, .. } => is_error_event(inner),
+        _ => false,
+    }
+}
+
+/// Plain-text rendering of a subagent's inner event: tool activity, commits, and errors are shown
+/// on stderr tagged with a short lane id. Assistant/reasoning text is intentionally not echoed to
+/// stdout so the primary output stays the top-level agent's answer.
+fn emit_subagent_plain(agent_id: &str, inner: &EventMsg) {
+    let tag: String = agent_id.chars().take(6).collect();
+    match inner {
+        EventMsg::ToolCallBegin {
+            name, args_preview, ..
+        } => {
+            eprintln!(
+                "[agent {tag} · tool] {} {}",
+                crate::sanitize_terminal_line(name),
+                crate::sanitize_terminal(args_preview)
+            );
+        }
+        EventMsg::ToolCallEnd { ok, summary, .. } => {
+            eprintln!(
+                "[agent {tag} · tool] {} — {}",
+                if *ok { "ok" } else { "failed/denied" },
+                crate::sanitize_terminal(summary)
+            );
+        }
+        EventMsg::Committed { sha, message } => {
+            let short = &sha[..sha.len().min(8)];
+            eprintln!(
+                "[agent {tag} · commit {short}] {}",
+                crate::sanitize_terminal(message)
+            );
+        }
+        EventMsg::Error { message, .. } => {
+            eprintln!(
+                "[agent {tag} · error] {}",
+                crate::sanitize_terminal(message)
+            );
         }
         _ => {}
     }
