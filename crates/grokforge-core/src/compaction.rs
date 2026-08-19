@@ -19,8 +19,14 @@ pub fn estimate_bytes(history: &[ResponseItem]) -> usize {
 
 fn item_bytes(item: &ResponseItem) -> usize {
     match item {
-        ResponseItem::UserMessage { text, .. }
-        | ResponseItem::AssistantMessage { text }
+        ResponseItem::UserMessage { text, images, .. } => {
+            images.iter().fold(text.len(), |total, image| {
+                total
+                    .saturating_add(image.mime_type.len())
+                    .saturating_add(image.base64.len())
+            })
+        }
+        ResponseItem::AssistantMessage { text }
         | ResponseItem::Reasoning { text }
         | ResponseItem::CompactionSummary { text, .. } => text.len(),
         ResponseItem::EncryptedReasoning {
@@ -52,8 +58,18 @@ pub fn should_compact(history: &[ResponseItem], trigger_bytes: usize, _keep_tail
     history.len() > 1 && estimate_bytes(history) > trigger_bytes
 }
 
-/// Mechanically pull verbatim file paths (from write/edit tool calls) and error text (from
-/// failed tool results) out of the items being summarized, so they are never lost or reworded.
+/// Whether `name` is a mutating file tool whose `path` argument must be preserved verbatim.
+///
+/// `write_file`, `edit`, `apply_patch`, and `format_file` all take a workspace `path` and
+/// rewrite that file. `remember` writes under `.grokforge/memory/` from `note`/`topic`, not a
+/// caller-supplied workspace path, so it is not included.
+fn mutating_file_tool(name: &str) -> bool {
+    matches!(name, "write_file" | "edit" | "apply_patch" | "format_file")
+}
+
+/// Mechanically pull verbatim file paths (from write_file / edit / apply_patch / format_file
+/// tool calls) and error text (from failed tool results) out of the items being summarized, so
+/// they are never lost or reworded.
 #[must_use]
 pub fn extract_verbatim(items: &[ResponseItem]) -> (Vec<String>, Vec<String>) {
     let mut files = Vec::new();
@@ -69,16 +85,8 @@ pub fn extract_verbatim(items: &[ResponseItem]) -> (Vec<String>, Vec<String>) {
         match item {
             ResponseItem::ToolCall {
                 name, arguments, ..
-            } if matches!(name.as_str(), "write_file" | "edit") => {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments)
-                    && let Some(p) = v.get("path").and_then(|p| p.as_str())
-                {
-                    let path = bounded_fragment(p, MAX_VERBATIM_ENTRY_BYTES);
-                    if known_files.insert(path.clone()) {
-                        total_bytes = total_bytes.saturating_add(path.len());
-                        files.push(path);
-                    }
-                }
+            } if mutating_file_tool(name) => {
+                record_verbatim_path(arguments, &mut known_files, &mut files, &mut total_bytes);
             }
             ResponseItem::ToolResult {
                 content,
@@ -102,26 +110,35 @@ pub fn extract_verbatim(items: &[ResponseItem]) -> (Vec<String>, Vec<String>) {
                     .get("name")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
-                if matches!(name, "write_file" | "edit") {
+                if mutating_file_tool(name) {
                     let arguments = item
                         .get("arguments")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default();
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments)
-                        && let Some(path) = value.get("path").and_then(serde_json::Value::as_str)
-                    {
-                        let path = bounded_fragment(path, MAX_VERBATIM_ENTRY_BYTES);
-                        if known_files.insert(path.clone()) {
-                            total_bytes = total_bytes.saturating_add(path.len());
-                            files.push(path);
-                        }
-                    }
+                    record_verbatim_path(arguments, &mut known_files, &mut files, &mut total_bytes);
                 }
             }
             _ => {}
         }
     }
     (files, errors)
+}
+
+fn record_verbatim_path(
+    arguments: &str,
+    known_files: &mut std::collections::HashSet<String>,
+    files: &mut Vec<String>,
+    total_bytes: &mut usize,
+) {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments)
+        && let Some(path) = value.get("path").and_then(serde_json::Value::as_str)
+    {
+        let path = bounded_fragment(path, MAX_VERBATIM_ENTRY_BYTES);
+        if known_files.insert(path.clone()) {
+            *total_bytes = total_bytes.saturating_add(path.len());
+            files.push(path);
+        }
+    }
 }
 
 fn bounded_fragment(value: &str, max_bytes: usize) -> String {
@@ -414,6 +431,113 @@ mod tests {
         assert_eq!(files, vec!["src/net/backoff.rs".to_string()]);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("cannot find value `foo`"));
+    }
+
+    #[test]
+    fn extracts_apply_patch_path_from_tool_call() {
+        let items = vec![ResponseItem::ToolCall {
+            id: ToolCallId::new(),
+            name: "apply_patch".into(),
+            arguments: r#"{"path":"src/tools/patch.rs","patch":"--- a\n+++ b\n"}"#.into(),
+        }];
+        let (files, errors) = extract_verbatim(&items);
+        assert_eq!(files, vec!["src/tools/patch.rs".to_string()]);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn extracts_apply_patch_path_from_provider_function_call() {
+        let items = vec![ResponseItem::ProviderOutput {
+            item: serde_json::json!({
+                "type": "function_call",
+                "name": "apply_patch",
+                "arguments": r#"{"path":"crates/core/src/turn.rs","patch":"..."}"#
+            }),
+        }];
+        let (files, errors) = extract_verbatim(&items);
+        assert_eq!(files, vec!["crates/core/src/turn.rs".to_string()]);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn extracts_format_file_path() {
+        let items = vec![
+            ResponseItem::ToolCall {
+                id: ToolCallId::new(),
+                name: "format_file".into(),
+                arguments: r#"{"path":"src/lib.rs"}"#.into(),
+            },
+            ResponseItem::ProviderOutput {
+                item: serde_json::json!({
+                    "type": "function_call",
+                    "name": "format_file",
+                    "arguments": r#"{"path":"src/main.rs"}"#
+                }),
+            },
+        ];
+        let (files, errors) = extract_verbatim(&items);
+        assert_eq!(
+            files,
+            vec!["src/lib.rs".to_string(), "src/main.rs".to_string()]
+        );
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn ignores_unknown_tools_even_when_arguments_contain_path() {
+        let items = vec![
+            ResponseItem::ToolCall {
+                id: ToolCallId::new(),
+                name: "shell".into(),
+                arguments: r#"{"command":"echo","path":"should-not-extract.rs"}"#.into(),
+            },
+            ResponseItem::ToolCall {
+                id: ToolCallId::new(),
+                name: "remember".into(),
+                arguments: r#"{"note":"keep this","topic":"src/secret.rs"}"#.into(),
+            },
+            ResponseItem::ProviderOutput {
+                item: serde_json::json!({
+                    "type": "function_call",
+                    "name": "read_file",
+                    "arguments": r#"{"path":"src/other.rs"}"#
+                }),
+            },
+        ];
+        let (files, errors) = extract_verbatim(&items);
+        assert!(files.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn verbatim_paths_stay_unique_across_tools_and_item_kinds() {
+        let items = vec![
+            ResponseItem::ToolCall {
+                id: ToolCallId::new(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"src/dup.rs","content":"a"}"#.into(),
+            },
+            ResponseItem::ToolCall {
+                id: ToolCallId::new(),
+                name: "edit".into(),
+                arguments: r#"{"path":"src/dup.rs","old_string":"a","new_string":"b"}"#.into(),
+            },
+            ResponseItem::ToolCall {
+                id: ToolCallId::new(),
+                name: "apply_patch".into(),
+                arguments: r#"{"path":"src/dup.rs","patch":"..."}"#.into(),
+            },
+            ResponseItem::ProviderOutput {
+                item: serde_json::json!({
+                    "type": "function_call",
+                    "name": "format_file",
+                    "arguments": r#"{"path":"src/dup.rs"}"#
+                }),
+            },
+        ];
+        let (files, errors) = extract_verbatim(&items);
+        assert_eq!(files, vec!["src/dup.rs".to_string()]);
+        assert!(errors.is_empty());
     }
 
     #[test]

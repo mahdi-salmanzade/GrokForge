@@ -1,6 +1,6 @@
 //! The interactive TUI application: an async event loop over terminal input, agent events, and
-//! approval requests, rendering a scrolling transcript, a composer, a status line, and an
-//! approval modal.
+//! approval and structured-question requests, rendering a scrolling transcript, a composer, a
+//! status line, and focused modal sheets.
 //!
 //! This is the first working cut. It uses the alternate screen for robustness; the inline
 //! viewport + native-scrollback render pipeline (the inline-scrollback differentiator in the design
@@ -9,8 +9,9 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{
@@ -19,8 +20,14 @@ use crossterm::event::{
 use futures::{FutureExt, StreamExt};
 use grokforge_core::commands::{self, CommandDoc};
 use grokforge_core::skills::{self, SkillDoc};
-use grokforge_core::{Agent, RolloutWriter, Session, SessionMeta, TurnCancellation, sessions_dir};
-use grokforge_protocol::{Decision, DenialClass, EventMsg, ResponseItem, Usage};
+use grokforge_core::{
+    Agent, RolloutWriter, Session, SessionMeta, ToolSpec, TurnCancellation, sessions_dir,
+};
+use grokforge_git::{WorktreeJournal, WorktreeJournalBuilder};
+use grokforge_protocol::{
+    Decision, DenialClass, EventMsg, LedgerEntry, QuestionAnswer, QuestionResponse, ResponseItem,
+    SandboxMode, Usage,
+};
 use grokforge_render::{LineKind, RenderLine, RenderSpan, SpanRole, render_markdown};
 use grokforge_xai::{Effort, ServerTool, model_supports_effort};
 use ratatui::Terminal;
@@ -34,6 +41,8 @@ use tokio::task::JoinHandle;
 use unicode_width::UnicodeWidthChar;
 
 use crate::approver::PendingApproval;
+use crate::ledger::{LEDGER_SCOPE_NOTE, LEDGER_VIEW_ENTRIES, MAX_LEDGER_ENTRIES, SessionLedger};
+use crate::questioner::PendingQuestion;
 
 const MAX_COMPOSER_BYTES: usize = 64 * 1024;
 const MAX_TRANSCRIPT_ENTRIES: usize = 2_048;
@@ -56,6 +65,10 @@ const MAX_INPUT_HISTORY: usize = 200;
 /// Mouse wheels commonly emit several rapid events per gesture; three transcript rows per event
 /// feels responsive without making short messages disappear in one notch.
 const MOUSE_SCROLL_ROWS: u16 = 3;
+/// Whole-worktree snapshots cannot distinguish an agent edit from a concurrent editor save.
+/// Keep the prototype compiled and tested, but do not expose it until journaling is driven by
+/// per-mutation ownership records from the core file tools.
+const FOREGROUND_JOURNAL_ENABLED: bool = false;
 
 // GrokForge's UI palette. Explicit colors make the product identity consistent across terminal
 // themes; every foreground/background pair is intentionally high-contrast. The interface still
@@ -165,6 +178,12 @@ enum ShutdownState {
     Active,
     Requested,
     Ready,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustedProjectMcp {
+    Inactive,
+    Active,
 }
 
 /// One locally discoverable slash action. The palette is derived from these records on every
@@ -323,6 +342,137 @@ impl ApprovalDetail {
     }
 }
 
+/// State for one structured question batch. Concurrent subagents enqueue separate batches; only
+/// the oldest batch owns the modal and its response channel.
+#[derive(Debug)]
+struct QuestionDialog {
+    pending: PendingQuestion,
+    current: usize,
+    selection: usize,
+    answers: Vec<Option<QuestionAnswer>>,
+    custom_input: String,
+    editing_custom: bool,
+}
+
+impl QuestionDialog {
+    fn new(pending: PendingQuestion) -> Self {
+        let answer_count = pending.request.questions.len();
+        Self {
+            pending,
+            current: 0,
+            selection: 0,
+            answers: vec![None; answer_count],
+            custom_input: String::new(),
+            editing_custom: false,
+        }
+    }
+
+    fn choice_count(&self) -> usize {
+        self.pending
+            .request
+            .questions
+            .get(self.current)
+            .map_or(0, |question| {
+                question.options.len() + usize::from(question.allow_custom)
+            })
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.editing_custom {
+            return;
+        }
+        let count = self.choice_count();
+        if count == 0 {
+            return;
+        }
+        self.selection = if delta < 0 {
+            self.selection
+                .checked_sub(delta.unsigned_abs())
+                .unwrap_or(count - 1)
+        } else {
+            self.selection.saturating_add(delta.unsigned_abs()) % count
+        };
+    }
+
+    fn select_number(&mut self, number: usize) -> bool {
+        if self.editing_custom || number == 0 || number > self.choice_count() {
+            return false;
+        }
+        self.selection = number - 1;
+        true
+    }
+
+    /// Save the current selection. Returns true when the full batch is ready to submit.
+    fn commit_current(&mut self) -> bool {
+        let Some(question) = self.pending.request.questions.get(self.current) else {
+            return false;
+        };
+        let answer = if self.editing_custom {
+            let custom = self.custom_input.trim();
+            if custom.is_empty() {
+                return false;
+            }
+            QuestionAnswer {
+                question: self.current,
+                selected: None,
+                custom: Some(custom.to_string()),
+            }
+        } else if self.selection < question.options.len() {
+            QuestionAnswer {
+                question: self.current,
+                selected: Some(self.selection),
+                custom: None,
+            }
+        } else if question.allow_custom {
+            self.editing_custom = true;
+            return false;
+        } else {
+            return false;
+        };
+        self.answers[self.current] = Some(answer);
+        self.editing_custom = false;
+        self.custom_input.clear();
+        if self.current + 1 == self.pending.request.questions.len() {
+            return true;
+        }
+        self.current += 1;
+        self.restore_current_selection();
+        false
+    }
+
+    fn previous(&mut self) {
+        if self.editing_custom || self.current == 0 {
+            return;
+        }
+        self.current -= 1;
+        self.restore_current_selection();
+    }
+
+    fn restore_current_selection(&mut self) {
+        self.custom_input.clear();
+        self.editing_custom = false;
+        self.selection = match self.answers[self.current].as_ref() {
+            Some(QuestionAnswer {
+                selected: Some(selected),
+                ..
+            }) => *selected,
+            Some(QuestionAnswer {
+                custom: Some(custom),
+                ..
+            }) => {
+                self.custom_input.clone_from(custom);
+                self.pending.request.questions[self.current].options.len()
+            }
+            _ => 0,
+        };
+    }
+
+    fn response(&self) -> Option<QuestionResponse> {
+        let answers = self.answers.iter().cloned().collect::<Option<Vec<_>>>()?;
+        Some(QuestionResponse::Answered { answers })
+    }
+}
+
 /// The running application state.
 pub struct App {
     agent: Arc<Agent>,
@@ -349,6 +499,9 @@ pub struct App {
     /// Sanitized and cached once when the request arrives. Full approval details remain visible;
     /// redraws do not repeatedly format or scan a potentially large command.
     approval_detail: Option<ApprovalDetail>,
+    /// Structured question batches share one polished modal and are FIFO across subagents.
+    question_dialog: Option<QuestionDialog>,
+    question_queue: VecDeque<PendingQuestion>,
     running: bool,
     shutdown: ShutdownState,
     status_model: String,
@@ -359,6 +512,17 @@ pub struct App {
     ledger_bytes: usize,
     ledger_sources: usize,
     ledger_redactions: usize,
+    /// Newest [`MAX_LEDGER_ENTRIES`] `LedgerAppended` rows. Totals above keep counting after
+    /// this ring drops oldest entries so `/status` and the compact status-line stay lifetime-true.
+    session_ledger: SessionLedger,
+    /// Exact local tool surface captured after built-ins, custom tools, and MCP registration.
+    /// Keeping the specs here makes `/tools` and the slash deck describe what this agent can call,
+    /// rather than a second hard-coded capability list that silently drifts.
+    local_tools: Vec<ToolSpec>,
+    /// Trusted project MCP transports are long-lived and run outside the command sandbox. Plan
+    /// mode hides their tools, but cannot retroactively guarantee that an already-running process
+    /// has no independent side effects.
+    trusted_project_mcp: TrustedProjectMcp,
     available_skills: Vec<SkillDoc>,
     project_commands: Vec<CommandDoc>,
     display_mode: DisplayMode,
@@ -382,10 +546,15 @@ pub struct App {
     // The channel stays open for the app's lifetime because `agent` (Arc) holds the sender.
     events_rx: mpsc::UnboundedReceiver<EventMsg>,
     approvals_rx: mpsc::UnboundedReceiver<PendingApproval>,
+    questions_rx: mpsc::UnboundedReceiver<PendingQuestion>,
     turn_handle: Option<JoinHandle<TurnOutcome>>,
     turn_cancellation: Option<TurnCancellation>,
     turn_complete_seen: bool,
-    undo_handle: Option<JoinHandle<Entry>>,
+    undo_handle: Option<JoinHandle<JournalCommandOutcome>>,
+    /// Completed foreground-turn journals. `foreground_journal_cursor` is the number currently
+    /// applied; entries after it are redo history and are discarded by the next execute turn.
+    foreground_journals: Vec<Arc<Mutex<WorktreeJournal>>>,
+    foreground_journal_cursor: usize,
     model_handle: Option<JoinHandle<ModelSaveOutcome>>,
     effort_handle: Option<JoinHandle<EffortSaveOutcome>>,
 }
@@ -395,6 +564,30 @@ struct TurnOutcome {
     session: Session,
     rollout: Option<RolloutWriter>,
     panic: Option<String>,
+    foreground_journal: Result<Option<WorktreeJournal>, String>,
+    metadata_warning: Option<String>,
+}
+
+async fn persist_first_prompt_label(
+    directory: Option<std::path::PathBuf>,
+    session_id: grokforge_protocol::SessionId,
+    prompt: &str,
+) -> Option<String> {
+    let directory = directory?;
+    SessionMeta::set_first_prompt_if_empty(&directory, session_id, prompt)
+        .await
+        .err()
+        .map(|error| {
+            format!(
+                "session remains resumable, but its first-prompt label could not be saved: {error}"
+            )
+        })
+}
+
+#[derive(Debug)]
+struct JournalCommandOutcome {
+    entry: Entry,
+    foreground_cursor: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -459,6 +652,8 @@ impl std::fmt::Debug for App {
             .field("running", &self.running)
             .field("has_pending_approval", &self.pending.is_some())
             .field("queued_approvals", &self.approval_queue.len())
+            .field("has_pending_question", &self.question_dialog.is_some())
+            .field("queued_questions", &self.question_queue.len())
             .field("has_pending_undo", &self.undo_handle.is_some())
             .field("has_pending_model_save", &self.model_handle.is_some())
             .field("has_pending_effort_save", &self.effort_handle.is_some())
@@ -477,8 +672,36 @@ impl App {
         status_model: String,
         status_preset: String,
     ) -> Self {
+        let (_questions_tx, questions_rx) = mpsc::unbounded_channel();
+        Self::new_with_questions(
+            agent,
+            session,
+            rollout,
+            events_rx,
+            approvals_rx,
+            questions_rx,
+            status_model,
+            status_preset,
+        )
+    }
+
+    /// Construct an app with an interactive structured-question channel. The original [`Self::new`]
+    /// remains available for embedders that do not provide this capability.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_questions(
+        agent: Arc<Agent>,
+        session: Session,
+        rollout: Option<RolloutWriter>,
+        events_rx: mpsc::UnboundedReceiver<EventMsg>,
+        approvals_rx: mpsc::UnboundedReceiver<PendingApproval>,
+        questions_rx: mpsc::UnboundedReceiver<PendingQuestion>,
+        status_model: String,
+        status_preset: String,
+    ) -> Self {
         let resumed = session.history.len();
         let workspace_root = session.config.workspace_root.clone();
+        let local_tools = agent.tool_specs();
         let available_skills = skills::discover(&session.config.workspace_root);
         let project_commands = commands::discover(&session.config.workspace_root);
         let mut transcript = Vec::new();
@@ -509,6 +732,8 @@ impl App {
             pending: None,
             approval_queue: VecDeque::new(),
             approval_detail: None,
+            question_dialog: None,
+            question_queue: VecDeque::new(),
             running: false,
             shutdown: ShutdownState::Active,
             status_model,
@@ -519,6 +744,9 @@ impl App {
             ledger_bytes: 0,
             ledger_sources: 0,
             ledger_redactions: 0,
+            session_ledger: SessionLedger::default(),
+            local_tools,
+            trusted_project_mcp: TrustedProjectMcp::Inactive,
             available_skills,
             project_commands,
             display_mode: DisplayMode::from_environment(),
@@ -532,10 +760,13 @@ impl App {
             history_draft: String::new(),
             events_rx,
             approvals_rx,
+            questions_rx,
             turn_handle: None,
             turn_cancellation: None,
             turn_complete_seen: false,
             undo_handle: None,
+            foreground_journals: Vec::new(),
+            foreground_journal_cursor: 0,
             model_handle: None,
             effort_handle: None,
         }
@@ -543,6 +774,14 @@ impl App {
 
     pub(crate) fn set_startup_notice(&mut self, message: impl Into<String>) {
         self.startup_notice = Some(bounded_text(&message.into(), MAX_ENTRY_BYTES));
+    }
+
+    pub(crate) fn set_trusted_project_mcp_active(&mut self, active: bool) {
+        self.trusted_project_mcp = if active {
+            TrustedProjectMcp::Active
+        } else {
+            TrustedProjectMcp::Inactive
+        };
     }
 
     fn push_entry(&mut self, entry: Entry) {
@@ -567,6 +806,7 @@ impl App {
             cancellation.cancel();
         }
         self.abort_all_approvals();
+        self.abort_all_questions();
         self.finish_quit_if_quiescent();
     }
 
@@ -650,6 +890,10 @@ impl App {
                     self.on_approval_request(pending);
                     redraw_needed = true;
                 }
+                Some(pending) = self.questions_rx.recv() => {
+                    self.on_question_request(pending);
+                    redraw_needed = true;
+                }
                 result = wait_for_turn(&mut self.turn_handle), if self.turn_handle.is_some() => {
                     self.finish_turn(result);
                     redraw_needed = true;
@@ -729,6 +973,12 @@ impl App {
         // Approval modal captures input.
         if self.pending.is_some() {
             self.on_approval_key(key);
+            return;
+        }
+
+        // Structured questions capture all input while their modal is visible.
+        if self.question_dialog.is_some() {
+            self.on_question_key(key);
             return;
         }
 
@@ -935,6 +1185,15 @@ impl App {
         if self.pending.is_some() {
             return;
         }
+        if let Some(dialog) = &mut self.question_dialog {
+            if dialog.editing_custom {
+                let value = safe_terminal_text(value);
+                let remaining = grokforge_core::questions::MAX_CUSTOM_ANSWER_BYTES
+                    .saturating_sub(dialog.custom_input.len());
+                append_up_to_bytes(&mut dialog.custom_input, &value, remaining);
+            }
+            return;
+        }
         let value = safe_terminal_text(value);
         let remaining = MAX_COMPOSER_BYTES.saturating_sub(self.composer.len());
         let mut used = 0usize;
@@ -1042,6 +1301,118 @@ impl App {
         }
     }
 
+    fn on_question_request(&mut self, pending: PendingQuestion) {
+        // A question can race with Ctrl+C just like an approval. Resolve it immediately so the
+        // agent future never survives frontend shutdown.
+        if self.shutdown != ShutdownState::Active {
+            let _ = pending.respond.send(QuestionResponse::Cancelled);
+            return;
+        }
+        if !(1..=3).contains(&pending.request.questions.len())
+            || pending
+                .request
+                .questions
+                .iter()
+                .any(|question| !(2..=4).contains(&question.options.len()))
+        {
+            let _ = pending.respond.send(QuestionResponse::Unavailable {
+                reason: "question frontend received an invalid request shape".to_string(),
+            });
+            return;
+        }
+        self.question_queue.push_back(pending);
+        self.activate_next_question();
+    }
+
+    fn activate_next_question(&mut self) {
+        if self.question_dialog.is_some() {
+            return;
+        }
+        self.question_dialog = self.question_queue.pop_front().map(QuestionDialog::new);
+    }
+
+    fn abort_all_questions(&mut self) {
+        if let Some(dialog) = self.question_dialog.take() {
+            let _ = dialog.pending.respond.send(QuestionResponse::Cancelled);
+        }
+        while let Some(pending) = self.question_queue.pop_front() {
+            let _ = pending.respond.send(QuestionResponse::Cancelled);
+        }
+    }
+
+    fn finish_question(&mut self, response: QuestionResponse) {
+        if let Some(dialog) = self.question_dialog.take() {
+            let _ = dialog.pending.respond.send(response);
+        }
+        self.activate_next_question();
+    }
+
+    fn on_question_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            if let Some(dialog) = &mut self.question_dialog
+                && dialog.editing_custom
+            {
+                dialog.editing_custom = false;
+                dialog.custom_input.clear();
+                return;
+            }
+            self.finish_question(QuestionResponse::Cancelled);
+            return;
+        }
+
+        let mut completed = false;
+        if let Some(dialog) = &mut self.question_dialog {
+            if dialog.editing_custom {
+                match key.code {
+                    KeyCode::Enter => completed = dialog.commit_current(),
+                    KeyCode::Backspace => {
+                        dialog.custom_input.pop();
+                    }
+                    KeyCode::Char(character)
+                        if !key.modifiers.intersects(
+                            KeyModifiers::CONTROL
+                                | KeyModifiers::ALT
+                                | KeyModifiers::SUPER
+                                | KeyModifiers::HYPER
+                                | KeyModifiers::META,
+                        ) && is_safe_terminal_char(character)
+                            && dialog
+                                .custom_input
+                                .len()
+                                .saturating_add(character.len_utf8())
+                                <= grokforge_core::questions::MAX_CUSTOM_ANSWER_BYTES =>
+                    {
+                        dialog.custom_input.push(character);
+                    }
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Up | KeyCode::BackTab => dialog.move_selection(-1),
+                    KeyCode::Down | KeyCode::Tab => dialog.move_selection(1),
+                    KeyCode::Left => dialog.previous(),
+                    KeyCode::Enter => completed = dialog.commit_current(),
+                    KeyCode::Char(character @ '1'..='5') => {
+                        let number = usize::from(character as u8 - b'0');
+                        if dialog.select_number(number) {
+                            completed = dialog.commit_current();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if completed {
+            let response = self
+                .question_dialog
+                .as_ref()
+                .and_then(QuestionDialog::response);
+            if let Some(response) = response {
+                self.finish_question(response);
+            }
+        }
+    }
+
     fn submit(&mut self) {
         // The composer is sanitized on every input path, and again here as a final boundary before
         // text can reach project-command expansion, persistence, or the model request ledger.
@@ -1116,6 +1487,26 @@ impl App {
         let Some(mut session) = self.session.take() else {
             return;
         };
+        // Fresh interactive sessions are created before a first prompt exists. Derive the metadata
+        // directory from the already-locked rollout instead of consulting global state, then fill
+        // the label once before the first turn. Resume/export semantics remain rollout-driven.
+        let first_prompt_metadata_dir = if session.history.is_empty() {
+            self.rollout
+                .as_ref()
+                .and_then(|rollout| rollout.path().parent())
+                .map(std::path::Path::to_path_buf)
+        } else {
+            None
+        };
+        let session_id = session.id;
+        let capture_foreground =
+            FOREGROUND_JOURNAL_ENABLED && !plan && !session.config.isolated_worktree;
+        if capture_foreground {
+            // A new execute turn branches from the current state, so stale redo records can no
+            // longer be replayed coherently even when the new turn ultimately makes no files.
+            self.foreground_journals
+                .truncate(self.foreground_journal_cursor);
+        }
         let plan_restore = if plan {
             match PlanConfigRestore::apply(&mut session) {
                 Ok(restore) => Some(restore),
@@ -1139,6 +1530,20 @@ impl App {
         self.turn_cancellation = Some(cancellation.clone());
         let agent = Arc::clone(&self.agent);
         self.turn_handle = Some(tokio::spawn(async move {
+            let metadata_warning =
+                persist_first_prompt_label(first_prompt_metadata_dir, session_id, &text).await;
+            let foreground_builder = if capture_foreground {
+                let workspace = session.config.workspace_root.clone();
+                match tokio::task::spawn_blocking(move || WorktreeJournalBuilder::begin(&workspace))
+                    .await
+                {
+                    Ok(Ok(builder)) => Ok(Some(builder)),
+                    Ok(Err(error)) => Err(format!("foreground undo unavailable: {error}")),
+                    Err(error) => Err(format!("foreground snapshot task failed: {error}")),
+                }
+            } else {
+                Ok(None)
+            };
             let turn = AssertUnwindSafe(async {
                 if plan {
                     agent
@@ -1155,10 +1560,25 @@ impl App {
             if let Some(restore) = plan_restore {
                 restore.restore(&mut session);
             }
+            let foreground_journal = match foreground_builder {
+                Ok(Some(builder)) => {
+                    match tokio::task::spawn_blocking(move || builder.finish()).await {
+                        Ok(Ok(journal)) => Ok(journal),
+                        Ok(Err(error)) => {
+                            Err(format!("could not finish foreground undo journal: {error}"))
+                        }
+                        Err(error) => Err(format!("foreground journal task failed: {error}")),
+                    }
+                }
+                Ok(None) => Ok(None),
+                Err(error) => Err(error),
+            };
             TurnOutcome {
                 session,
                 rollout,
                 panic: turn.err().map(|payload| panic_message(payload.as_ref())),
+                foreground_journal,
+                metadata_warning,
             }
         }));
     }
@@ -1167,8 +1587,19 @@ impl App {
         let (name, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
         match name {
             "help" | "?" => {
+                let undo = if self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.config.isolated_worktree)
+                {
+                    "  ·  /undo"
+                } else {
+                    ""
+                };
                 self.push_entry(Entry::Info(
-                    "commands: /plan <task>  ·  /model [slug]  ·  /effort [auto|low|medium|high|xhigh]  ·  /skills [name]  ·  /memory  ·  /tools [web|x|code] [on|off]  ·  /undo  ·  /clear  ·  /quit".to_string(),
+                    format!(
+                        "commands: /plan <task>  ·  /model [slug]  ·  /effort [auto|low|medium|high|xhigh]  ·  /skills [name]  ·  /memory  ·  /tools [web|x|code] [on|off]  ·  /ledger  ·  /status{undo}  ·  /clear  ·  /quit"
+                    ),
                 ));
                 if !self.project_commands.is_empty() {
                     let commands = self
@@ -1189,16 +1620,25 @@ impl App {
                 self.omitted_entries = 0;
             }
             "undo" => self.undo(),
+            "redo" => self.redo(),
             "skills" => self.show_skills(rest.trim()),
             "memory" => self.show_memory(),
             "model" => self.handle_model(rest.trim()),
             "effort" => self.handle_effort(rest.trim()),
             "tools" => self.handle_server_tools(rest.trim()),
+            "ledger" => self.show_ledger(),
+            "status" => self.show_status(),
             "plan" => {
                 let task = rest.trim();
                 if task.is_empty() {
                     self.push_entry(Entry::Info("usage: /plan <task>".to_string()));
                 } else {
+                    if self.trusted_project_mcp == TrustedProjectMcp::Active {
+                        self.push_entry(Entry::Info(
+                            "PLAN BOUNDARY · agent tools and commands are read-only, but trusted project MCP processes were already started outside GrokForge's sandbox and may have independent side effects"
+                                .to_string(),
+                        ));
+                    }
                     self.push_entry(Entry::User(format!("/plan {task}")));
                     self.follow = true;
                     self.start_turn(task.to_string(), true);
@@ -1214,15 +1654,20 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn slash_palette_items(&self) -> Vec<SlashPaletteItem> {
+        let isolated_worktree = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.config.isolated_worktree);
+        let plan_description = if self.trusted_project_mcp == TrustedProjectMcp::Active {
+            "Read-only agent plan · trusted MCP processes remain active"
+        } else {
+            "Design a solution without changing files"
+        };
         let builtin = [
             ("/help", "Command map and keyboard shortcuts", false, false),
-            (
-                "/plan",
-                "Design a solution without changing files",
-                true,
-                true,
-            ),
+            ("/plan", plan_description, true, true),
             ("/skills", "Browse local project skills", true, false),
             (
                 "/model",
@@ -1270,8 +1715,20 @@ impl App {
                 false,
             ),
             (
+                "/ledger",
+                "Inspect what left the machine this session",
+                false,
+                false,
+            ),
+            (
+                "/status",
+                "Model, sandbox, usage, and ledger totals",
+                false,
+                false,
+            ),
+            (
                 "/undo",
-                "Undo an isolated-worktree agent commit · foreground journal pending",
+                "Undo the last session commit in an isolated worktree",
                 false,
                 false,
             ),
@@ -1280,6 +1737,7 @@ impl App {
         ];
         let mut items = builtin
             .into_iter()
+            .filter(|(completion, _, _, _)| *completion != "/undo" || isolated_worktree)
             .map(
                 |(completion, description, accepts_arguments, requires_argument)| {
                     SlashPaletteItem {
@@ -1435,13 +1893,7 @@ impl App {
             return;
         };
         if requested.is_empty() {
-            let current = match session.config.effort {
-                None => "auto",
-                Some(Effort::Low) => "low",
-                Some(Effort::Medium) => "medium",
-                Some(Effort::High) => "high",
-                Some(Effort::Xhigh) => "xhigh",
-            };
+            let current = effort_label(session.config.effort);
             self.push_entry(Entry::Info(format!(
                 "reasoning effort · {current} · set with /effort <auto|low|medium|high|xhigh>"
             )));
@@ -1506,15 +1958,18 @@ impl App {
         }
 
         let Some(tool_name) = tool_name else {
-            self.push_entry(Entry::Info(
-                "LOCAL CAPABILITIES · available without hosted-tool charges".to_string(),
-            ));
-            self.push_entry(Entry::Info(
-                "read · write · edit · list · glob · grep · shell".to_string(),
-            ));
-            self.push_entry(Entry::Info(
-                "git status · git diff · spawn task".to_string(),
-            ));
+            self.push_entry(Entry::Info(format!(
+                "LOCAL CAPABILITIES · {} loaded · available without hosted-tool charges",
+                self.local_tools.len()
+            )));
+            let tool_names = self
+                .local_tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>();
+            for tools in tool_names.chunks(6) {
+                self.push_entry(Entry::Info(tools.join(" · ")));
+            }
             let enabled = self
                 .session
                 .as_ref()
@@ -1625,16 +2080,153 @@ impl App {
         }
     }
 
-    /// Undo the last agent commit for this session (git, from the host process).
+    fn record_ledger_entry(&mut self, entry: LedgerEntry) {
+        self.ledger_sources = self.ledger_sources.saturating_add(1);
+        self.ledger_bytes = self.ledger_bytes.saturating_add(entry.bytes);
+        self.ledger_redactions = self.ledger_redactions.saturating_add(entry.redactions);
+        self.session_ledger.push(entry);
+    }
+
+    /// Print the in-memory context ledger: lifetime totals, a newest-N source window, and the
+    /// honest scope note. This is not the fullscreen Ctrl+O overlay.
+    fn show_ledger(&mut self) {
+        self.follow = true;
+        let retained = self.session_ledger.len();
+        debug_assert!(retained <= MAX_LEDGER_ENTRIES);
+        let mut header = format!(
+            "CONTEXT LEDGER · {} source(s) · {} · {} redaction(s)",
+            self.ledger_sources,
+            compact_bytes(self.ledger_bytes),
+            self.ledger_redactions,
+        );
+        if self.ledger_sources > retained {
+            let _ = write!(header, " · last {retained} retained");
+        }
+        let view: Vec<LedgerEntry> = self
+            .session_ledger
+            .recent(LEDGER_VIEW_ENTRIES)
+            .cloned()
+            .collect();
+        if retained > view.len() {
+            let _ = write!(
+                header,
+                " · showing last {} of {retained} retained",
+                view.len()
+            );
+        }
+        self.push_entry(Entry::Info(header));
+        for entry in view {
+            self.push_entry(Entry::Info(format!(
+                "{} · {} · {} · {} redaction(s)",
+                safe_terminal_line(&entry.source),
+                compact_bytes(entry.bytes),
+                safe_terminal_line(&entry.reason),
+                entry.redactions
+            )));
+        }
+        self.push_entry(Entry::Info(LEDGER_SCOPE_NOTE.to_string()));
+    }
+
+    /// One status card from fields the TUI already tracks. No cost-USD: this crate has no prices.
+    fn show_status(&mut self) {
+        self.follow = true;
+        let mut parts = vec![
+            format!("SESSION · {}", safe_terminal_line(&self.status_model)),
+            format!("preset {}", safe_terminal_line(&self.status_preset)),
+        ];
+        if let Some(session) = self.session.as_ref() {
+            parts.push(format!("effort {}", effort_label(session.config.effort)));
+            parts.push(format!(
+                "sandbox {}",
+                sandbox_mode_label(session.config.sandbox_mode)
+            ));
+            parts.push(session.id.to_string());
+        }
+        let used_tokens = self
+            .usage
+            .input_tokens
+            .saturating_add(self.usage.output_tokens);
+        if used_tokens > 0 {
+            parts.push(format!("tok {}", compact_count(used_tokens)));
+            parts.push(format!("cache {}%", cache_percent(self.usage)));
+            if let Some(window) = self
+                .session
+                .as_ref()
+                .and_then(|session| session.config.context_window_tokens)
+            {
+                parts.push(format!(
+                    "ctx {}% ({}/{})",
+                    ctx_percent(used_tokens, window),
+                    compact_count(used_tokens),
+                    compact_count(window)
+                ));
+            }
+        }
+        parts.push(format!(
+            "ledger {} source(s) / {} / {} redaction(s)",
+            self.ledger_sources,
+            compact_bytes(self.ledger_bytes),
+            self.ledger_redactions
+        ));
+        if let Some(session) = self.session.as_ref() {
+            parts.push(format!(
+                "isolated-worktree {}",
+                yes_no(session.config.isolated_worktree)
+            ));
+        }
+        parts.push(format!(
+            "trusted MCP {}",
+            yes_no(self.trusted_project_mcp == TrustedProjectMcp::Active)
+        ));
+        self.push_entry(Entry::Info(parts.join(" · ")));
+    }
+
+    /// Undo the last agent change for this session (Git host process or foreground journal).
     fn undo(&mut self) {
         let Some(session) = self.session.as_ref() else {
             return;
         };
         if !session.config.isolated_worktree {
-            self.push_entry(Entry::Info(
-                "foreground undo is not available yet · GrokForge leaves shared-worktree edits uncommitted to avoid racing your editor; review with git diff"
-                    .to_string(),
-            ));
+            if !FOREGROUND_JOURNAL_ENABLED {
+                self.push_entry(Entry::Info(
+                    "foreground undo is disabled because GrokForge cannot yet prove that concurrent editor saves belong to the agent; isolated-worktree session commits remain undoable"
+                        .to_string(),
+                ));
+                return;
+            }
+            let Some(index) = self.foreground_journal_cursor.checked_sub(1) else {
+                self.push_entry(Entry::Info(
+                    "nothing to undo for this foreground session".to_string(),
+                ));
+                return;
+            };
+            let Some(journal) = self.foreground_journals.get(index).cloned() else {
+                self.push_entry(Entry::Error(
+                    "foreground undo history is inconsistent; start a new turn".to_string(),
+                ));
+                return;
+            };
+            self.follow = true;
+            self.scroll = 0;
+            self.running = true;
+            self.undo_handle = Some(tokio::task::spawn_blocking(move || {
+                let result = journal
+                    .lock()
+                    .map_err(|_| "foreground journal lock was poisoned".to_string())
+                    .and_then(|mut journal| journal.undo().map_err(|error| error.to_string()));
+                match result {
+                    Ok(()) => JournalCommandOutcome {
+                        entry: Entry::Git(
+                            "undo: restored the workspace to its pre-turn state".to_string(),
+                        ),
+                        foreground_cursor: Some(index),
+                    },
+                    Err(error) => JournalCommandOutcome {
+                        entry: Entry::Error(format!("undo refused: {error}")),
+                        foreground_cursor: None,
+                    },
+                }
+            }));
             return;
         }
         let root = session.config.workspace_root.clone();
@@ -1642,17 +2234,67 @@ impl App {
         self.follow = true;
         self.scroll = 0;
         self.running = true;
-        self.undo_handle =
-            Some(tokio::task::spawn_blocking(
-                move || match grokforge_git::Git::discover(&root) {
-                    Some(git) => match git.undo_last(id) {
-                        Ok(Some(msg)) => Entry::Git(format!("undo: {msg}")),
-                        Ok(None) => Entry::Info("nothing to undo for this session".to_string()),
-                        Err(error) => Entry::Error(format!("undo failed: {error}")),
-                    },
-                    None => Entry::Info("not a git repository".to_string()),
+        self.undo_handle = Some(tokio::task::spawn_blocking(move || {
+            let entry = match grokforge_git::Git::discover(&root) {
+                Some(git) => match git.undo_last(id) {
+                    Ok(Some(msg)) => Entry::Git(format!("undo: {msg}")),
+                    Ok(None) => Entry::Info("nothing to undo for this session".to_string()),
+                    Err(error) => Entry::Error(format!("undo failed: {error}")),
                 },
+                None => Entry::Info("not a git repository".to_string()),
+            };
+            JournalCommandOutcome {
+                entry,
+                foreground_cursor: None,
+            }
+        }));
+    }
+
+    /// Reapply the next safely undone foreground change.
+    fn redo(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        if !session.config.isolated_worktree && !FOREGROUND_JOURNAL_ENABLED {
+            self.push_entry(Entry::Info(
+                "foreground redo is disabled with foreground undo until per-file ownership can be proven"
+                    .to_string(),
             ));
+            return;
+        }
+        if session.config.isolated_worktree {
+            self.push_entry(Entry::Info(
+                "redo is available for foreground journals; isolated-worktree commit redo is not available"
+                    .to_string(),
+            ));
+            return;
+        }
+        let index = self.foreground_journal_cursor;
+        let Some(journal) = self.foreground_journals.get(index).cloned() else {
+            self.push_entry(Entry::Info(
+                "nothing to redo for this foreground session".to_string(),
+            ));
+            return;
+        };
+        self.follow = true;
+        self.scroll = 0;
+        self.running = true;
+        self.undo_handle = Some(tokio::task::spawn_blocking(move || {
+            let result = journal
+                .lock()
+                .map_err(|_| "foreground journal lock was poisoned".to_string())
+                .and_then(|mut journal| journal.redo().map_err(|error| error.to_string()));
+            match result {
+                Ok(()) => JournalCommandOutcome {
+                    entry: Entry::Git("redo: reapplied the agent turn".to_string()),
+                    foreground_cursor: Some(index + 1),
+                },
+                Err(error) => JournalCommandOutcome {
+                    entry: Entry::Error(format!("redo refused: {error}")),
+                    foreground_cursor: None,
+                },
+            }
+        }));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1725,15 +2367,13 @@ impl App {
                 });
             }
             EventMsg::LedgerAppended(entry) => {
-                self.ledger_sources = self.ledger_sources.saturating_add(1);
-                self.ledger_bytes = self.ledger_bytes.saturating_add(entry.bytes);
-                self.ledger_redactions = self.ledger_redactions.saturating_add(entry.redactions);
                 if entry.redactions > 0 {
                     self.push_entry(Entry::Info(format!(
                         "privacy · {} secret(s) redacted from {}",
                         entry.redactions, entry.source
                     )));
                 }
+                self.record_ledger_entry(entry);
             }
             EventMsg::TokenUsage { usage } => {
                 self.usage.add(usage);
@@ -1787,6 +2427,8 @@ impl App {
             | EventMsg::TurnStarted { .. }
             | EventMsg::ToolOutputDelta { .. }
             | EventMsg::ApprovalRequested(_)
+            | EventMsg::QuestionRequested(_)
+            | EventMsg::QuestionResolved { .. }
             | EventMsg::ShutdownComplete => {}
         }
     }
@@ -1834,9 +2476,7 @@ impl App {
                 }
             }
             EventMsg::LedgerAppended(entry) => {
-                self.ledger_sources = self.ledger_sources.saturating_add(1);
-                self.ledger_bytes = self.ledger_bytes.saturating_add(entry.bytes);
-                self.ledger_redactions = self.ledger_redactions.saturating_add(entry.redactions);
+                self.record_ledger_entry(entry.clone());
             }
             _ => {}
         }
@@ -1862,6 +2502,19 @@ impl App {
             Ok(outcome) => {
                 self.session = Some(outcome.session);
                 self.rollout = outcome.rollout;
+                match outcome.foreground_journal {
+                    Ok(Some(journal)) => {
+                        self.foreground_journals
+                            .truncate(self.foreground_journal_cursor);
+                        self.foreground_journals.push(Arc::new(Mutex::new(journal)));
+                        self.foreground_journal_cursor = self.foreground_journals.len();
+                    }
+                    Ok(None) => {}
+                    Err(message) => self.push_entry(Entry::Info(message)),
+                }
+                if let Some(message) = outcome.metadata_warning {
+                    self.push_entry(Entry::Info(message));
+                }
                 if let Some(message) = outcome.panic {
                     self.push_entry(Entry::Error(format!(
                         "turn task panicked: {message}; session closed so recovery can repair any interrupted tool call"
@@ -1889,11 +2542,16 @@ impl App {
         self.finish_quit_if_quiescent();
     }
 
-    fn finish_undo(&mut self, result: Result<Entry, tokio::task::JoinError>) {
+    fn finish_undo(&mut self, result: Result<JournalCommandOutcome, tokio::task::JoinError>) {
         self.undo_handle.take();
         self.running = false;
         match result {
-            Ok(entry) => self.push_entry(entry),
+            Ok(outcome) => {
+                if let Some(cursor) = outcome.foreground_cursor {
+                    self.foreground_journal_cursor = cursor;
+                }
+                self.push_entry(outcome.entry);
+            }
             Err(error) => self.push_entry(Entry::Error(format!("undo task failed: {error}"))),
         }
         self.finish_quit_if_quiescent();
@@ -2014,6 +2672,8 @@ impl App {
 
         if let (Some(pending), Some(detail)) = (&self.pending, &self.approval_detail) {
             render_approval_modal(area, f, pending, detail);
+        } else if let Some(dialog) = &self.question_dialog {
+            render_question_modal(area, f, dialog);
         }
         apply_display_fallback(f, area, self.display_mode);
     }
@@ -2137,6 +2797,8 @@ impl App {
         let spin = self.working_spinner();
         if self.pending.is_some() {
             ("● APPROVAL".to_string(), WARNING)
+        } else if self.question_dialog.is_some() {
+            ("◆ YOUR CALL".to_string(), ACCENT_SOFT)
         } else if let Some(attempt) = self.stream_retry {
             (format!("↻ RETRY {attempt}"), WARNING)
         } else if let Some(tool) = &self.active_tool {
@@ -2156,6 +2818,11 @@ impl App {
         let spin = self.working_spinner();
         if self.pending.is_some() {
             Some(("● approval needed — respond above".to_string(), WARNING))
+        } else if self.question_dialog.is_some() {
+            Some((
+                "◆ Grok needs your direction — choose above".to_string(),
+                ACCENT_SOFT,
+            ))
         } else if let Some(attempt) = self.stream_retry {
             Some((format!("↻ retrying (attempt {attempt})…"), WARNING))
         } else if let Some(tool) = &self.active_tool {
@@ -2722,7 +3389,7 @@ impl App {
             })
             .collect::<Vec<_>>();
         if show_toolbox {
-            lines.push(slash_toolbox_line(inner_width));
+            lines.push(slash_toolbox_line(inner_width, &self.local_tools));
         }
 
         f.render_widget(Clear, palette_area);
@@ -2777,8 +3444,8 @@ async fn wait_for_turn(
 }
 
 async fn wait_for_undo(
-    handle: &mut Option<JoinHandle<Entry>>,
-) -> Result<Entry, tokio::task::JoinError> {
+    handle: &mut Option<JoinHandle<JournalCommandOutcome>>,
+) -> Result<JournalCommandOutcome, tokio::task::JoinError> {
     match handle {
         Some(handle) => handle.await,
         None => std::future::pending().await,
@@ -2946,6 +3613,14 @@ fn append_bounded(target: &mut String, delta: &str, cap: usize) {
     }
     target.push_str(&delta[..end]);
     target.push_str("\n… [streaming display truncated; final value is retained in rollout] …");
+}
+
+fn append_up_to_bytes(target: &mut String, value: &str, limit: usize) {
+    let mut used = 0usize;
+    target.extend(value.chars().take_while(|character| {
+        used = used.saturating_add(character.len_utf8());
+        used <= limit
+    }));
 }
 
 fn entry_from_history(item: &ResponseItem) -> Option<Entry> {
@@ -3841,13 +4516,28 @@ fn slash_palette_line(
     Line::from(spans).style(Style::default().bg(if chosen { SURFACE_RAISED } else { SURFACE }))
 }
 
-fn slash_toolbox_line(width: usize) -> Line<'static> {
-    let tools = if width >= 74 {
-        "read · write · edit · list · glob · grep · shell · git · task"
-    } else if width >= 48 {
-        "read · edit · search · shell · git · task"
+fn slash_toolbox_line(width: usize, specs: &[ToolSpec]) -> Line<'static> {
+    const PREFIX_WIDTH: usize = 15;
+    let available = width.saturating_sub(PREFIX_WIDTH);
+    let tools = if available < 16 {
+        "open /tools".to_string()
     } else {
-        "open /tools"
+        let labels = compact_tool_labels(specs);
+        let mut tools = format!("{} loaded", specs.len());
+        let mut truncated = false;
+        for label in labels {
+            let candidate = format!("{tools} · {label}");
+            if candidate.chars().count() <= available {
+                tools = candidate;
+            } else {
+                truncated = true;
+                break;
+            }
+        }
+        if truncated && tools.chars().count().saturating_add(2) <= available {
+            tools.push_str(" …");
+        }
+        tools
     };
     Line::from(vec![
         Span::styled(
@@ -3857,6 +4547,44 @@ fn slash_toolbox_line(width: usize) -> Line<'static> {
         Span::styled(tools, Style::default().fg(MUTED)),
     ])
     .style(Style::default().bg(SURFACE))
+}
+
+/// Friendly labels for the one-line deck, but only for tools that really exist in the registry.
+/// Unknown custom and MCP tools remain visible under their registered names.
+fn compact_tool_labels(specs: &[ToolSpec]) -> Vec<String> {
+    const KNOWN: &[(&str, &str)] = &[
+        ("read_file", "read"),
+        ("write_file", "write"),
+        ("edit", "edit"),
+        ("apply_patch", "patch"),
+        ("list", "list"),
+        ("glob", "glob"),
+        ("grep", "grep"),
+        ("shell", "shell"),
+        ("git_status", "git status"),
+        ("git_diff", "git diff"),
+        ("repo_map", "map"),
+        ("lsp_diagnostics", "diagnostics"),
+        ("lsp_query", "LSP"),
+        ("format_file", "format"),
+        ("update_plan", "update plan"),
+        ("read_plan", "read plan"),
+        ("remember", "memory"),
+        ("ask_user", "ask"),
+        ("spawn_task", "task"),
+    ];
+    let mut labels = KNOWN
+        .iter()
+        .filter(|(name, _)| specs.iter().any(|spec| spec.name == *name))
+        .map(|(_, label)| (*label).to_string())
+        .collect::<Vec<_>>();
+    labels.extend(
+        specs
+            .iter()
+            .filter(|spec| !KNOWN.iter().any(|(name, _)| spec.name == *name))
+            .map(|spec| spec.name.clone()),
+    );
+    labels
 }
 
 fn humanize_tool_call(name: &str, arguments: &str) -> String {
@@ -3873,6 +4601,7 @@ fn humanize_tool_call(name: &str, arguments: &str) -> String {
         "read_file" => format!("read  {}", path()),
         "write_file" => format!("write  {}", path()),
         "edit" => format!("edit  {}", path()),
+        "apply_patch" => format!("patch  {}", path()),
         "list" => format!("list  {}", path()),
         "glob" => format!(
             "glob  {}",
@@ -3900,6 +4629,29 @@ fn humanize_tool_call(name: &str, arguments: &str) -> String {
             "agent  {}",
             arg("prompt").unwrap_or_else(|| "isolated subtask".to_string())
         ),
+        "repo_map" => format!(
+            "map  {}",
+            arg("query").map_or_else(|| "repository".to_string(), |query| format!("for {query}"))
+        ),
+        "lsp_diagnostics" => format!("LSP  diagnostics · {}", path()),
+        "format_file" => format!("format  {}", path()),
+        "update_plan" => {
+            let count = parsed
+                .as_ref()
+                .and_then(|value| value.get("plan"))
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            format!("plan  update · {count} step(s)")
+        }
+        "read_plan" => "plan  read".to_string(),
+        "ask_user" => {
+            let count = parsed
+                .as_ref()
+                .and_then(|value| value.get("questions"))
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            format!("ask  {count} question(s)")
+        }
         _ => {
             let name = compact_preview(name, 64);
             let arguments = compact_preview(arguments, 360);
@@ -3931,6 +4683,42 @@ fn compact_bytes(value: usize) -> String {
     } else {
         format!("{value}B")
     }
+}
+
+fn effort_label(effort: Option<Effort>) -> &'static str {
+    match effort {
+        None => "auto",
+        Some(Effort::Low) => "low",
+        Some(Effort::Medium) => "medium",
+        Some(Effort::High) => "high",
+        Some(Effort::Xhigh) => "xhigh",
+    }
+}
+
+fn sandbox_mode_label(mode: SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::ReadOnly => "read-only",
+        SandboxMode::WorkspaceWrite => "workspace-write",
+        SandboxMode::DangerFullAccess => "danger-full-access",
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn ctx_percent(used: u64, window: u64) -> u64 {
+    if window == 0 {
+        return 0;
+    }
+    u64::try_from(
+        u128::from(used)
+            .saturating_mul(100)
+            .checked_div(u128::from(window))
+            .unwrap_or(0)
+            .min(100),
+    )
+    .unwrap_or(100)
 }
 
 fn compact_scaled(value: u64, unit: u64, suffix: &str) -> String {
@@ -4004,6 +4792,186 @@ fn composer_tail(value: &str, max_width: usize) -> String {
     }
     reversed.reverse();
     format!("…{}", reversed.into_iter().collect::<String>())
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_question_modal(area: Rect, f: &mut ratatui::Frame, dialog: &QuestionDialog) {
+    let modal = approval_sheet_rect(area);
+    let backdrop = Rect::new(area.x, modal.y, area.width, modal.height);
+    f.render_widget(Clear, backdrop);
+    f.render_widget(
+        Block::default().style(Style::default().bg(CANVAS).fg(TEXT)),
+        backdrop,
+    );
+    f.render_widget(Clear, modal);
+
+    let request = &dialog.pending.request;
+    let Some(question) = request.questions.get(dialog.current) else {
+        f.render_widget(
+            Paragraph::new("Invalid question request · Esc cancel")
+                .style(Style::default().fg(DANGER).bg(SURFACE)),
+            modal,
+        );
+        return;
+    };
+    let title = format!(
+        " ◆ YOUR CALL  ·  {}/{}  ·  {} ",
+        dialog.current + 1,
+        request.questions.len(),
+        safe_terminal_line(&question.header)
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(ACCENT_SOFT)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(SURFACE).fg(TEXT));
+    let inner = horizontal_inset(block.inner(modal), u16::from(modal.width >= 12));
+    f.render_widget(block, modal);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if inner.height <= 2 {
+        f.render_widget(
+            Paragraph::new("↑↓ choose · Enter select · Esc cancel")
+                .style(Style::default().fg(MUTED)),
+            inner,
+        );
+        return;
+    }
+
+    let controls_height = if inner.height >= 8 { 2 } else { 1 };
+    let prompt_height = if inner.height >= 12 { 4 } else { 2 };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(prompt_height),
+            Constraint::Min(1),
+            Constraint::Length(controls_height),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                safe_terminal_text(&question.prompt),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "Choose one. GrokForge will return only this answer to the model.",
+                Style::default().fg(MUTED),
+            )),
+        ])
+        .wrap(Wrap { trim: true }),
+        chunks[0],
+    );
+
+    let mut choices = Vec::new();
+    for (index, option) in question.options.iter().enumerate() {
+        let selected = dialog.selection == index;
+        let marker = if selected { "◆" } else { "◇" };
+        let style = if selected {
+            Style::default()
+                .fg(CANVAS)
+                .bg(ACCENT_SOFT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        choices.push(Line::from(vec![
+            Span::styled(format!(" {} {}  ", index + 1, marker), style),
+            Span::styled(safe_terminal_line(&option.label), style),
+            Span::styled(
+                if option.description.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ·  {}", safe_terminal_line(&option.description))
+                },
+                if selected {
+                    style
+                } else {
+                    Style::default().fg(MUTED)
+                },
+            ),
+        ]));
+    }
+    if question.allow_custom {
+        let index = question.options.len();
+        let selected = dialog.selection == index;
+        let style = if selected {
+            Style::default()
+                .fg(CANVAS)
+                .bg(TOOL)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TOOL)
+        };
+        let content = if dialog.editing_custom {
+            format!("{}█", safe_terminal_line(&dialog.custom_input))
+        } else if dialog.custom_input.is_empty() {
+            "Type a different answer".to_string()
+        } else {
+            safe_terminal_line(&dialog.custom_input)
+        };
+        choices.push(Line::from(vec![
+            Span::styled(
+                format!(" {} {}  ", index + 1, if selected { "◆" } else { "◇" }),
+                style,
+            ),
+            Span::styled("Custom", style),
+            Span::styled(format!("  ·  {content}"), style),
+        ]));
+    }
+    f.render_widget(
+        Paragraph::new(choices)
+            .style(Style::default().bg(SURFACE_RAISED))
+            .wrap(Wrap { trim: true }),
+        chunks[1],
+    );
+
+    let controls = if dialog.editing_custom {
+        vec![
+            Line::from(vec![
+                Span::styled(" Enter ", Style::default().fg(CANVAS).bg(SUCCESS)),
+                Span::styled(" submit answer   ", Style::default().fg(MUTED)),
+                Span::styled(" Esc ", Style::default().fg(CANVAS).bg(BORDER)),
+                Span::styled(" back to choices", Style::default().fg(MUTED)),
+            ]),
+            Line::from(Span::styled(
+                format!(
+                    "{} / {} bytes",
+                    dialog.custom_input.len(),
+                    grokforge_core::questions::MAX_CUSTOM_ANSWER_BYTES
+                ),
+                Style::default().fg(FAINT),
+            )),
+        ]
+    } else {
+        vec![
+            Line::from(vec![
+                Span::styled(" ↑↓ ", Style::default().fg(CANVAS).bg(BORDER)),
+                Span::styled(" choose   ", Style::default().fg(MUTED)),
+                Span::styled(" 1-5 / Enter ", Style::default().fg(CANVAS).bg(SUCCESS)),
+                Span::styled(" select   ", Style::default().fg(MUTED)),
+                Span::styled(" Esc ", Style::default().fg(CANVAS).bg(DANGER)),
+                Span::styled(" dismiss", Style::default().fg(MUTED)),
+            ]),
+            Line::from(Span::styled(
+                if dialog.current > 0 {
+                    "← previous question · answers submit together after the final choice"
+                } else {
+                    "Answers submit together after the final choice"
+                },
+                Style::default().fg(FAINT),
+            )),
+        ]
+    };
+    f.render_widget(Paragraph::new(controls), chunks[2]);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4313,7 +5281,10 @@ mod tests {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use futures::FutureExt as _;
     use grokforge_core::{Agent, Session, SessionConfig, ToolRegistry};
-    use grokforge_protocol::{Decision, DenialClass, EventMsg, LedgerEntry, ResponseItem, Usage};
+    use grokforge_protocol::{
+        Decision, DenialClass, EventMsg, LedgerEntry, QuestionId, QuestionOption, QuestionRequest,
+        QuestionResponse, ResponseItem, ToolCallId, Usage, UserQuestion,
+    };
     use grokforge_sandbox::PassthroughRunner;
     use grokforge_xai::{Effort, ModelInfo, XaiClient};
     // `ServerTool` is only exercised by the Unix-gated project-capabilities test.
@@ -4331,9 +5302,34 @@ mod tests {
         format_at_mention,
     };
     use crate::approver::ChannelApprover;
+    use crate::questioner::PendingQuestion;
 
     fn test_app() -> App {
         test_app_with_history(Vec::new())
+    }
+
+    fn question_request(label: &str, question_count: usize, allow_custom: bool) -> QuestionRequest {
+        QuestionRequest {
+            id: QuestionId::new(),
+            call_id: ToolCallId::new(),
+            questions: (0..question_count)
+                .map(|index| UserQuestion {
+                    header: format!("{label} {index}"),
+                    prompt: format!("Choose for {label} question {index}?"),
+                    options: vec![
+                        QuestionOption {
+                            label: "Alpha".into(),
+                            description: "Conservative choice".into(),
+                        },
+                        QuestionOption {
+                            label: "Beta".into(),
+                            description: "Ambitious choice".into(),
+                        },
+                    ],
+                    allow_custom,
+                })
+                .collect(),
+        }
     }
 
     #[test]
@@ -4876,16 +5872,39 @@ mod tests {
     }
 
     #[test]
-    fn foreground_undo_is_honest_instead_of_spawning_a_noop_git_task() {
+    fn foreground_undo_fails_closed_until_mutation_ownership_is_provable() {
         let mut app = test_app();
 
         app.handle_slash("undo");
 
         assert!(!app.running);
         assert!(app.undo_handle.is_none());
-        assert!(app.transcript.iter().any(
-            |entry| matches!(entry, Entry::Info(text) if text.contains("foreground undo is not available"))
-        ));
+        assert!(
+            app.transcript.iter().any(
+                |entry| matches!(entry, Entry::Info(text) if text.contains("foreground undo is disabled"))
+            )
+        );
+    }
+
+    #[test]
+    fn undo_is_advertised_only_for_an_attributable_isolated_worktree() {
+        let mut app = test_app();
+        assert!(
+            app.slash_palette_items()
+                .iter()
+                .all(|item| item.completion != "/undo")
+        );
+
+        app.session
+            .as_mut()
+            .expect("session")
+            .config
+            .isolated_worktree = true;
+        assert!(
+            app.slash_palette_items()
+                .iter()
+                .any(|item| item.completion == "/undo")
+        );
     }
 
     #[cfg(unix)] // discovery uses the Unix-only confined reader
@@ -4919,6 +5938,71 @@ mod tests {
         assert!(filtered.contains("Project · Review the current diff carefully."));
         assert!(!filtered.contains("Command map and keyboard shortcuts"));
         assert!(!filtered.contains("second line"));
+    }
+
+    #[tokio::test]
+    async fn plan_warns_when_trusted_mcp_processes_are_already_active() {
+        let mut app = test_app();
+        app.set_trusted_project_mcp_active(true);
+        let plan = app
+            .slash_palette_items()
+            .into_iter()
+            .find(|item| item.completion == "/plan")
+            .expect("plan command");
+        assert!(plan.description.contains("MCP processes remain active"));
+
+        app.handle_slash("plan inspect the change");
+        assert!(app.transcript.iter().any(|entry| {
+            matches!(
+                entry,
+                Entry::Info(message)
+                    if message.contains("trusted project MCP processes")
+                        && message.contains("independent side effects")
+            )
+        }));
+
+        if let Some(cancellation) = &app.turn_cancellation {
+            cancellation.cancel();
+        }
+        if let Some(handle) = app.turn_handle.take() {
+            handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn first_interactive_turn_fills_the_session_discovery_label() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let mut app = test_app_in(workspace.path().to_path_buf(), Vec::new());
+        let session = app.session.as_ref().expect("session");
+        let session_id = session.id;
+        grokforge_core::SessionMeta::new(
+            session_id,
+            workspace.path().to_path_buf(),
+            session.config.model.clone(),
+            "",
+        )
+        .write(sessions.path(), session_id)
+        .await
+        .expect("metadata");
+        app.rollout = Some(
+            grokforge_core::RolloutWriter::create(sessions.path(), session_id)
+                .await
+                .expect("rollout"),
+        );
+
+        let leaked = "xai-ABCDEF0123456789XYZ";
+        app.start_turn(format!("inspect persistence {leaked}"), false);
+        let result = super::wait_for_turn(&mut app.turn_handle).await;
+        app.finish_turn(result);
+
+        let saved = grokforge_core::SessionMeta::list(sessions.path())
+            .await
+            .pop()
+            .expect("saved metadata");
+        assert!(saved.first_prompt.contains("inspect persistence"));
+        assert!(!saved.first_prompt.contains(leaked));
+        assert!(saved.first_prompt.contains("[REDACTED:xai-key]"));
     }
 
     #[cfg(unix)] // discovery uses the Unix-only confined reader
@@ -4990,8 +6074,11 @@ mod tests {
         app.handle_slash("tools");
         let frame = buffer_frame(&app, 100, 32);
         assert!(frame.contains("LOCAL CAPABILITIES"), "{frame}");
-        assert!(frame.contains("read · write · edit · list · glob · grep · shell"));
-        assert!(frame.contains("git status · git diff · spawn task"));
+        assert!(frame.contains("apply_patch"), "{frame}");
+        assert!(frame.contains("lsp_query"), "{frame}");
+        assert!(frame.contains("repo_map"), "{frame}");
+        assert!(frame.contains("ask_user"), "{frame}");
+        assert!(frame.contains("update_plan"), "{frame}");
         assert!(frame.contains("xAI-HOSTED TOOLS"));
     }
 
@@ -5044,6 +6131,12 @@ mod tests {
         );
         assert_eq!(write, "write  src/lib.rs");
         assert!(!write.contains("private payload"));
+        let patch = super::humanize_tool_call(
+            "apply_patch",
+            "{\"path\":\"src/lib.rs\",\"patch\":\"private diff payload\"}",
+        );
+        assert_eq!(patch, "patch  src/lib.rs");
+        assert!(!patch.contains("private diff payload"));
         assert_eq!(
             super::humanize_tool_call("list", "{\"path\":\"crates\"}"),
             "list  crates"
@@ -5059,6 +6152,17 @@ mod tests {
         assert_eq!(
             super::humanize_tool_call("git_diff", "{\"staged\":true}"),
             "git  diff · staged"
+        );
+        assert_eq!(
+            super::humanize_tool_call(
+                "update_plan",
+                "{\"plan\":[{\"step\":\"one\",\"status\":\"in_progress\"}]}"
+            ),
+            "plan  update · 1 step(s)"
+        );
+        assert_eq!(
+            super::humanize_tool_call("repo_map", "{\"query\":\"billing\"}"),
+            "map  for billing"
         );
     }
 
@@ -5151,6 +6255,174 @@ mod tests {
         assert!(frame.contains("↑1/2KB/1r"));
         assert!(frame.contains("secret(s) redacted"));
         assert!(!frame.contains("{\"command\""));
+
+        app.handle_slash("ledger");
+        app.handle_slash("status");
+        let inspect = buffer_frame(&app, 168, 48);
+        assert!(inspect.contains("CONTEXT LEDGER"), "{inspect}");
+        assert!(inspect.contains("src/retry.rs"), "{inspect}");
+        assert!(inspect.contains("tool read"), "{inspect}");
+        assert!(
+            inspect.contains("model-request (and remote MCP JSON-RPC) ledger"),
+            "{inspect}"
+        );
+        assert!(inspect.contains("stdio MCP process egress"), "{inspect}");
+        assert!(inspect.contains("SESSION · grok-build-0.1"), "{inspect}");
+        let infos: Vec<&str> = app
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Info(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            infos
+                .iter()
+                .any(|text| text.contains("CONTEXT LEDGER · 1 source(s) · 2KB · 1 redaction(s)"))
+        );
+        assert!(infos.contains(&"src/retry.rs · 2KB · tool read · 1 redaction(s)"));
+        assert!(infos.iter().any(|text| {
+            text.contains("SESSION · grok-build-0.1")
+                && text.contains("preset auto")
+                && text.contains("sandbox workspace-write")
+                && text.contains("ledger 1 source(s) / 2KB / 1 redaction(s)")
+                && text.contains("isolated-worktree no")
+                && text.contains("trusted MCP no")
+        }));
+    }
+
+    #[test]
+    fn ledger_command_caps_retained_rows_without_rewriting_totals() {
+        let mut app = test_app();
+        for index in 0..130 {
+            app.on_agent_event(EventMsg::LedgerAppended(LedgerEntry::new(
+                format!("src/{index}.rs"),
+                10,
+                "auto-context",
+            )));
+        }
+        assert_eq!(app.ledger_sources, 130);
+        assert_eq!(app.ledger_bytes, 1_300);
+        assert_eq!(app.session_ledger.len(), 128);
+
+        app.handle_slash("ledger");
+        let infos: Vec<&str> = app
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Info(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            infos
+                .iter()
+                .any(|text| text.contains("130 source(s)") && text.contains("last 128 retained"))
+        );
+        assert!(
+            infos
+                .iter()
+                .any(|text| text.contains("showing last 24 of 128 retained"))
+        );
+        assert!(infos.contains(&"src/129.rs · 10B · auto-context · 0 redaction(s)"));
+        assert!(infos.contains(&"src/106.rs · 10B · auto-context · 0 redaction(s)"));
+        assert!(infos.iter().all(|text| !text.contains("src/0.rs")));
+        assert!(infos.iter().all(|text| !text.contains("src/105.rs")));
+        assert!(
+            infos
+                .iter()
+                .any(|text| text.contains(super::LEDGER_SCOPE_NOTE))
+        );
+    }
+
+    #[test]
+    fn status_command_uses_session_fields_without_inventing_cost() {
+        let mut app = test_app();
+        let session_id = app.session.as_ref().expect("session").id.to_string();
+        app.session.as_mut().expect("session").config.effort = Some(Effort::High);
+        app.session
+            .as_mut()
+            .expect("session")
+            .config
+            .isolated_worktree = true;
+        app.session
+            .as_mut()
+            .expect("session")
+            .config
+            .context_window_tokens = Some(256_000);
+        app.set_trusted_project_mcp_active(true);
+        app.usage = Usage {
+            input_tokens: 80_000,
+            cached_tokens: 40_000,
+            output_tokens: 200,
+            reasoning_tokens: 80,
+        };
+
+        app.handle_slash("status");
+        let frame = buffer_frame(&app, 160, 32);
+        assert!(frame.contains("SESSION · grok-build-0.1"), "{frame}");
+        assert!(frame.contains("effort high"), "{frame}");
+        assert!(frame.contains("preset auto"), "{frame}");
+        assert!(frame.contains("sandbox workspace-write"), "{frame}");
+        assert!(frame.contains(&session_id), "{frame}");
+        assert!(frame.contains("tok 80k"), "{frame}");
+        assert!(frame.contains("cache 50%"), "{frame}");
+        assert!(frame.contains("ctx 31% (80k/256k)"), "{frame}");
+        assert!(frame.contains("isolated-worktree yes"), "{frame}");
+        assert!(frame.contains("trusted MCP yes"), "{frame}");
+        assert!(!frame.contains('$'), "{frame}");
+        assert!(!frame.contains("USD"), "{frame}");
+    }
+
+    #[test]
+    fn help_and_palette_advertise_ledger_and_status() {
+        let mut app = test_app();
+        let completions: Vec<String> = app
+            .slash_palette_items()
+            .into_iter()
+            .map(|item| item.completion)
+            .collect();
+        assert!(
+            completions.contains(&"/ledger".to_string()),
+            "{completions:?}"
+        );
+        assert!(
+            completions.contains(&"/status".to_string()),
+            "{completions:?}"
+        );
+
+        app.handle_slash("help");
+        assert!(app.transcript.iter().any(|entry| {
+            matches!(
+                entry,
+                Entry::Info(text) if text.contains("/ledger") && text.contains("/status")
+            )
+        }));
+    }
+
+    #[test]
+    fn subagent_ledger_appends_update_the_same_session_ring() {
+        let mut app = test_app();
+        app.on_agent_event(EventMsg::SubagentUpdate {
+            agent_id: "agent-1".to_string(),
+            inner: Box::new(EventMsg::LedgerAppended(LedgerEntry::new(
+                "crates/core.rs",
+                512,
+                "mention",
+            ))),
+        });
+        assert_eq!(app.ledger_sources, 1);
+        assert_eq!(app.ledger_bytes, 512);
+        app.handle_slash("ledger");
+        assert!(
+            app.transcript.iter().any(|entry| {
+                matches!(
+                    entry,
+                    Entry::Info(text) if text.contains("crates/core.rs · 512B · mention · 0 redaction(s)")
+                )
+            })
+        );
     }
 
     #[test]
@@ -5244,6 +6516,113 @@ mod tests {
         assert!(app.pending.is_none());
         assert!(app.approval_queue.is_empty());
         assert!(app.approval_detail.is_none());
+    }
+
+    #[test]
+    fn structured_question_modal_is_branded_responsive_and_terminal_safe() {
+        use tokio::sync::oneshot;
+
+        let mut app = test_app();
+        let (respond, _wait) = oneshot::channel();
+        let mut request = question_request("Scope", 1, true);
+        request.questions[0].header = "\u{1b}[2JScope\u{202e}".into();
+        request.questions[0].prompt = "Pick a direction\u{1b}[31m".into();
+        app.on_question_request(PendingQuestion { request, respond });
+
+        for (width, height) in [(32, 10), (80, 24), (140, 40)] {
+            let frame = buffer_frame(&app, width, height);
+            assert!(frame.contains("YOUR CALL"));
+            assert!(frame.contains("Alpha"));
+            assert!(!frame.contains('\u{1b}'));
+            assert!(!frame.contains('\u{202e}'));
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_question_flow_collects_choice_and_bounded_custom_answer() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        use tokio::sync::oneshot;
+
+        let mut app = test_app();
+        let (respond, wait) = oneshot::channel();
+        app.on_question_request(PendingQuestion {
+            request: question_request("Architecture", 2, true),
+            respond,
+        });
+
+        // Number shortcuts choose immediately and advance to the next question.
+        app.on_question_key(KeyEvent::from(KeyCode::Char('2')));
+        assert_eq!(
+            app.question_dialog.as_ref().map(|dialog| dialog.current),
+            Some(1)
+        );
+
+        // Move to Custom, enter edit mode, and paste text containing terminal controls.
+        app.on_question_key(KeyEvent::from(KeyCode::Down));
+        app.on_question_key(KeyEvent::from(KeyCode::Down));
+        app.on_question_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            app.question_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.editing_custom)
+        );
+        app.on_paste("Use a hybrid\u{1b}[2J approach\u{202e}");
+        app.on_question_key(KeyEvent::from(KeyCode::Enter));
+
+        let QuestionResponse::Answered { answers } = wait.await.expect("question response") else {
+            panic!("expected answered response")
+        };
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0].selected, Some(1));
+        assert_eq!(answers[1].selected, None);
+        let custom = answers[1].custom.as_deref().expect("custom answer");
+        assert!(custom.contains("Use a hybrid"));
+        assert!(!custom.contains('\u{1b}'));
+        assert!(!custom.contains('\u{202e}'));
+        assert!(app.question_dialog.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_questions_are_fifo_and_escape_cancels_only_the_visible_batch() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        use tokio::sync::oneshot;
+
+        let mut app = test_app();
+        let (first_respond, first_wait) = oneshot::channel();
+        let (second_respond, second_wait) = oneshot::channel();
+        app.on_question_request(PendingQuestion {
+            request: question_request("First", 1, false),
+            respond: first_respond,
+        });
+        app.on_question_request(PendingQuestion {
+            request: question_request("Second", 1, false),
+            respond: second_respond,
+        });
+        assert_eq!(app.question_queue.len(), 1);
+        assert_eq!(
+            app.question_dialog
+                .as_ref()
+                .map(|dialog| dialog.pending.request.questions[0].header.as_str()),
+            Some("First 0")
+        );
+
+        app.on_question_key(KeyEvent::from(KeyCode::Char('1')));
+        assert!(matches!(
+            first_wait.await.expect("first response"),
+            QuestionResponse::Answered { .. }
+        ));
+        assert_eq!(
+            app.question_dialog
+                .as_ref()
+                .map(|dialog| dialog.pending.request.questions[0].header.as_str()),
+            Some("Second 0")
+        );
+        app.on_question_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(
+            second_wait.await.expect("second response"),
+            QuestionResponse::Cancelled
+        );
+        assert!(app.question_dialog.is_none());
     }
 
     #[test]
@@ -5407,6 +6786,8 @@ mod tests {
                 session,
                 rollout: None,
                 panic: None,
+                foreground_journal: Ok(None),
+                metadata_warning: None,
             }
         }));
         app.on_agent_event(EventMsg::TurnComplete {
@@ -5426,6 +6807,8 @@ mod tests {
                 session,
                 rollout: None,
                 panic: None,
+                foreground_journal: Ok(None),
+                metadata_warning: None,
             }
         }));
         let result = super::wait_for_turn(&mut app.turn_handle).await;
@@ -5633,6 +7016,8 @@ mod tests {
                 session,
                 rollout: None,
                 panic: None,
+                foreground_journal: Ok(None),
+                metadata_warning: None,
             }
         }));
         app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -5703,5 +7088,43 @@ mod tests {
         assert!(app.pending.is_none());
         assert!(app.approval_queue.is_empty());
         assert!(app.approval_detail.is_none());
+    }
+
+    #[tokio::test]
+    async fn quitting_cancels_visible_queued_and_late_questions() {
+        use tokio::sync::oneshot;
+
+        let mut app = test_app();
+        let (first_respond, first_wait) = oneshot::channel();
+        let (second_respond, second_wait) = oneshot::channel();
+        app.on_question_request(PendingQuestion {
+            request: question_request("Visible", 1, false),
+            respond: first_respond,
+        });
+        app.on_question_request(PendingQuestion {
+            request: question_request("Queued", 1, false),
+            respond: second_respond,
+        });
+        app.request_quit();
+        assert_eq!(
+            first_wait.await.expect("visible response"),
+            QuestionResponse::Cancelled
+        );
+        assert_eq!(
+            second_wait.await.expect("queued response"),
+            QuestionResponse::Cancelled
+        );
+        assert!(app.question_dialog.is_none());
+        assert!(app.question_queue.is_empty());
+
+        let (late_respond, late_wait) = oneshot::channel();
+        app.on_question_request(PendingQuestion {
+            request: question_request("Late", 1, false),
+            respond: late_respond,
+        });
+        assert_eq!(
+            late_wait.await.expect("late response"),
+            QuestionResponse::Cancelled
+        );
     }
 }

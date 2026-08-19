@@ -9,33 +9,40 @@
 //! you enter the password to unlock. `XAI_API_KEY` in the environment still overrides everything
 //! (for CI), needing no password.
 
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Mutex, OnceLock};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use grokforge_xai::oauth::{self, OAuthTokens};
+use grokforge_mcp::oauth::{self as mcp_oauth, OAuthRecord};
+use grokforge_xai::oauth::{self as xai_oauth, OAuthTokens};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize as _, Zeroizing};
 
 const CREDENTIAL_FILE_VERSION: u8 = 1;
-const CREDENTIAL_FILE_MAX_BYTES: usize = 64 * 1024;
+const CREDENTIAL_FILE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const ARGON2_MEMORY_KIB: u32 = 19_456;
 const ARGON2_ITERATIONS: u32 = 2;
 const ARGON2_PARALLELISM: u32 = 1;
 const SHORT_PASSWORD_WARNING_CHARS: usize = 12;
+const MAX_MCP_OAUTH_RECORDS: usize = 16;
 
-/// Credentials held in the encrypted file. New writes keep exactly one login method active, and
-/// ambiguous legacy files containing both are rejected instead of guessing which one to bill.
+/// Credentials held in the encrypted file. New writes keep exactly one xAI login method active;
+/// independently bound MCP OAuth records coexist in the same encrypted payload. Ambiguous legacy
+/// xAI files containing both login methods are rejected instead of guessing which one to bill.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StoredCreds {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     oauth: Option<OAuthTokens>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    mcp_oauth: BTreeMap<String, OAuthRecord>,
 }
 
 impl StoredCreds {
@@ -56,8 +63,46 @@ impl StoredCreds {
                     .to_string(),
             );
         }
+        if self.mcp_oauth.len() > MAX_MCP_OAUTH_RECORDS {
+            return Err(format!(
+                "credentials file contains more than {MAX_MCP_OAUTH_RECORDS} MCP OAuth records"
+            ));
+        }
+        for name in self.mcp_oauth.keys() {
+            if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+                return Err("credentials file contains an invalid MCP OAuth server name".into());
+            }
+        }
         Ok(())
     }
+}
+
+#[derive(Clone)]
+struct UnlockedCredentials {
+    path: PathBuf,
+    password: Zeroizing<String>,
+    creds: StoredCreds,
+}
+
+static UNLOCKED_CREDENTIALS: OnceLock<Mutex<Option<UnlockedCredentials>>> = OnceLock::new();
+
+fn remember_unlocked(path: &Path, password: &str, creds: &StoredCreds) {
+    let unlocked = UnlockedCredentials {
+        path: path.to_path_buf(),
+        password: Zeroizing::new(password.to_string()),
+        creds: creds.clone(),
+    };
+    if let Ok(mut cache) = UNLOCKED_CREDENTIALS.get_or_init(|| Mutex::new(None)).lock() {
+        *cache = Some(unlocked);
+    }
+}
+
+fn recalled_unlocked(path: &Path) -> Option<UnlockedCredentials> {
+    UNLOCKED_CREDENTIALS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|cache| cache.as_ref().filter(|value| value.path == path).cloned())
 }
 
 /// The on-disk envelope: salt + nonce + ciphertext, all base64.
@@ -177,6 +222,11 @@ fn save_to(path: &Path, password: &str, creds: &StoredCreds) -> Result<(), Strin
         create_private_dir(dir)?;
     }
     let json = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
+    if json.len() > CREDENTIAL_FILE_MAX_BYTES {
+        return Err(format!(
+            "encrypted credentials exceed the {CREDENTIAL_FILE_MAX_BYTES}-byte safety limit"
+        ));
+    }
 
     #[cfg(unix)]
     {
@@ -371,14 +421,16 @@ pub async fn resolve(allow_prompt: bool) -> Option<String> {
             return None;
         }
         let password = prompt_password("Enter your GrokForge password: ")?;
-        let creds = match load_from(&path, &password) {
+        let mut creds = match load_from(&path, &password) {
             Ok(creds) => creds,
             Err(e) => {
                 eprintln!("{e}");
                 return None;
             }
         };
-        return bearer_from(&path, creds, &password).await;
+        let bearer = bearer_from(&path, &mut creds, &password).await;
+        remember_unlocked(&path, &password, &creds);
+        return bearer;
     }
 
     if allow_prompt && std::io::stdin().is_terminal() {
@@ -412,7 +464,7 @@ async fn onboard(path: &std::path::Path) -> Option<String> {
         key
     } else {
         eprintln!("Note: subscription API access currently requires the SuperGrok Heavy tier.\n");
-        match oauth::login().await {
+        match xai_oauth::login().await {
             Ok(tokens) => {
                 let access = tokens.access_token.clone();
                 creds.use_oauth(tokens);
@@ -429,10 +481,13 @@ async fn onboard(path: &std::path::Path) -> Option<String> {
     };
 
     match save_to(path, &password, &creds) {
-        Ok(()) => eprintln!(
-            "✓ credentials encrypted and saved to {}",
-            terminal_path(path)
-        ),
+        Ok(()) => {
+            remember_unlocked(path, &password, &creds);
+            eprintln!(
+                "✓ credentials encrypted and saved to {}",
+                terminal_path(path)
+            );
+        }
         Err(e) => {
             eprintln!("warning: couldn't save credentials ({e}); using for this session only");
         }
@@ -444,7 +499,7 @@ async fn onboard(path: &std::path::Path) -> Option<String> {
 /// re-saving with the same password) when needed.
 async fn bearer_from(
     path: &std::path::Path,
-    mut creds: StoredCreds,
+    creds: &mut StoredCreds,
     password: &str,
 ) -> Option<String> {
     if let Some(key) = &creds.api_key
@@ -457,14 +512,14 @@ async fn bearer_from(
             return Some(tokens.access_token);
         }
         if let Some(refresh) = tokens.refresh_token.clone()
-            && let Ok(mut fresh) = oauth::refresh(&refresh).await
+            && let Ok(mut fresh) = xai_oauth::refresh(&refresh).await
         {
             if fresh.refresh_token.is_none() {
                 fresh.refresh_token = Some(refresh);
             }
             let access = fresh.access_token.clone();
             creds.oauth = Some(fresh);
-            if let Err(error) = save_to(path, password, &creds) {
+            if let Err(error) = save_to(path, password, creds) {
                 eprintln!(
                     "warning: refreshed the subscription session but could not update {} ({error})",
                     terminal_path(path)
@@ -549,7 +604,7 @@ pub async fn login_subscription() -> ExitCode {
         "\nNote: xAI currently limits subscription (OAuth) API access to the SuperGrok Heavy tier."
     );
     eprintln!("Standard SuperGrok / X Premium+ may be refused with a 403 until xAI lifts that.\n");
-    match oauth::login().await {
+    match xai_oauth::login().await {
         Ok(tokens) => {
             creds.use_oauth(tokens);
             match save_to(&path, &password, &creds) {
@@ -573,6 +628,170 @@ pub async fn login_subscription() -> ExitCode {
     }
 }
 
+/// Resolve OAuth Bearer tokens for trusted remote MCP servers. The already-unlocked credential
+/// payload is reused when xAI credentials came from the same file, so startup asks for the
+/// password at most once. Expired tokens are rediscovered, binding-checked, refreshed, and sealed
+/// back into the same file before use.
+pub async fn mcp_access_tokens(workspace: &Path) -> BTreeMap<String, String> {
+    let clients = match grokforge_core::mcp_config::oauth_client_configs(workspace).await {
+        Ok(clients) => clients,
+        Err(error) => {
+            eprintln!(
+                "MCP OAuth configuration error: {}",
+                crate::sanitize_terminal(&error)
+            );
+            return BTreeMap::new();
+        }
+    };
+    if clients.is_empty() {
+        return BTreeMap::new();
+    }
+    let path = match creds_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("cannot locate MCP OAuth credential storage: {error}");
+            return BTreeMap::new();
+        }
+    };
+    let mut unlocked = if let Some(unlocked) = recalled_unlocked(&path) {
+        unlocked
+    } else {
+        if !path.exists() {
+            eprintln!("MCP OAuth is not signed in; run `grokforge login --mcp <name>`.");
+            return BTreeMap::new();
+        }
+        if !std::io::stdin().is_terminal() {
+            eprintln!(
+                "MCP OAuth credentials are password-encrypted and cannot be unlocked on protocol stdin."
+            );
+            return BTreeMap::new();
+        }
+        let Some(password) = prompt_password("Enter your GrokForge password for MCP OAuth: ")
+        else {
+            return BTreeMap::new();
+        };
+        let creds = match load_from(&path, &password) {
+            Ok(creds) => creds,
+            Err(error) => {
+                eprintln!("{error}");
+                return BTreeMap::new();
+            }
+        };
+        UnlockedCredentials {
+            path: path.clone(),
+            password,
+            creds,
+        }
+    };
+
+    let mut access_tokens = BTreeMap::new();
+    let mut changed = false;
+    for (name, client) in clients {
+        let Some(record) = unlocked.creds.mcp_oauth.get(&name).cloned() else {
+            eprintln!("MCP OAuth `{name}` is not signed in; run `grokforge login --mcp {name}`.");
+            continue;
+        };
+        if !mcp_oauth::stored_binding_matches(&client, &record) {
+            eprintln!(
+                "MCP OAuth `{name}` configuration changed; run `grokforge login --mcp {name}` again."
+            );
+            continue;
+        }
+        let current = if record.tokens.is_valid() {
+            record
+        } else {
+            match mcp_oauth::refresh(&client, &record).await {
+                Ok(fresh) => {
+                    changed = true;
+                    fresh
+                }
+                Err(error) => {
+                    eprintln!(
+                        "MCP OAuth `{name}` refresh failed: {}",
+                        crate::sanitize_terminal(&error.to_string())
+                    );
+                    continue;
+                }
+            }
+        };
+        access_tokens.insert(name.clone(), current.tokens.access_token.clone());
+        unlocked.creds.mcp_oauth.insert(name, current);
+    }
+    if changed && let Err(error) = save_to(&path, &unlocked.password, &unlocked.creds) {
+        eprintln!(
+            "warning: refreshed MCP OAuth but could not update {} ({error})",
+            terminal_path(&path)
+        );
+    }
+    remember_unlocked(&path, &unlocked.password, &unlocked.creds);
+    access_tokens
+}
+
+/// `grokforge login --mcp <name>` — authorize one pre-registered project MCP client and store its
+/// bound tokens inside the existing password-encrypted credential payload.
+pub async fn login_mcp(workspace: &Path, name: &str) -> ExitCode {
+    let mut clients = match grokforge_core::mcp_config::oauth_client_configs(workspace).await {
+        Ok(clients) => clients,
+        Err(error) => {
+            eprintln!(
+                "MCP OAuth configuration error: {}",
+                crate::sanitize_terminal(&error)
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let Some(client) = clients.remove(name) else {
+        let available = clients.keys().cloned().collect::<Vec<_>>().join(", ");
+        if available.is_empty() {
+            eprintln!("no OAuth-enabled remote MCP servers are configured in .grokforge/mcp.json");
+        } else {
+            eprintln!("unknown MCP OAuth server `{name}`; configured: {available}");
+        }
+        return ExitCode::from(2);
+    };
+    let path = match creds_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("cannot locate credential storage: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let (password, mut creds) = match unlock_or_create(&path) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    eprintln!(
+        "Authorizing trusted project MCP `{}`. Tokens will only be stored in {}.",
+        crate::sanitize_terminal_line(name),
+        terminal_path(&path)
+    );
+    let record = match mcp_oauth::login(&client).await {
+        Ok(record) => record,
+        Err(error) => {
+            eprintln!(
+                "MCP sign-in failed: {}",
+                crate::sanitize_terminal(&error.to_string())
+            );
+            return ExitCode::from(1);
+        }
+    };
+    creds.mcp_oauth.insert(name.to_string(), record);
+    match save_to(&path, &password, &creds) {
+        Ok(()) => {
+            remember_unlocked(&path, &password, &creds);
+            println!(
+                "✓ MCP `{}` tokens encrypted and saved.",
+                crate::sanitize_terminal_line(name)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("authorized, but could not save credentials: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -584,6 +803,7 @@ mod tests {
         let creds = StoredCreds {
             api_key: Some("xai-secret".to_string()),
             oauth: None,
+            ..StoredCreds::default()
         };
         let file = encrypt("hunter2", &creds).unwrap();
         let back = decrypt("hunter2", &file).unwrap();
@@ -595,6 +815,7 @@ mod tests {
         let creds = StoredCreds {
             api_key: Some("xai-secret".to_string()),
             oauth: None,
+            ..StoredCreds::default()
         };
         let file = encrypt("correct-horse", &creds).unwrap();
         assert!(decrypt("wrong-password", &file).is_err());
@@ -616,6 +837,7 @@ mod tests {
         let creds = StoredCreds {
             api_key: Some("xai-file-key".to_string()),
             oauth: None,
+            ..StoredCreds::default()
         };
         save_to(&path, "pass", &creds).unwrap();
         assert!(path.exists());
@@ -631,6 +853,49 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn mcp_tokens_are_encrypted_persisted_and_wrong_password_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.enc");
+        let mut creds = StoredCreds::default();
+        creds.mcp_oauth.insert(
+            "remote".into(),
+            OAuthRecord {
+                binding: grokforge_mcp::oauth::OAuthBinding {
+                    endpoint: "https://mcp.example/rpc".into(),
+                    resource: "https://mcp.example/".into(),
+                    issuer: "https://auth.example/".into(),
+                    client_id: "grokforge-client".into(),
+                    redirect_uri: "http://127.0.0.1:49152/callback".into(),
+                },
+                tokens: grokforge_mcp::oauth::OAuthTokens {
+                    access_token: "mcp-secret-access".into(),
+                    refresh_token: Some("mcp-secret-refresh".into()),
+                    expires_at: i64::MAX,
+                    scope: Some("files:read".into()),
+                },
+            },
+        );
+
+        save_to(&path, "correct-password", &creds).unwrap();
+        let envelope = std::fs::read_to_string(&path).unwrap();
+        assert!(!envelope.contains("mcp-secret-access"));
+        assert!(!envelope.contains("mcp-secret-refresh"));
+        let loaded = load_from(&path, "correct-password").unwrap();
+        assert_eq!(
+            loaded.mcp_oauth["remote"].tokens.access_token,
+            "mcp-secret-access"
+        );
+        assert!(load_from(&path, "wrong-password").is_err());
+    }
+
+    #[test]
+    fn legacy_credential_payloads_default_to_no_mcp_tokens() {
+        let legacy: StoredCreds = serde_json::from_str(r#"{"api_key":"xai-legacy"}"#).unwrap();
+        assert_eq!(legacy.api_key.as_deref(), Some("xai-legacy"));
+        assert!(legacy.mcp_oauth.is_empty());
     }
 
     #[test]
@@ -700,6 +965,7 @@ mod tests {
                 refresh_token: None,
                 expires_at: i64::MAX,
             }),
+            ..StoredCreds::default()
         };
         assert!(encrypt("pw", &creds).is_err());
     }

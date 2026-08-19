@@ -9,6 +9,7 @@ use grokforge_xai::{Effort, XaiClient, model_supports_effort};
 pub async fn launch(
     trust_project_mcp: bool,
     trust_project_config: bool,
+    trust_project_tools: bool,
     model_override: Option<String>,
     effort_override: Option<String>,
 ) -> ExitCode {
@@ -89,7 +90,21 @@ pub async fn launch(
         return ExitCode::from(2);
     }
 
-    match grokforge_tui::run(client, config, "auto".to_string(), trust_project_mcp).await {
+    let mcp_oauth_tokens = if trust_project_mcp {
+        crate::credentials::mcp_access_tokens(&config.workspace_root).await
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    match grokforge_tui::run_with_mcp_oauth(
+        client,
+        config,
+        "auto".to_string(),
+        trust_project_mcp,
+        trust_project_tools,
+        mcp_oauth_tokens,
+    )
+    .await
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("tui error: {e}");

@@ -11,10 +11,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use grokforge_core::{
-    Agent, ApprovalNeed, Approver, AutoApprover, Session, SessionConfig, Tool, ToolInvocation,
-    ToolOutput, ToolRegistry, ToolSpec, TurnCancellation,
+    Agent, ApprovalNeed, Approver, AutoApprover, Questioner, Session, SessionConfig, Tool,
+    ToolInvocation, ToolOutput, ToolRegistry, ToolSpec, TurnCancellation,
 };
-use grokforge_protocol::{ApprovalRequest, Decision, EventMsg, SandboxMode, StopReason};
+use grokforge_protocol::{
+    ApprovalRequest, Decision, EventMsg, QuestionAnswer, QuestionRequest, QuestionResponse,
+    SandboxMode, StopReason,
+};
 use grokforge_sandbox::{
     CommandSpec, ExecError, ExecOutput, PassthroughRunner, SandboxCapability, SandboxRunner,
 };
@@ -27,6 +30,48 @@ use tokio::sync::mpsc;
 struct DelayedHostMutation {
     started: Arc<tokio::sync::Notify>,
     finished: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Debug)]
+struct ChooseSecondOption;
+
+#[derive(Debug)]
+struct ChooseFirstOption;
+
+#[async_trait]
+impl Questioner for ChooseSecondOption {
+    async fn ask(&self, request: QuestionRequest) -> QuestionResponse {
+        QuestionResponse::Answered {
+            answers: request
+                .questions
+                .iter()
+                .enumerate()
+                .map(|(question, _)| QuestionAnswer {
+                    question,
+                    selected: Some(1),
+                    custom: None,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl Questioner for ChooseFirstOption {
+    async fn ask(&self, request: QuestionRequest) -> QuestionResponse {
+        QuestionResponse::Answered {
+            answers: request
+                .questions
+                .iter()
+                .enumerate()
+                .map(|(question, _)| QuestionAnswer {
+                    question,
+                    selected: Some(0),
+                    custom: None,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[async_trait]
@@ -99,6 +144,25 @@ fn tool_call_then_done(name: &str, args: serde_json::Value) -> Reply {
                 "type": "function_call",
                 "id": "fc_1",
                 "call_id": "call_1",
+                "name": name,
+                "arguments": args.to_string()
+            }
+        }),
+        json!({"type":"response.completed","response":{"status":"requires_action"}}),
+    ])
+}
+
+/// Same as [`tool_call_then_done`], but with a caller-chosen `call_id` so sequential iterations
+/// in one session do not collide with the provider-id uniqueness check.
+fn tool_call_then_done_with_id(call_id: &str, name: &str, args: serde_json::Value) -> Reply {
+    Reply::sse_events(&[
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": format!("fc_{call_id}"),
+                "call_id": call_id,
                 "name": name,
                 "arguments": args.to_string()
             }
@@ -180,6 +244,65 @@ fn agent_for(mock: &MockXai, events: mpsc::UnboundedSender<EventMsg>) -> Agent {
         Arc::new(AutoApprover::yolo()),
         events,
     )
+}
+
+#[tokio::test]
+async fn structured_question_round_trips_through_the_real_agent_loop() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mock = MockXai::builder()
+        .route(
+            "/v1/responses",
+            tool_call_then_done(
+                "ask_user",
+                json!({
+                    "questions": [{
+                        "header": "Scope",
+                        "question": "Which scope should I implement?",
+                        "options": [
+                            {"label": "Focused", "description": "Only the bug"},
+                            {"label": "Complete", "description": "Bug and tests"}
+                        ],
+                        "allow_custom": true
+                    }]
+                }),
+            ),
+        )
+        .route(
+            "/v1/responses",
+            final_text("Implementing the complete option."),
+        )
+        .start()
+        .await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let agent = agent_for(&mock, tx).with_questioner(Arc::new(ChooseSecondOption));
+    let mut session = Session::new(SessionConfig::new(
+        workspace.path().to_path_buf(),
+        "grok-build-0.1",
+    ));
+    let stop = agent.run_turn(&mut session, "fix this", &mut None).await;
+    assert_eq!(stop, StopReason::EndTurn);
+    assert!(session.history.iter().any(|item| matches!(
+        item,
+        grokforge_protocol::ResponseItem::ToolResult { content, is_error: false, .. }
+            if content.contains("\"label\":\"Complete\"")
+    )));
+    let mut requested = false;
+    let mut resolved = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            EventMsg::QuestionRequested(request) => {
+                requested = request.questions[0].header == "Scope";
+            }
+            EventMsg::QuestionResolved {
+                answered: 1,
+                cancelled: false,
+                auto: false,
+                ..
+            } => resolved = true,
+            _ => {}
+        }
+    }
+    assert!(requested && resolved);
 }
 
 #[cfg(unix)]
@@ -1831,4 +1954,314 @@ async fn network_escalation_does_not_widen_filesystem_access() {
     assert_eq!(policies[1].writable_roots, policies[0].writable_roots);
     assert_eq!(policies[1].protected_paths, policies[0].protected_paths);
     assert_eq!(policies[1].unreadable_globs, policies[0].unreadable_globs);
+}
+
+fn history_tool_results(session: &Session) -> Vec<(bool, String)> {
+    session
+        .history
+        .iter()
+        .filter_map(|item| match item {
+            grokforge_protocol::ResponseItem::ToolResult {
+                content, is_error, ..
+            } => Some((*is_error, content.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn drain_events(rx: &mut mpsc::UnboundedReceiver<EventMsg>) -> Vec<EventMsg> {
+    std::iter::from_fn(|| rx.try_recv().ok()).collect()
+}
+
+/// Host-process `apply_patch` is Unix-only (`replace_file_if_unchanged_bound` denies elsewhere).
+#[cfg(unix)]
+#[tokio::test]
+async fn apply_patch_updates_a_workspace_file_through_the_turn_loop() {
+    let workspace = tempfile::tempdir().unwrap();
+    // Production always canonicalizes the workspace; apply_patch binds the relative path against
+    // that physical root, so a lexical `/var` tempfile would fail the in-workspace check on macOS.
+    let root = std::fs::canonicalize(workspace.path()).unwrap();
+    std::fs::write(root.join("notes.txt"), "hello world\n").unwrap();
+    let patch = "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-hello world\n+hello grok\n";
+
+    let mock = MockXai::builder()
+        .route(
+            "/v1/responses",
+            tool_call_then_done(
+                "apply_patch",
+                json!({ "path": "notes.txt", "patch": patch }),
+            ),
+        )
+        .route("/v1/responses", final_text("patched notes.txt"))
+        .start()
+        .await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let agent = agent_for(&mock, tx);
+    let mut session = Session::new(
+        SessionConfig::new(root.clone(), "grok-build-0.1").with_policy(
+            grokforge_protocol::ApprovalPolicy::Untrusted,
+            SandboxMode::WorkspaceWrite,
+        ),
+    );
+    let stop = agent
+        .run_turn(&mut session, "patch notes.txt", &mut None)
+        .await;
+
+    assert_eq!(stop, StopReason::EndTurn);
+    assert_eq!(
+        std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+        "hello grok\n"
+    );
+    assert!(
+        history_tool_results(&session)
+            .iter()
+            .any(|(is_error, content)| !is_error && content.contains("applied unified diff")),
+        "apply_patch result should be recorded: {:?}",
+        history_tool_results(&session)
+    );
+
+    let events = drain_events(&mut rx);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventMsg::ToolCallEnd { ok: true, .. })),
+        "apply_patch should emit ToolCallEnd ok"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventMsg::ApprovalResolved { auto: true, .. })),
+        "Untrusted apply_patch should consult AutoApprover"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventMsg::LedgerAppended(_))),
+        "the patched turn must go through the ledgered request path"
+    );
+}
+
+#[tokio::test]
+async fn ask_user_feeds_option_zero_back_into_the_turn() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mock = MockXai::builder()
+        .route(
+            "/v1/responses",
+            tool_call_then_done(
+                "ask_user",
+                json!({
+                    "questions": [{
+                        "header": "Style",
+                        "question": "Which implementation style should I use?",
+                        "options": [
+                            {"label": "Minimal", "description": "Smallest change"},
+                            {"label": "Verbose", "description": "Extra comments"}
+                        ]
+                    }]
+                }),
+            ),
+        )
+        .route("/v1/responses", final_text("Using the minimal option."))
+        .start()
+        .await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let agent = agent_for(&mock, tx).with_questioner(Arc::new(ChooseFirstOption));
+    let mut session = Session::new(SessionConfig::new(
+        workspace.path().to_path_buf(),
+        "grok-build-0.1",
+    ));
+    let stop = agent
+        .run_turn(&mut session, "how should I implement this?", &mut None)
+        .await;
+    assert_eq!(stop, StopReason::EndTurn);
+    assert!(
+        session.history.iter().any(|item| matches!(
+            item,
+            grokforge_protocol::ResponseItem::ToolResult { content, is_error: false, .. }
+                if content.contains("\"selected\":0") && content.contains("\"label\":\"Minimal\"")
+        )),
+        "option 0 must be fed back as the tool result: {:?}",
+        history_tool_results(&session)
+    );
+    let events = drain_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EventMsg::QuestionResolved {
+            answered: 1,
+            cancelled: false,
+            auto: false,
+            ..
+        }
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventMsg::ToolCallEnd { ok: true, .. })),
+        "ask_user should emit ToolCallEnd ok"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventMsg::LedgerAppended(_))),
+        "ask_user must round-trip through the ledgered request path"
+    );
+}
+
+#[tokio::test]
+async fn update_plan_then_read_plan_round_trips_through_the_turn_loop() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mock = MockXai::builder()
+        .route(
+            "/v1/responses",
+            tool_call_then_done_with_id(
+                "call_update",
+                "update_plan",
+                json!({
+                    "explanation": "Cover the new builtins",
+                    "plan": [
+                        {"step": "Patch the fixture file", "status": "in_progress"},
+                        {"step": "Map the repository", "status": "pending"}
+                    ]
+                }),
+            ),
+        )
+        .route(
+            "/v1/responses",
+            tool_call_then_done_with_id("call_read", "read_plan", json!({})),
+        )
+        .route("/v1/responses", final_text("plan is in place"))
+        .start()
+        .await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let agent = agent_for(&mock, tx);
+    let mut session = Session::new(SessionConfig::new(
+        workspace.path().to_path_buf(),
+        "grok-build-0.1",
+    ));
+    let stop = agent
+        .run_turn(
+            &mut session,
+            "set a two-step plan and read it back",
+            &mut None,
+        )
+        .await;
+    assert_eq!(stop, StopReason::EndTurn);
+
+    let results = history_tool_results(&session);
+    let read = results
+        .iter()
+        .find(|(is_error, content)| {
+            !is_error
+                && content.contains("Patch the fixture file")
+                && content.contains("Map the repository")
+        })
+        .map(|(_, content)| content.as_str())
+        .expect("read/update plan output should contain both steps");
+    assert!(
+        read.contains("[>]") && read.contains("[ ]"),
+        "plan output should include in-progress and pending markers: {read}"
+    );
+    assert_eq!(
+        results.iter().filter(|(is_error, _)| !is_error).count(),
+        2,
+        "update_plan and read_plan should both succeed: {results:?}"
+    );
+    assert_eq!(mock.received().len(), 3);
+
+    let events = drain_events(&mut rx);
+    let ok_ends = events
+        .iter()
+        .filter(|event| matches!(event, EventMsg::ToolCallEnd { ok: true, .. }))
+        .count();
+    assert_eq!(ok_ends, 2, "both planning tools should emit ToolCallEnd ok");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventMsg::LedgerAppended(_))),
+        "planning tools must round-trip through the ledgered request path"
+    );
+}
+
+#[tokio::test]
+async fn repo_map_reports_workspace_symbols_without_following_symlinks() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::create_dir(workspace.path().join("src")).unwrap();
+    std::fs::write(workspace.path().join("src/hello.rs"), "fn hello() {}\n").unwrap();
+
+    #[cfg(unix)]
+    let _outside = {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("secret.rs"),
+            "fn leaked_from_symlink() {}\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.rs"),
+            workspace.path().join("linked.rs"),
+        )
+        .unwrap();
+        outside
+    };
+
+    let mock = MockXai::builder()
+        .route(
+            "/v1/responses",
+            tool_call_then_done("repo_map", json!({ "query": "hello", "max_bytes": 4096 })),
+        )
+        .route("/v1/responses", final_text("mapped the workspace"))
+        .start()
+        .await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let agent = agent_for(&mock, tx);
+    let mut session = Session::new(SessionConfig::new(
+        workspace.path().to_path_buf(),
+        "grok-build-0.1",
+    ));
+    let stop = agent
+        .run_turn(&mut session, "map this repo", &mut None)
+        .await;
+    assert_eq!(stop, StopReason::EndTurn);
+
+    let results = history_tool_results(&session);
+    let map = results
+        .iter()
+        .find(|(is_error, content)| {
+            !is_error && (content.contains("hello.rs") || content.contains("fn hello"))
+        })
+        .map(|(_, content)| content.as_str())
+        .expect("repo_map output should mention hello.rs or fn hello");
+    assert!(
+        map.contains("hello.rs") || map.contains("fn hello"),
+        "repo_map should mention the fixture file or symbol: {map}"
+    );
+
+    #[cfg(unix)]
+    {
+        assert!(
+            !map.contains("leaked_from_symlink"),
+            "repo_map must not follow a planted symlink: {map}"
+        );
+        assert!(
+            !map.contains("linked.rs"),
+            "repo_map must not inventory the symlink itself: {map}"
+        );
+    }
+
+    let events = drain_events(&mut rx);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventMsg::ToolCallEnd { ok: true, .. })),
+        "repo_map should emit ToolCallEnd ok"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventMsg::LedgerAppended(_))),
+        "repo_map must enter context through the ledgered request path"
+    );
 }

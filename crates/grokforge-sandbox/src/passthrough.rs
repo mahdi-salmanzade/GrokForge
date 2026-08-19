@@ -62,6 +62,10 @@ mod tests {
             args: vec!["hello".to_string()],
             cwd: std::env::temp_dir(),
             timeout: Duration::from_secs(5),
+            stdin: None,
+            stdin_close_delay: Duration::ZERO,
+            env: Vec::new(),
+            private_read_roots: Vec::new(),
             cancellation: None,
         };
         let out = runner.run(&policy, &spec).await.expect("run");

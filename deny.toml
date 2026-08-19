@@ -9,6 +9,8 @@ version = 2
 # Only permissive dependency licenses that are compatible with this MIT project.
 allow = [
     "MIT",
+    # Zero-attribution MIT variant used by `borrow-or-share` through the JSON Schema validator.
+    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",

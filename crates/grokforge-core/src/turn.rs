@@ -5,21 +5,24 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::StreamExt;
 use grokforge_protocol::{
     ApprovalId, ApprovalKind, ApprovalPolicy, ApprovalRequest, Decision, EventMsg, LedgerEntry,
-    ResponseItem, SandboxMode, SandboxPolicy, StopReason, ToolCallId, TurnId, Usage,
+    QuestionResponse, ResponseItem, SandboxMode, SandboxPolicy, StopReason, ToolCallId, TurnId,
+    Usage,
 };
 use grokforge_sandbox::SandboxRunner;
 use grokforge_xai::{ServerTool, StreamEvent, ToolDef, XaiClient};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Sender, UnboundedSender, error::TrySendError};
 
 use crate::agents_md;
 use crate::approvals::{Approver, Gate, gate};
 use crate::cancellation::TurnCancellation;
 use crate::compaction;
 use crate::context::{self, Assembled};
+use crate::questions::{AutoQuestioner, Questioner};
 use crate::redaction::Redactor;
 use crate::session::Session;
 use crate::skills;
@@ -247,6 +250,64 @@ fn summarize_subagent(branch: &str, output: &ToolOutput) -> String {
     }
 }
 
+/// Shared status for a bounded frontend event queue.
+///
+/// Interactive frontends keep their existing unbounded sender because they continuously drain it
+/// in-process. Long-lived network frontends can instead give the agent a bounded sender; if that
+/// queue fills, the turn is cancelled rather than accumulating an unbounded in-memory backlog.
+#[derive(Debug, Clone, Default)]
+pub struct BoundedEventQueueStatus {
+    overflowed: Arc<AtomicBool>,
+}
+
+impl BoundedEventQueueStatus {
+    /// Whether an event had to be refused because the bounded frontend queue was full.
+    #[must_use]
+    pub fn overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::Acquire)
+    }
+
+    fn mark_overflowed(&self) {
+        self.overflowed.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Clone)]
+enum AgentEvents {
+    Unbounded(UnboundedSender<EventMsg>),
+    Bounded {
+        sender: Sender<EventMsg>,
+        cancellation: TurnCancellation,
+        status: BoundedEventQueueStatus,
+    },
+}
+
+impl AgentEvents {
+    fn send(&self, msg: EventMsg) -> Result<(), ()> {
+        match self {
+            // A dropped in-process receiver just means the frontend is gone; preserve the
+            // historical behavior for TUI, ACP, and headless callers.
+            Self::Unbounded(events) => events.send(msg).map_err(|_| ()),
+            Self::Bounded {
+                sender,
+                cancellation,
+                status,
+            } => match sender.try_send(msg) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(_)) => {
+                    status.mark_overflowed();
+                    cancellation.cancel();
+                    Err(())
+                }
+                Err(TrySendError::Closed(_)) => {
+                    cancellation.cancel();
+                    Err(())
+                }
+            },
+        }
+    }
+}
+
 /// Drives turns for a session. Shared, cheap to hold; the mutable per-run state is the session
 /// and the rollout writer passed to [`Agent::run_turn`].
 pub struct Agent {
@@ -254,9 +315,12 @@ pub struct Agent {
     registry: ToolRegistry,
     sandbox: Arc<dyn SandboxRunner>,
     approver: Arc<dyn Approver>,
-    events: UnboundedSender<EventMsg>,
+    questioner: Arc<dyn Questioner>,
+    events: AgentEvents,
     /// Whether approvals are resolved without a human (headless); recorded on `ApprovalResolved`.
     auto_approval: bool,
+    /// Whether structured questions use the safe non-interactive fallback.
+    auto_questions: bool,
     /// Whether this agent may spawn subagents (false inside a subagent — depth cap 1).
     allow_subagents: bool,
 }
@@ -266,6 +330,7 @@ impl std::fmt::Debug for Agent {
         f.debug_struct("Agent")
             .field("registry", &self.registry)
             .field("auto_approval", &self.auto_approval)
+            .field("auto_questions", &self.auto_questions)
             .finish_non_exhaustive()
     }
 }
@@ -284,15 +349,69 @@ impl Agent {
             registry,
             sandbox,
             approver,
-            events,
+            questioner: Arc::new(AutoQuestioner),
+            events: AgentEvents::Unbounded(events),
             auto_approval: true,
+            auto_questions: true,
             allow_subagents: true,
         }
+    }
+
+    /// Construct an agent whose frontend event queue is hard-bounded.
+    ///
+    /// Emission stays synchronous so tool and provider state cannot be suspended while holding a
+    /// host resource. A full queue atomically marks overflow and requests cooperative turn
+    /// cancellation. The frontend can inspect the returned status and surface a terminal error.
+    #[must_use]
+    pub fn new_bounded(
+        client: XaiClient,
+        registry: ToolRegistry,
+        sandbox: Arc<dyn SandboxRunner>,
+        approver: Arc<dyn Approver>,
+        events: Sender<EventMsg>,
+        cancellation: TurnCancellation,
+    ) -> (Self, BoundedEventQueueStatus) {
+        let status = BoundedEventQueueStatus::default();
+        (
+            Self {
+                client,
+                registry,
+                sandbox,
+                approver,
+                questioner: Arc::new(AutoQuestioner),
+                events: AgentEvents::Bounded {
+                    sender: events,
+                    cancellation,
+                    status: status.clone(),
+                },
+                auto_approval: true,
+                auto_questions: true,
+                allow_subagents: true,
+            },
+            status,
+        )
+    }
+
+    /// Return the exact local tool surface registered for this agent.
+    ///
+    /// Frontends use this snapshot for capability discovery so their `/tools` views cannot drift
+    /// from built-ins, trusted custom tools, or MCP tools that were actually loaded.
+    #[must_use]
+    pub fn tool_specs(&self) -> Vec<crate::tools::ToolSpec> {
+        self.registry.specs()
     }
 
     #[must_use]
     pub fn interactive(mut self) -> Self {
         self.auto_approval = false;
+        self
+    }
+
+    /// Attach an interactive structured-question handler without changing the stable constructor.
+    #[must_use]
+    pub fn with_questioner(mut self, questioner: Arc<dyn Questioner>) -> Self {
+        self.questioner = questioner;
+        self.auto_questions = false;
         self
     }
 
@@ -304,14 +423,15 @@ impl Agent {
             registry: self.registry.clone(),
             sandbox: Arc::clone(&self.sandbox),
             approver: Arc::clone(&self.approver),
-            events,
+            questioner: Arc::clone(&self.questioner),
+            events: AgentEvents::Unbounded(events),
             auto_approval: self.auto_approval,
+            auto_questions: self.auto_questions,
             allow_subagents: false,
         }
     }
 
     fn emit(&self, msg: EventMsg) {
-        // A dropped receiver just means the frontend is gone; the turn can still finish.
         let _ = self.events.send(msg);
     }
 
@@ -513,19 +633,25 @@ impl Agent {
         let expanded = {
             let workspace_root = session.config.workspace_root.clone();
             let raw = user_text.to_string();
-            tokio::task::spawn_blocking(move || crate::attach::expand(&workspace_root, &raw))
-                .await
-                .unwrap_or_else(|_| user_text.to_string())
+            tokio::task::spawn_blocking(move || {
+                crate::attach::expand_multimodal(&workspace_root, &raw)
+            })
+            .await
+            .unwrap_or_else(|_| crate::attach::ExpandedPrompt {
+                text: user_text.to_string(),
+                images: Vec::new(),
+            })
         };
 
         // In plan mode, instruct the model not to change anything.
         let effective_text = if plan {
             format!(
                 "[PLAN MODE — do not modify files or run mutating commands; produce a concise, \
-                 numbered plan for the following task]\n\n{expanded}"
+                 numbered plan for the following task]\n\n{}",
+                expanded.text
             )
         } else {
-            expanded
+            expanded.text
         };
         if effective_text.len() > MAX_USER_TEXT_BYTES {
             let stop = StopReason::Error;
@@ -546,7 +672,11 @@ impl Agent {
             .record(
                 session,
                 rollout,
-                ResponseItem::user_redacted(user_red.text, user_red.count),
+                ResponseItem::user_with_images_redacted(
+                    user_red.text,
+                    user_red.count,
+                    expanded.images,
+                ),
             )
             .await
             .is_err()
@@ -1706,7 +1836,14 @@ impl Agent {
                 ));
             }
         };
-        let sub_writer = match RolloutWriter::create(&sessions, sub_session.id).await {
+        let meta = crate::store::SessionMeta::new(
+            sub_session.id,
+            worktree.clone(),
+            session.config.model.clone(),
+            &prompt,
+        )
+        .with_effort(sub_session.config.effort);
+        let sub_writer = match meta.create_rollout(&sessions, sub_session.id).await {
             Ok(writer) => writer,
             Err(error) => {
                 tracing::warn!(%error, branch, "subagent persistence is unavailable");
@@ -1716,21 +1853,6 @@ impl Agent {
                 ));
             }
         };
-        let meta = crate::store::SessionMeta::new(
-            sub_session.id,
-            worktree.clone(),
-            session.config.model.clone(),
-            &prompt,
-        )
-        .with_effort(sub_session.config.effort);
-        if let Err(error) = meta.write(&sessions, sub_session.id).await {
-            tracing::warn!(%error, branch, "subagent metadata could not be persisted");
-            drop(sub_writer);
-            remove_worktree(git, worktree).await;
-            return Err(ToolOutput::failure(
-                "subagent metadata could not be persisted; no model call was made",
-            ));
-        }
         Ok(SubagentJob {
             call_id,
             label: subagent_label(&prompt),
@@ -1920,6 +2042,26 @@ impl Agent {
         decision
     }
 
+    async fn request_questions(
+        &self,
+        request: grokforge_protocol::QuestionRequest,
+        cancellation: &TurnCancellation,
+    ) -> QuestionResponse {
+        let id = request.id;
+        self.emit(EventMsg::QuestionRequested(request.clone()));
+        let response = tokio::select! {
+            response = self.questioner.ask(request) => response,
+            () = cancellation.cancelled() => QuestionResponse::Cancelled,
+        };
+        self.emit(EventMsg::QuestionResolved {
+            id,
+            answered: response.answer_count(),
+            cancelled: response.is_cancelled(),
+            auto: self.auto_questions,
+        });
+        response
+    }
+
     async fn finish_tool_call(
         &self,
         session: &mut Session,
@@ -2039,9 +2181,42 @@ impl Agent {
 
         let args: serde_json::Value =
             serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+        if name == crate::questions::ASK_USER {
+            self.emit(EventMsg::ToolCallBegin {
+                call_id: call_id.clone(),
+                name: name.to_string(),
+                args_preview: preview(arguments),
+                sandboxed: false,
+            });
+            let output = match crate::questions::parse_request(&args, call_id.clone()) {
+                Ok(request) => {
+                    let response = self.request_questions(request.clone(), cancellation).await;
+                    match crate::questions::validate_response(&request, response) {
+                        Ok(response) => crate::questions::response_output(&request, &response),
+                        Err(error) => ToolOutput::failure(format!(
+                            "[invalid response from question frontend: {error}]"
+                        )),
+                    }
+                }
+                Err(error) => ToolOutput::failure(error),
+            };
+            let cancelled = cancellation.is_cancelled();
+            return if self
+                .finish_tool_call(session, rollout, call_id, output)
+                .await
+                .is_err()
+            {
+                ToolCallFlow::Error
+            } else if cancelled {
+                ToolCallFlow::Abort
+            } else {
+                ToolCallFlow::Continue
+            };
+        }
         let need = tool.approval(&args, ctx);
 
         let mut elevated = false;
+        let mut network_elevated = false;
         let mut approved_write_targets = Vec::new();
         if let Gate::Ask(kind) = gate(
             session.config.approval_policy,
@@ -2135,6 +2310,9 @@ impl Agent {
                 return ToolCallFlow::Continue;
             }
             elevated = exceeds;
+            // Network approval is deliberately capability-specific: it may enable egress for
+            // this invocation, but it must never broaden readable or writable filesystem roots.
+            network_elevated = exceeds && matches!(kind, ApprovalKind::Network { .. });
         }
 
         // `spawn_task` is dispatched separately (see `run_spawn_batch`) so a whole batch of
@@ -2161,7 +2339,10 @@ impl Agent {
             return ToolCallFlow::Continue;
         }
         let elevated_ctx;
-        let invoke_ctx = if elevated {
+        let invoke_ctx = if network_elevated {
+            elevated_ctx = Self::escalation_context(ctx, grokforge_protocol::DenialClass::Network);
+            &elevated_ctx
+        } else if elevated {
             elevated_ctx = if approved_write_targets.is_empty() {
                 Self::elevated_context(ctx)
             } else {
@@ -2968,13 +3149,30 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 fn tool_preserves_auto_commit_ownership(name: &str) -> bool {
-    // File tools are awaited host operations and the private worktree excludes sibling agents.
-    // A shell or external/custom tool can leave a daemonized descendant on platforms without a
-    // PID namespace (notably Seatbelt), so its same-path writes cannot be attributed at staging.
-    // `remember` is a confined, awaited host write to `.grokforge/memory/`, safe like a file tool.
+    // Built-in host mutations are awaited, descriptor-bound operations and the private worktree
+    // excludes sibling agents. Built-in code-intelligence processes cannot write the worktree;
+    // formatter installation is a separate awaited host write. A shell or dynamic custom/MCP
+    // tool can leave a daemonized descendant on platforms without a PID namespace (notably
+    // Seatbelt), so its same-path writes cannot be attributed at staging.
     matches!(
         name,
-        "read_file" | "write_file" | "edit" | "list" | "glob" | "grep" | "remember"
+        "read_file"
+            | "write_file"
+            | "edit"
+            | "apply_patch"
+            | "list"
+            | "glob"
+            | "grep"
+            | "git_status"
+            | "git_diff"
+            | "repo_map"
+            | "lsp_diagnostics"
+            | "lsp_query"
+            | "format_file"
+            | "update_plan"
+            | "read_plan"
+            | "remember"
+            | crate::questions::ASK_USER
     )
 }
 
@@ -3008,6 +3206,98 @@ fn summarize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct NeverAnswerQuestioner;
+
+    #[async_trait::async_trait]
+    impl crate::Questioner for NeverAnswerQuestioner {
+        async fn ask(&self, _request: grokforge_protocol::QuestionRequest) -> QuestionResponse {
+            std::future::pending().await
+        }
+    }
+
+    #[test]
+    fn bounded_frontend_queue_cancels_instead_of_accumulating() {
+        let (events, mut events_rx) = tokio::sync::mpsc::channel(1);
+        let cancellation = TurnCancellation::new();
+        let (agent, status) = Agent::new_bounded(
+            XaiClient::new("http://127.0.0.1:1", "test").unwrap(),
+            ToolRegistry::with_builtins(),
+            Arc::new(grokforge_sandbox::PassthroughRunner),
+            Arc::new(crate::AutoApprover::default()),
+            events,
+            cancellation.clone(),
+        );
+        let first = EventMsg::TurnStarted {
+            turn_id: TurnId::new(),
+        };
+        agent.emit(first.clone());
+        agent.emit(EventMsg::TurnStarted {
+            turn_id: TurnId::new(),
+        });
+
+        assert_eq!(events_rx.try_recv().unwrap(), first);
+        assert!(events_rx.try_recv().is_err());
+        assert!(status.overflowed());
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancellation_preempts_a_question_frontend_that_never_answers() {
+        let (events, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent = Agent::new(
+            XaiClient::new("http://127.0.0.1:1", "test").unwrap(),
+            ToolRegistry::with_builtins(),
+            Arc::new(grokforge_sandbox::PassthroughRunner),
+            Arc::new(crate::AutoApprover::default()),
+            events,
+        )
+        .with_questioner(Arc::new(NeverAnswerQuestioner));
+        let request = grokforge_protocol::QuestionRequest {
+            id: grokforge_protocol::QuestionId::new(),
+            call_id: ToolCallId::new(),
+            questions: vec![grokforge_protocol::UserQuestion {
+                header: "Scope".into(),
+                prompt: "Which scope?".into(),
+                options: vec![
+                    grokforge_protocol::QuestionOption {
+                        label: "Small".into(),
+                        description: String::new(),
+                    },
+                    grokforge_protocol::QuestionOption {
+                        label: "Large".into(),
+                        description: String::new(),
+                    },
+                ],
+                allow_custom: false,
+            }],
+        };
+        let cancellation = TurnCancellation::new();
+        let cancel = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancel.cancel();
+        });
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            agent.request_questions(request, &cancellation),
+        )
+        .await
+        .expect("question cancellation must be prompt");
+        assert_eq!(response, QuestionResponse::Cancelled);
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(EventMsg::QuestionRequested(_))
+        ));
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(EventMsg::QuestionResolved {
+                cancelled: true,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn trim_history_to_budget_shrinks_old_tool_output_and_keeps_recent() {
@@ -3210,8 +3500,26 @@ mod tests {
 
     #[test]
     fn shell_and_external_tools_disable_isolated_auto_commit_ownership() {
-        assert!(tool_preserves_auto_commit_ownership("write_file"));
-        assert!(tool_preserves_auto_commit_ownership("read_file"));
+        for built_in in [
+            "read_file",
+            "write_file",
+            "edit",
+            "apply_patch",
+            "git_status",
+            "git_diff",
+            "repo_map",
+            "lsp_diagnostics",
+            "lsp_query",
+            "format_file",
+            "update_plan",
+            "read_plan",
+            "ask_user",
+        ] {
+            assert!(
+                tool_preserves_auto_commit_ownership(built_in),
+                "built-in should preserve ownership: {built_in}"
+            );
+        }
         assert!(!tool_preserves_auto_commit_ownership("shell"));
         assert!(!tool_preserves_auto_commit_ownership("mcp__docs__search"));
         assert!(!tool_preserves_auto_commit_ownership("custom_tool"));

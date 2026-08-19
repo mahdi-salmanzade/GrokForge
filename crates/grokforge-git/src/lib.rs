@@ -6,7 +6,7 @@
 //! real commit carrying `Grokforge-Session`/`Grokforge-Turn` trailers (the marker `/undo` keys
 //! off), with hooks neutralized so a repo hook can't be used as an injection vector.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -54,6 +54,8 @@ pub enum GitError {
     Timeout(Duration),
     #[error("git command output exceeded {0} bytes")]
     OutputLimit(usize),
+    #[error("workspace changed after the agent turn; refusing to overwrite newer edits")]
+    WorktreeChanged,
     #[error("no trusted git executable is available: {0}")]
     UntrustedExecutable(String),
     #[error("io error running git: {0}")]
@@ -73,6 +75,117 @@ pub struct CommitInfo {
     pub subject: String,
     pub session: Option<String>,
     pub turn: Option<String>,
+}
+
+/// Prototype content-addressed snapshot captured immediately before a foreground turn.
+///
+/// The temporary Git index and object database live outside the repository, so capturing a
+/// journal never stages files, changes refs, or writes agent content into `.git/objects`. The
+/// completed journal checks the visible workspace before moving between snapshots, but cannot
+/// attribute editor writes that happen during a turn and cannot make Git patch application atomic
+/// with respect to an external writer. The TUI therefore keeps foreground journaling disabled.
+#[derive(Debug)]
+pub struct WorktreeJournalBuilder {
+    git: Git,
+    scratch: tempfile::TempDir,
+    before: String,
+}
+
+/// One completed foreground turn that can be undone and redone without touching the real index.
+#[derive(Debug)]
+pub struct WorktreeJournal {
+    git: Git,
+    scratch: tempfile::TempDir,
+    before: String,
+    after: String,
+    applied: bool,
+}
+
+impl WorktreeJournalBuilder {
+    /// Capture the complete visible Git worktree state (tracked files plus non-ignored untracked
+    /// files) without mutating the repository index or refs.
+    pub fn begin(workspace: &Path) -> Result<Self, GitError> {
+        let git =
+            Git::discover(workspace).ok_or_else(|| GitError::NotARepo(workspace.to_path_buf()))?;
+        let scratch = tempfile::Builder::new()
+            .prefix("grokforge-foreground-journal-")
+            .tempdir()?;
+        std::fs::create_dir(scratch.path().join("objects"))?;
+        let before = git.snapshot_tree(scratch.path())?;
+        Ok(Self {
+            git,
+            scratch,
+            before,
+        })
+    }
+
+    /// Finish the snapshot after the turn. Returns `None` when the turn made no visible changes.
+    pub fn finish(self) -> Result<Option<WorktreeJournal>, GitError> {
+        let after = self.git.snapshot_tree(self.scratch.path())?;
+        if after == self.before {
+            return Ok(None);
+        }
+        Ok(Some(WorktreeJournal {
+            git: self.git,
+            scratch: self.scratch,
+            before: self.before,
+            after,
+            applied: true,
+        }))
+    }
+}
+
+impl WorktreeJournal {
+    /// Whether this journal currently represents an applied (not undone) turn.
+    #[must_use]
+    pub fn is_applied(&self) -> bool {
+        self.applied
+    }
+
+    /// Restore the exact pre-turn worktree state. Refuses if anything changed since the turn.
+    pub fn undo(&mut self) -> Result<(), GitError> {
+        if !self.applied {
+            return Err(GitError::Command(
+                "foreground turn is already undone".to_string(),
+            ));
+        }
+        self.move_to(&self.after, &self.before)?;
+        self.applied = false;
+        Ok(())
+    }
+
+    /// Reapply an undone turn. Refuses if anything changed after undo.
+    pub fn redo(&mut self) -> Result<(), GitError> {
+        if self.applied {
+            return Err(GitError::Command(
+                "foreground turn is already applied".to_string(),
+            ));
+        }
+        self.move_to(&self.before, &self.after)?;
+        self.applied = true;
+        Ok(())
+    }
+
+    fn move_to(&self, expected: &str, target: &str) -> Result<(), GitError> {
+        if self.git.snapshot_tree(self.scratch.path())? != expected {
+            return Err(GitError::WorktreeChanged);
+        }
+        let patch = self
+            .git
+            .snapshot_diff(self.scratch.path(), expected, target)?;
+        if patch.is_empty() {
+            return Ok(());
+        }
+        self.git.apply_snapshot_patch(&patch, true)?;
+        self.git.apply_snapshot_patch(&patch, false)?;
+        // `git apply` has its own context checks, but verify the complete visible worktree too.
+        // If an external writer touched an unrelated path during the tiny check/apply interval,
+        // report the race instead of claiming that the requested state was restored.
+        if self.git.snapshot_tree(self.scratch.path())? != target {
+            return Err(GitError::WorktreeChanged);
+        }
+        Ok(())
+    }
 }
 
 impl Git {
@@ -157,6 +270,81 @@ impl Git {
             };
             Err(GitError::Command(detail))
         }
+    }
+
+    fn snapshot_command(&self, scratch: &Path) -> Result<Command, GitError> {
+        let mut command = self.repo_command()?;
+        let objects = scratch.join("objects");
+        let index = scratch.join("index");
+        let common = self.run(&["rev-parse", "--git-common-dir"])?;
+        let common = PathBuf::from(common.trim());
+        let common = if common.is_absolute() {
+            common
+        } else {
+            self.root.join(common)
+        };
+        command
+            .env("GIT_INDEX_FILE", index)
+            .env("GIT_OBJECT_DIRECTORY", objects)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", common.join("objects"))
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(&self.root);
+        Ok(command)
+    }
+
+    fn snapshot_tree(&self, scratch: &Path) -> Result<String, GitError> {
+        let index = scratch.join("index");
+        match std::fs::remove_file(&index) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(GitError::Io(error)),
+        }
+
+        let mut reset = self.snapshot_command(scratch)?;
+        if self.run(&["rev-parse", "--verify", "HEAD^{tree}"]).is_ok() {
+            reset.args(["read-tree", "HEAD"]);
+        } else {
+            reset.args(["read-tree", "--empty"]);
+        }
+        ensure_git_success(&execute_git_command(&mut reset)?)?;
+
+        let mut add = self.snapshot_command(scratch)?;
+        add.args(["add", "-A", "--", "."]);
+        ensure_git_success(&execute_git_command(&mut add)?)?;
+
+        let mut write = self.snapshot_command(scratch)?;
+        write.arg("write-tree");
+        let output = execute_git_command(&mut write)?;
+        ensure_git_success_ref(&output)?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn snapshot_diff(&self, scratch: &Path, from: &str, to: &str) -> Result<Vec<u8>, GitError> {
+        let mut command = self.snapshot_command(scratch)?;
+        command.args([
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            from,
+            to,
+        ]);
+        let output = execute_git_command(&mut command)?;
+        ensure_git_success_ref(&output)?;
+        Ok(output.stdout)
+    }
+
+    fn apply_snapshot_patch(&self, patch: &[u8], check: bool) -> Result<(), GitError> {
+        let mut command = self.repo_command()?;
+        command.args(["apply", "--binary", "--whitespace=nowarn"]);
+        if check {
+            command.arg("--check");
+        }
+        command.arg("-").current_dir(&self.root);
+        let output = execute_git_command_with_input(&mut command, patch)?;
+        ensure_git_success(&output)
     }
 
     /// Construct a Git command with every repository-configured executable hook neutralized.
@@ -690,6 +878,86 @@ fn execute_git_command(command: &mut Command) -> Result<GitCommandOutput, GitErr
     execute_command(command, GIT_TIMEOUT, GIT_OUTPUT_CAP)
 }
 
+fn execute_git_command_with_input(
+    command: &mut Command,
+    input: &[u8],
+) -> Result<GitCommandOutput, GitError> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    #[cfg(unix)]
+    let child_id = child.id();
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| GitError::Command("git stdin pipe was unavailable".to_string()))?;
+    stdin.write_all(input)?;
+    drop(stdin);
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitError::Command("git stdout pipe was unavailable".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| GitError::Command("git stderr pipe was unavailable".to_string()))?;
+    let stdout_reader = std::thread::spawn(move || read_capped(stdout, GIT_OUTPUT_CAP));
+    let stderr_reader = std::thread::spawn(move || read_capped(stderr, GIT_OUTPUT_CAP));
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            #[cfg(unix)]
+            kill_git_process_group(child_id);
+            break status;
+        }
+        if Instant::now() >= deadline {
+            #[cfg(unix)]
+            kill_git_process_group(child_id);
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(stdout_reader);
+            drop(stderr_reader);
+            return Err(GitError::Timeout(GIT_TIMEOUT));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let (stdout, stdout_truncated) = join_reader_until(stdout_reader, deadline, GIT_TIMEOUT)?;
+    let (stderr, stderr_truncated) = join_reader_until(stderr_reader, deadline, GIT_TIMEOUT)?;
+    if stdout_truncated || stderr_truncated {
+        return Err(GitError::OutputLimit(GIT_OUTPUT_CAP));
+    }
+    Ok(GitCommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn ensure_git_success(output: &GitCommandOutput) -> Result<(), GitError> {
+    ensure_git_success_ref(output)
+}
+
+fn ensure_git_success_ref(output: &GitCommandOutput) -> Result<(), GitError> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = if stderr.is_empty() {
+        format!("git exited with {}", output.status)
+    } else {
+        stderr
+    };
+    Err(GitError::Command(detail))
+}
+
 fn execute_command(
     command: &mut Command,
     timeout: Duration,
@@ -853,6 +1121,101 @@ mod tests {
         let (_d, git) = init_repo();
         assert!(git.current_branch().is_ok());
         assert!(!git.is_dirty().unwrap());
+    }
+
+    #[test]
+    fn foreground_journal_undoes_and_redoes_without_touching_index() {
+        let (dir, _git) = init_repo();
+        std::fs::write(dir.path().join("README"), "user draft\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "README"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(dir.path().join("README"), "user unstaged\n").unwrap();
+        let staged_before = Command::new("git")
+            .args(["diff", "--cached", "--binary"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout;
+
+        let journal = WorktreeJournalBuilder::begin(dir.path()).unwrap();
+        std::fs::write(dir.path().join("README"), "agent edit\n").unwrap();
+        std::fs::write(dir.path().join("new.txt"), "agent file\n").unwrap();
+        let mut journal = journal.finish().unwrap().expect("changed journal");
+
+        journal.undo().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("README")).unwrap(),
+            "user unstaged\n"
+        );
+        assert!(!dir.path().join("new.txt").exists());
+        let staged_after = Command::new("git")
+            .args(["diff", "--cached", "--binary"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(
+            staged_before, staged_after,
+            "real index must stay untouched"
+        );
+
+        journal.redo().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("README")).unwrap(),
+            "agent edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+            "agent file\n"
+        );
+    }
+
+    #[test]
+    fn foreground_journal_refuses_to_overwrite_later_user_edit() {
+        let (dir, _git) = init_repo();
+        let journal = WorktreeJournalBuilder::begin(dir.path()).unwrap();
+        std::fs::write(dir.path().join("README"), "agent edit\n").unwrap();
+        let mut journal = journal.finish().unwrap().expect("changed journal");
+        std::fs::write(dir.path().join("README"), "newer user edit\n").unwrap();
+
+        assert!(matches!(journal.undo(), Err(GitError::WorktreeChanged)));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("README")).unwrap(),
+            "newer user edit\n"
+        );
+        assert!(journal.is_applied());
+    }
+
+    #[test]
+    fn foreground_journal_ignores_gitignored_build_output() {
+        let (dir, _git) = init_repo();
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", ".gitignore"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-q", "-m", "ignore build output"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let journal = WorktreeJournalBuilder::begin(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/cache"), "noise\n").unwrap();
+        assert!(journal.finish().unwrap().is_none());
     }
 
     #[test]

@@ -19,7 +19,9 @@ mod writable;
 
 pub use bubblewrap::BubblewrapRunner;
 pub use classifier::classify;
-pub use exec::{CommandSpec, ExecError, ExecOutput, OUTPUT_CAP, run_capture};
+pub use exec::{
+    CommandSpec, ExecError, ExecOutput, OUTPUT_CAP, STDIN_CAP, STDIN_CLOSE_DELAY_CAP, run_capture,
+};
 pub use passthrough::PassthroughRunner;
 pub use seatbelt::SeatbeltRunner;
 
@@ -42,6 +44,29 @@ pub(crate) fn validate_backend_policy(
     }
     for root in &policy.writable_roots {
         validate_existing_absolute_directory("writable root", root)?;
+    }
+    if command.private_read_roots.len() > 8 {
+        return Err(ExecError::UnsupportedPolicy(
+            "at most 8 private read roots may be exposed to one command".to_string(),
+        ));
+    }
+    for root in &command.private_read_roots {
+        validate_existing_absolute_directory("private read root", root)?;
+        let canonical = std::fs::canonicalize(root).map_err(|error| {
+            ExecError::UnsupportedPolicy(format!(
+                "could not canonicalize private read root {}: {error}",
+                root.display()
+            ))
+        })?;
+        if canonical == std::path::Path::new("/")
+            || canonical == std::path::Path::new("/tmp")
+            || canonical == std::path::Path::new("/run")
+        {
+            return Err(ExecError::UnsupportedPolicy(format!(
+                "private read root {} is too broad",
+                root.display()
+            )));
+        }
     }
     for protected in &policy.protected_paths {
         if !protected.is_absolute() {

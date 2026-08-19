@@ -169,14 +169,19 @@ fn redact_json_strings(value: &serde_json::Value) -> (serde_json::Value, usize) 
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use std::sync::Arc;
 
     use async_trait::async_trait;
     use grokforge_mcp::{McpConnection, McpError, McpTool};
+    use grokforge_protocol::{ApprovalKind, SandboxPolicy};
+    use grokforge_sandbox::PassthroughRunner;
     use serde_json::{Value, json};
 
     use super::McpToolAdapter;
-    use crate::tools::Tool;
+    use crate::approvals::ApprovalNeed;
+    use crate::tools::{Tool, TurnContext};
 
     #[derive(Debug)]
     struct NoopConnection;
@@ -248,5 +253,29 @@ mod tests {
         let second =
             McpToolAdapter::advertised_name("Bearer zyxwvutsrqponmlkjihgfedcba654321", "search");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn every_mcp_transport_remains_explicitly_approval_gated() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tool: McpTool = serde_json::from_value(json!({
+            "name": "deploy",
+            "inputSchema": { "type": "object" }
+        }))
+        .unwrap();
+        let adapter = McpToolAdapter::new("remote", tool, Arc::new(NoopConnection));
+        let context = TurnContext {
+            workspace_root: workspace.path().to_path_buf(),
+            policy: SandboxPolicy::workspace_write(workspace.path()),
+            sandbox: Arc::new(PassthroughRunner),
+            touched: Arc::new(std::sync::Mutex::new(Vec::new())),
+            bound_write_targets: Vec::new(),
+            cancellation: crate::TurnCancellation::new(),
+        };
+        assert!(matches!(
+            adapter.approval(&json!({}), &context),
+            ApprovalNeed::Always(ApprovalKind::McpToolCall { server, tool })
+                if server == "remote" && tool == "deploy"
+        ));
     }
 }

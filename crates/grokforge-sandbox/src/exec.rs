@@ -2,14 +2,16 @@
 //! output (byte-capped, with head+tail truncation), timeout/kill, and a fail-closed child
 //! environment so ambient credentials never reach subprocesses.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use grokforge_protocol::DenialClass;
+use tokio::io::AsyncWriteExt as _;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 
@@ -35,9 +37,20 @@ const SAFE_LOCALE_ENV: &[&str] = &[
 const SAFE_TERMINAL_ENV: &[&str] = &["TERM", "COLORTERM"];
 const MAX_SAFE_ENV_VALUE_BYTES: usize = 128;
 const MAX_SAFE_PATH_BYTES: usize = 16 * 1024;
+const MAX_EXPLICIT_ENV: usize = 32;
+const MAX_EXPLICIT_ENV_NAME_BYTES: usize = 128;
+const MAX_EXPLICIT_ENV_VALUE_BYTES: usize = 16 * 1024;
+const MAX_EXPLICIT_ENV_BYTES: usize = 128 * 1024;
 
 /// Maximum captured bytes per stream before head+tail truncation kicks in.
 pub const OUTPUT_CAP: usize = 64 * 1024;
+
+/// Maximum bytes accepted on a command's standard input. This is intentionally independent of
+/// the output cap: language-server initialization includes the source text being diagnosed, but
+/// still must not become an unbounded allocation or pipe write.
+pub const STDIN_CAP: usize = 2 * 1024 * 1024;
+/// Maximum time a caller may keep stdin open after writing its bounded payload.
+pub const STDIN_CLOSE_DELAY_CAP: Duration = Duration::from_secs(10);
 
 /// A command to run.
 #[derive(Debug, Clone)]
@@ -46,6 +59,20 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub timeout: Duration,
+    /// Optional bounded bytes written to the child's stdin. `None` preserves the historical
+    /// behavior of attaching `/dev/null` (or the platform equivalent).
+    pub stdin: Option<Vec<u8>>,
+    /// Bounded grace period between writing `stdin` and closing the pipe. Language servers use
+    /// this to publish asynchronous diagnostics; ordinary commands keep the zero default.
+    pub stdin_close_delay: Duration,
+    /// Explicit environment entries for the target process. The ambient environment is still
+    /// cleared; these entries are additive to the small built-in usability set and pass strict
+    /// name/value/reserved-variable validation before any process is spawned.
+    pub env: Vec<(String, String)>,
+    /// Caller-created private directories that must remain readable when a sandbox backend hides
+    /// host runtime trees such as `/tmp` and `/run`. These are narrow, read-only visibility grants
+    /// for verified process artifacts, not additional writable roots.
+    pub private_read_roots: Vec<PathBuf>,
     /// Cooperative cancellation for an active command. Sandbox backends preserve this token
     /// when wrapping the command so cancellation reaches the process-group owner.
     pub cancellation: Option<CancellationToken>,
@@ -72,6 +99,10 @@ impl CommandSpec {
             args,
             cwd,
             timeout: Duration::from_secs(120),
+            stdin: None,
+            stdin_close_delay: Duration::ZERO,
+            env: Vec::new(),
+            private_read_roots: Vec::new(),
             cancellation: None,
         }
     }
@@ -116,6 +147,12 @@ pub enum ExecError {
     UnsupportedPolicy(String),
     #[error("command interrupted by user")]
     Cancelled,
+    #[error("command stdin is {actual} bytes; limit is {limit} bytes")]
+    StdinTooLarge { actual: usize, limit: usize },
+    #[error("command stdin close delay {actual:?} exceeds limit {limit:?}")]
+    StdinCloseDelayTooLong { actual: Duration, limit: Duration },
+    #[error("invalid explicit command environment: {0}")]
+    InvalidEnvironment(String),
     #[error("io error while running command: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -136,21 +173,62 @@ pub async fn run_capture(spec: &CommandSpec) -> Result<ExecOutput, ExecError> {
     {
         return Err(ExecError::Cancelled);
     }
+    if spec
+        .stdin
+        .as_ref()
+        .is_some_and(|stdin| stdin.len() > STDIN_CAP)
+    {
+        return Err(ExecError::StdinTooLarge {
+            actual: spec.stdin.as_ref().map_or(0, Vec::len),
+            limit: STDIN_CAP,
+        });
+    }
+    if spec.stdin_close_delay > STDIN_CLOSE_DELAY_CAP {
+        return Err(ExecError::StdinCloseDelayTooLong {
+            actual: spec.stdin_close_delay,
+            limit: STDIN_CLOSE_DELAY_CAP,
+        });
+    }
+    validate_explicit_environment(&spec.env)?;
+
     let mut cmd = tokio::process::Command::new(&spec.program);
     cmd.args(&spec.args)
         .current_dir(&spec.cwd)
-        .stdin(Stdio::null())
+        .stdin(if spec.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
-    configure_child_environment(&mut cmd);
+    configure_child_environment(&mut cmd, &spec.env);
 
     let mut child = cmd.spawn().map_err(|source| ExecError::Spawn {
         program: spec.program.clone(),
         source,
     })?;
+
+    let stdin_close_delay = spec.stdin_close_delay;
+    let mut stdin_writer = match (spec.stdin.clone(), child.stdin.take()) {
+        (Some(bytes), Some(mut stdin)) => Some(tokio::spawn(async move {
+            match stdin.write_all(&bytes).await {
+                Ok(()) => {
+                    if !stdin_close_delay.is_zero() {
+                        tokio::time::sleep(stdin_close_delay).await;
+                    }
+                    stdin.shutdown().await
+                }
+                // A process is allowed to decide it has consumed enough input and exit early.
+                // Preserve its exit status/output rather than replacing it with a pipe error.
+                Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(()),
+                Err(error) => Err(error),
+            }
+        })),
+        _ => None,
+    };
 
     let child_id = child.id();
     let mut process_group = ProcessGroupGuard::new(child_id);
@@ -185,6 +263,7 @@ pub async fn run_capture(spec: &CommandSpec) -> Result<ExecOutput, ExecError> {
             // draining so a child that deliberately escaped the group cannot hold us open.
             process_group.kill_remaining();
             process_group.disarm();
+            finish_stdin_writer(&mut stdin_writer).await?;
             finish_capture_readers(&mut stdout_reader, &mut stderr_reader).await?;
             let (stdout, t1) = snapshot(&stdout);
             let (stderr, t2) = snapshot(&stderr);
@@ -202,6 +281,7 @@ pub async fn run_capture(spec: &CommandSpec) -> Result<ExecOutput, ExecError> {
             let _ = child.start_kill();
             let _ = child.wait().await;
             process_group.disarm();
+            abort_stdin_writer(&mut stdin_writer).await;
             abort_capture_readers(&mut stdout_reader, &mut stderr_reader).await;
             Err(ExecError::Io(error))
         }
@@ -213,6 +293,7 @@ pub async fn run_capture(spec: &CommandSpec) -> Result<ExecOutput, ExecError> {
             let _ = child.start_kill();
             let _ = child.wait().await;
             process_group.disarm();
+            abort_stdin_writer(&mut stdin_writer).await;
 
             // Drain bytes already buffered in the pipes, but never let a surviving/misbehaving
             // descendant hold timeout reporting hostage.
@@ -243,9 +324,36 @@ pub async fn run_capture(spec: &CommandSpec) -> Result<ExecOutput, ExecError> {
             let _ = child.start_kill();
             let _ = child.wait().await;
             process_group.disarm();
+            abort_stdin_writer(&mut stdin_writer).await;
             finish_capture_readers(&mut stdout_reader, &mut stderr_reader).await?;
             Err(ExecError::Cancelled)
         }
+    }
+}
+
+async fn finish_stdin_writer(
+    writer: &mut Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+) -> Result<(), ExecError> {
+    let Some(mut writer) = writer.take() else {
+        return Ok(());
+    };
+    match tokio::time::timeout(Duration::from_secs(1), &mut writer).await {
+        Ok(Ok(result)) => result.map_err(ExecError::Io),
+        Ok(Err(error)) => Err(ExecError::Io(std::io::Error::other(format!(
+            "stdin writer failed: {error}"
+        )))),
+        Err(_) => {
+            writer.abort();
+            let _ = writer.await;
+            Ok(())
+        }
+    }
+}
+
+async fn abort_stdin_writer(writer: &mut Option<tokio::task::JoinHandle<std::io::Result<()>>>) {
+    if let Some(writer) = writer.take() {
+        writer.abort();
+        let _ = writer.await;
     }
 }
 
@@ -374,11 +482,93 @@ impl Drop for ProcessGroupGuard {
 /// inheritance, the command inside bubblewrap/Seatbelt receive only this narrow usability set.
 /// Backend-specific private values such as Seatbelt's `TMPDIR` are injected by the backend after
 /// this boundary, never copied from the host.
-fn configure_child_environment(command: &mut tokio::process::Command) {
+fn configure_child_environment(
+    command: &mut tokio::process::Command,
+    explicit: &[(String, String)],
+) {
     command.env_clear();
     for (key, value) in safe_child_environment(std::env::vars_os()) {
         command.env(key, value);
     }
+    for (key, value) in explicit {
+        command.env(key, value);
+    }
+}
+
+fn validate_explicit_environment(environment: &[(String, String)]) -> Result<(), ExecError> {
+    if environment.len() > MAX_EXPLICIT_ENV {
+        return Err(ExecError::InvalidEnvironment(format!(
+            "at most {MAX_EXPLICIT_ENV} explicit environment entries are allowed"
+        )));
+    }
+    let mut names = BTreeSet::new();
+    let mut total = 0_usize;
+    for (name, value) in environment {
+        if name.is_empty()
+            || name.len() > MAX_EXPLICIT_ENV_NAME_BYTES
+            || !name.bytes().enumerate().all(|(index, byte)| {
+                byte == b'_'
+                    || byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit())
+            })
+        {
+            return Err(ExecError::InvalidEnvironment(format!(
+                "invalid explicit environment name `{name}`"
+            )));
+        }
+        if reserved_environment_name(name) {
+            return Err(ExecError::InvalidEnvironment(format!(
+                "explicit environment name `{name}` is reserved"
+            )));
+        }
+        if value.len() > MAX_EXPLICIT_ENV_VALUE_BYTES || value.contains('\0') {
+            return Err(ExecError::InvalidEnvironment(format!(
+                "explicit environment value for `{name}` is invalid or exceeds {MAX_EXPLICIT_ENV_VALUE_BYTES} bytes"
+            )));
+        }
+        if !names.insert(name.to_ascii_uppercase()) {
+            return Err(ExecError::InvalidEnvironment(format!(
+                "duplicate explicit environment name `{name}`"
+            )));
+        }
+        total = total
+            .checked_add(name.len())
+            .and_then(|bytes| bytes.checked_add(value.len()))
+            .ok_or_else(|| ExecError::InvalidEnvironment("environment data is too large".into()))?;
+    }
+    if total > MAX_EXPLICIT_ENV_BYTES {
+        return Err(ExecError::InvalidEnvironment(format!(
+            "explicit environment data exceeds {MAX_EXPLICIT_ENV_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn reserved_environment_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == "PATH"
+        || upper == "HOME"
+        || upper == "TMPDIR"
+        || upper == "TEMP"
+        || upper == "TMP"
+        || upper == "TERM"
+        || upper == "COLORTERM"
+        || upper == "NO_COLOR"
+        || upper == "BASH_ENV"
+        || upper == "ENV"
+        || upper == "SHELLOPTS"
+        || upper == "CDPATH"
+        || upper == "GLOBIGNORE"
+        || upper == "PYTHONPATH"
+        || upper == "PYTHONHOME"
+        || upper == "PERL5LIB"
+        || upper == "RUBYLIB"
+        || upper == "RUBYOPT"
+        || upper == "NODE_OPTIONS"
+        || upper == "RUSTC_WRAPPER"
+        || upper.starts_with("LD_")
+        || upper.starts_with("DYLD_")
+        || upper.starts_with("GIT_")
+        || SAFE_LOCALE_ENV.contains(&upper.as_str())
 }
 
 fn safe_child_environment(
@@ -564,6 +754,71 @@ mod tests {
         assert_eq!(capture.retained_len(), OUTPUT_CAP);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_stdin_is_delivered_and_closed() {
+        let mut spec = CommandSpec::shell("/bin/cat", std::env::temp_dir());
+        spec.stdin = Some(b"language-server request\n".to_vec());
+        spec.timeout = Duration::from_secs(5);
+        let output = run_capture(&spec).await.expect("run cat");
+        assert!(output.succeeded(), "{output:?}");
+        assert_eq!(output.stdout, "language-server request\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_stdin_is_rejected_before_spawn() {
+        let mut spec = CommandSpec::shell("/bin/cat", std::env::temp_dir());
+        spec.stdin = Some(vec![0; STDIN_CAP + 1]);
+        let error = run_capture(&spec).await.expect_err("oversized stdin");
+        assert!(matches!(
+            error,
+            ExecError::StdinTooLarge {
+                actual,
+                limit: STDIN_CAP
+            } if actual == STDIN_CAP + 1
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn excessive_stdin_close_delay_is_rejected_before_spawn() {
+        let mut spec = CommandSpec::shell("/bin/cat", std::env::temp_dir());
+        spec.stdin = Some(Vec::new());
+        spec.stdin_close_delay = STDIN_CLOSE_DELAY_CAP + Duration::from_millis(1);
+        let error = run_capture(&spec).await.expect_err("excessive close delay");
+        assert!(matches!(error, ExecError::StdinCloseDelayTooLong { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_environment_is_added_without_restoring_ambient_secrets() {
+        let mut spec = CommandSpec {
+            program: "/usr/bin/env".to_string(),
+            args: Vec::new(),
+            cwd: PathBuf::from("/tmp"),
+            timeout: Duration::from_secs(5),
+            stdin: None,
+            stdin_close_delay: Duration::ZERO,
+            env: vec![("GROKFORGE_CUSTOM_LABEL".into(), "visible".into())],
+            private_read_roots: Vec::new(),
+            cancellation: None,
+        };
+        let output = run_capture(&spec).await.expect("explicit environment");
+        assert!(
+            output
+                .stdout
+                .lines()
+                .any(|line| line == "GROKFORGE_CUSTOM_LABEL=visible")
+        );
+
+        spec.env = vec![("DYLD_INSERT_LIBRARIES".into(), "/tmp/inject".into())];
+        assert!(matches!(
+            run_capture(&spec).await,
+            Err(ExecError::InvalidEnvironment(_))
+        ));
+    }
+
     #[test]
     fn explicit_environment_allowlist_rejects_unknown_and_malformed_values() {
         let first_path = std::env::current_dir().expect("current directory");
@@ -651,6 +906,10 @@ mod tests {
                     args: Vec::new(),
                     cwd: PathBuf::from("/tmp"),
                     timeout: Duration::from_secs(5),
+                    stdin: None,
+                    stdin_close_delay: Duration::ZERO,
+                    env: Vec::new(),
+                    private_read_roots: Vec::new(),
                     cancellation: None,
                 }))
                 .expect("capture child environment");
@@ -748,6 +1007,10 @@ mod tests {
             ],
             cwd: std::env::temp_dir(),
             timeout: Duration::from_secs(5),
+            stdin: None,
+            stdin_close_delay: Duration::ZERO,
+            env: Vec::new(),
+            private_read_roots: Vec::new(),
             cancellation: None,
         }
     }

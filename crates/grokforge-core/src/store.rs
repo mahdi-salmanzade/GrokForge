@@ -21,6 +21,9 @@ const MAX_METADATA_RESULTS: usize = 1_000;
 const MAX_METADATA_WORKSPACE_BYTES: usize = 4 * 1024;
 const MAX_METADATA_MODEL_BYTES: usize = 256;
 const MAX_METADATA_PROMPT_BYTES: usize = 1024;
+const MAX_METADATA_TITLE_BYTES: usize = 1024;
+const MAX_SESSION_TITLE_CHARS: usize = 120;
+const MAX_SESSION_QUERY_BYTES: usize = 512;
 
 /// Reasoning effort persisted independently of configuration defaults. `Auto` is explicit, while
 /// a missing field identifies legacy metadata that should still fall back to current config.
@@ -139,6 +142,12 @@ pub fn rollout_path(dir: &Path, session_uuid: &str) -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub session_id: String,
+    /// Optional human-readable label. Older metadata did not have names and remains readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The source session when this session was created with `sessions fork`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
     pub workspace: PathBuf,
     /// Canonical repository root (or canonical workspace for a non-repository session).
     #[serde(default)]
@@ -161,12 +170,7 @@ pub struct SessionMeta {
 impl SessionMeta {
     #[must_use]
     pub fn new(session: SessionId, workspace: PathBuf, model: String, first_prompt: &str) -> Self {
-        let created = SystemTime::now().duration_since(UNIX_EPOCH).ok();
-        let created_unix = created
-            .as_ref()
-            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
-        let created_unix_nanos = created.map_or(0, |d| d.subsec_nanos());
-        let prompt = crate::redaction::Redactor::apply(first_prompt);
+        let (created_unix, created_unix_nanos) = current_timestamp();
         let canonical_workspace = std::fs::canonicalize(&workspace).unwrap_or(workspace);
         let workspace_identity = grokforge_git::Git::discover(&canonical_workspace)
             .and_then(|git| std::fs::canonicalize(git.root()).ok())
@@ -174,6 +178,8 @@ impl SessionMeta {
         let workspace_fingerprint = workspace_fingerprint(&canonical_workspace);
         Self {
             session_id: session.as_uuid().to_string(),
+            title: None,
+            parent_session_id: None,
             workspace: canonical_workspace,
             workspace_identity,
             workspace_fingerprint,
@@ -181,12 +187,7 @@ impl SessionMeta {
             effort: None,
             created_unix,
             created_unix_nanos,
-            first_prompt: prompt
-                .text
-                .chars()
-                .map(|c| if c.is_control() { ' ' } else { c })
-                .take(120)
-                .collect(),
+            first_prompt: normalize_first_prompt(first_prompt),
         }
     }
 
@@ -258,6 +259,47 @@ impl SessionMeta {
         Ok(())
     }
 
+    /// Create the canonical rollout and metadata for a brand-new session as one lifecycle step.
+    ///
+    /// The rollout lock is acquired before checking that neither canonical file existed. If the
+    /// metadata write fails, both newly-created canonical files are removed while that same lock
+    /// is still held. The lock file itself is intentionally retained, matching normal session
+    /// deletion and preventing later processes from racing onto a replacement lock inode.
+    pub async fn create_rollout(
+        &self,
+        dir: &Path,
+        session: SessionId,
+    ) -> std::io::Result<RolloutWriter> {
+        let rollout = RolloutWriter::create_new(dir, session).await?;
+        self.write_new_with_rollout(dir, session, rollout).await
+    }
+
+    /// Publish metadata for an already-prepared fresh rollout. This is used by session forking,
+    /// which must finish copying the source history before the new session becomes discoverable.
+    pub async fn write_new_with_rollout(
+        &self,
+        dir: &Path,
+        session: SessionId,
+        rollout: RolloutWriter,
+    ) -> std::io::Result<RolloutWriter> {
+        if !rollout.is_new_session(dir, session) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "refusing to publish metadata over a pre-existing session",
+            ));
+        }
+        match self.write(dir, session).await {
+            Ok(()) => Ok(rollout),
+            Err(write_error) => match rollout.discard_incomplete(dir, session).await {
+                Ok(()) => Err(write_error),
+                Err(cleanup_error) => Err(std::io::Error::new(
+                    write_error.kind(),
+                    format!("{write_error}; failed to clean incomplete session: {cleanup_error}"),
+                )),
+            },
+        }
+    }
+
     /// Persist a runtime model switch without changing the session's creation identity or first
     /// prompt. The normal bounded/private metadata writer remains the only mutation path.
     pub async fn update_model(
@@ -281,6 +323,27 @@ impl SessionMeta {
         meta.write(dir, session).await
     }
 
+    /// Fill the discovery label for a session that was created before its first interactive
+    /// prompt was known. Existing labels are never replaced, so retries and later turns cannot
+    /// silently change the session's identity in list/search output.
+    pub async fn set_first_prompt_if_empty(
+        dir: &Path,
+        session: SessionId,
+        first_prompt: &str,
+    ) -> std::io::Result<bool> {
+        let mut meta = Self::for_update(dir, session).await?;
+        if !meta.first_prompt.is_empty() {
+            return Ok(false);
+        }
+        let first_prompt = normalize_first_prompt(first_prompt);
+        if first_prompt.trim().is_empty() {
+            return Ok(false);
+        }
+        meta.first_prompt = first_prompt;
+        meta.write(dir, session).await?;
+        Ok(true)
+    }
+
     /// Atomically persist a model switch and its required effort adjustment.
     pub async fn update_model_and_effort(
         dir: &Path,
@@ -292,6 +355,156 @@ impl SessionMeta {
         meta.model = model;
         meta.effort = Some(PersistedEffort::from_runtime(effort));
         meta.write(dir, session).await
+    }
+
+    /// Give a saved session a human-readable title. Renaming is refused while the session is
+    /// active so an older process cannot overwrite the updated metadata on shutdown.
+    pub async fn rename(dir: &Path, session: SessionId, title: &str) -> std::io::Result<Self> {
+        // Reject invalid input before creating a lock file. Besides avoiding needless filesystem
+        // work, this keeps repeated validation failures independent of asynchronous lock cleanup.
+        let title = normalize_session_title(title)?;
+        ensure_private_dir(dir).await?;
+        let lock_path = dir.join(format!("rollout-{}.lock", session.as_uuid()));
+        let _lock = SessionLock::acquire(lock_path).await?;
+        let mut meta = Self::for_update(dir, session).await?;
+        meta.title = Some(title);
+        meta.write(dir, session).await?;
+        Ok(meta)
+    }
+
+    /// Clone the current model-visible history into a fresh append-only rollout. The source lock
+    /// is held for the whole operation so the fork is an exact point-in-time snapshot.
+    pub async fn fork(
+        dir: &Path,
+        source: &SessionMeta,
+        title: Option<&str>,
+    ) -> std::io::Result<Self> {
+        let source_id = SessionId::parse_str(&source.session_id)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let title = title.map(normalize_session_title).transpose()?;
+        let (_source_writer, history) = RolloutWriter::open_and_read(dir, source_id).await?;
+        let source = Self::for_update(dir, source_id).await?;
+
+        let fork_id = SessionId::new();
+        let mut fork_writer = RolloutWriter::create_new(dir, fork_id).await?;
+        let append_result = async {
+            for item in &history {
+                fork_writer.append(item).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        }
+        .await;
+        if let Err(error) = append_result {
+            return match fork_writer.discard_incomplete(dir, fork_id).await {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(std::io::Error::new(
+                    error.kind(),
+                    format!("{error}; failed to clean incomplete fork: {cleanup_error}"),
+                )),
+            };
+        }
+
+        let mut fork = source.clone();
+        fork.session_id = fork_id.as_uuid().to_string();
+        fork.parent_session_id = Some(source.session_id.clone());
+        fork.title = title.or_else(|| source.title.clone());
+        (fork.created_unix, fork.created_unix_nanos) = current_timestamp();
+        let fork_writer = fork
+            .write_new_with_rollout(dir, fork_id, fork_writer)
+            .await?;
+        drop(fork_writer);
+        Ok(fork)
+    }
+
+    /// Permanently remove a session's metadata and canonical rollout. A per-session lock prevents
+    /// deleting a session that is currently open. Lock files are intentionally retained so no
+    /// second process can race onto a replacement lock inode.
+    pub async fn delete(dir: &Path, session: SessionId) -> std::io::Result<()> {
+        ensure_private_dir(dir).await?;
+        let lock_path = dir.join(format!("rollout-{}.lock", session.as_uuid()));
+        let _lock = SessionLock::acquire(lock_path).await?;
+        let meta = Self::for_update(dir, session).await?;
+        let metadata_path = Self::path(dir, session);
+        let rollout_path = meta.rollout(dir);
+
+        // Validate both entries before changing either one. The owner-private directory prevents
+        // another process from replacing them between this validation and unlinking.
+        validate_removable_entry(&metadata_path, false)?;
+        let rollout_exists = validate_removable_entry(&rollout_path, true)?;
+        tokio::fs::remove_file(metadata_path).await?;
+        if rollout_exists {
+            tokio::fs::remove_file(rollout_path).await?;
+        }
+        #[cfg(unix)]
+        sync_directory(dir).await?;
+        Ok(())
+    }
+
+    /// Search metadata and the full physical append-only transcript, including turns removed from
+    /// the model-visible replay window by compaction. Query terms are case-insensitive and may
+    /// match across different records; every term must be present for a session to be returned.
+    pub async fn search(dir: &Path, query: &str) -> std::io::Result<Vec<SessionSearchResult>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session search query must not be empty",
+            ));
+        }
+        if query.len() > MAX_SESSION_QUERY_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("session search query exceeds {MAX_SESSION_QUERY_BYTES} bytes"),
+            ));
+        }
+        let terms = query
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
+        let mut results = Vec::new();
+        for meta in Self::list(dir).await {
+            let metadata_text = metadata_search_text(&meta);
+            let mut matched = vec![false; terms.len()];
+            let _ = mark_query_terms(&metadata_text, &terms, &mut matched);
+            let mut matched_items = 0usize;
+            let mut snippet = matched
+                .iter()
+                .any(|term| *term)
+                .then(|| search_snippet(meta.title.as_deref().unwrap_or(&meta.first_prompt)));
+
+            if !matched.iter().all(|term| *term) {
+                match RolloutWriter::search_physical_history(
+                    &meta.rollout(dir),
+                    &terms,
+                    &mut matched,
+                )
+                .await
+                {
+                    Ok((history_matches, history_snippet)) => {
+                        matched_items = history_matches;
+                        if let Some(history_snippet) = history_snippet {
+                            snippet = Some(search_snippet(&history_snippet));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = %meta.session_id,
+                            %error,
+                            "skipping unreadable rollout during session search"
+                        );
+                    }
+                }
+            }
+            if matched.iter().all(|term| *term) {
+                results.push(SessionSearchResult {
+                    meta,
+                    snippet: snippet.unwrap_or_default(),
+                    matched_items,
+                });
+            }
+        }
+        Ok(results)
     }
 
     async fn for_update(dir: &Path, session: SessionId) -> std::io::Result<Self> {
@@ -378,6 +591,154 @@ impl SessionMeta {
     }
 }
 
+/// A matching saved session and a bounded human-readable excerpt.
+#[derive(Debug, Clone)]
+pub struct SessionSearchResult {
+    pub meta: SessionMeta,
+    pub snippet: String,
+    pub matched_items: usize,
+}
+
+fn current_timestamp() -> (i64, u32) {
+    let created = SystemTime::now().duration_since(UNIX_EPOCH).ok();
+    let seconds = created
+        .as_ref()
+        .map_or(0, |duration| i64::try_from(duration.as_secs()).unwrap_or(0));
+    let nanos = created.map_or(0, |duration| duration.subsec_nanos());
+    (seconds, nanos)
+}
+
+fn normalize_session_title(title: &str) -> std::io::Result<String> {
+    if title.len() > MAX_METADATA_TITLE_BYTES || title.chars().count() > MAX_SESSION_TITLE_CHARS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("session title must be at most {MAX_SESSION_TITLE_CHARS} characters"),
+        ));
+    }
+    let redacted = crate::redaction::Redactor::apply(title);
+    let normalized = redacted
+        .text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "session title must not be empty",
+        ));
+    }
+    if normalized.chars().count() > MAX_SESSION_TITLE_CHARS
+        || normalized.len() > MAX_METADATA_TITLE_BYTES
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("session title must be at most {MAX_SESSION_TITLE_CHARS} characters"),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn normalize_first_prompt(prompt: &str) -> String {
+    crate::redaction::Redactor::apply(prompt)
+        .text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(120)
+        .collect()
+}
+
+fn metadata_search_text(meta: &SessionMeta) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        meta.session_id,
+        meta.title.as_deref().unwrap_or_default(),
+        meta.parent_session_id.as_deref().unwrap_or_default(),
+        meta.workspace.display(),
+        meta.model,
+        meta.first_prompt
+    )
+}
+
+fn response_item_search_text(item: &ResponseItem) -> Option<String> {
+    match item {
+        ResponseItem::UserMessage { text, images, .. } => {
+            let image_types = images
+                .iter()
+                .map(|image| image.mime_type.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(format!("user {text} images {image_types}"))
+        }
+        ResponseItem::AssistantMessage { text } => Some(format!("assistant {text}")),
+        ResponseItem::Reasoning { text } => Some(format!("reasoning {text}")),
+        ResponseItem::EncryptedReasoning {
+            id,
+            status,
+            summary,
+            ..
+        } => serde_json::to_string(summary)
+            .ok()
+            .map(|summary| format!("encrypted reasoning {id} {status} {summary}")),
+        ResponseItem::ProviderOutput { item } => serde_json::to_string(item).ok(),
+        ResponseItem::ToolCall {
+            id,
+            name,
+            arguments,
+        } => Some(format!("tool call {} {name} {arguments}", id.as_str())),
+        ResponseItem::ToolResult {
+            id,
+            content,
+            is_error,
+            ..
+        } => Some(format!("tool result {} {is_error} {content}", id.as_str())),
+        ResponseItem::CompactionSummary { text, .. } => Some(format!("summary {text}")),
+        ResponseItem::CompactionCheckpoint { .. } => None,
+    }
+}
+
+fn mark_query_terms(text: &str, terms: &[String], matched: &mut [bool]) -> bool {
+    let text = text.to_lowercase();
+    let mut contains_any = false;
+    for (index, term) in terms.iter().enumerate() {
+        if text.contains(term) {
+            contains_any = true;
+            if !matched[index] {
+                matched[index] = true;
+            }
+        }
+    }
+    contains_any
+}
+
+fn search_snippet(text: &str) -> String {
+    // Rollouts are owner-private and normal persistence redacts at ingress, but search also reads
+    // the physical append-only log. Re-apply redaction at the final display boundary so a damaged
+    // or hand-edited record cannot turn session discovery into a secret-printing primitive.
+    crate::redaction::Redactor::apply(text)
+        .text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(160)
+        .collect()
+}
+
 fn compare_metadata(left: &SessionMeta, right: &SessionMeta) -> std::cmp::Ordering {
     (
         left.created_unix,
@@ -393,6 +754,15 @@ fn compare_metadata(left: &SessionMeta, right: &SessionMeta) -> std::cmp::Orderi
 
 fn metadata_fields_are_bounded(meta: &SessionMeta) -> bool {
     meta.session_id.len() <= 36
+        && meta.title.as_ref().is_none_or(|title| {
+            title.len() <= MAX_METADATA_TITLE_BYTES
+                && title.chars().count() <= MAX_SESSION_TITLE_CHARS
+                && !title.chars().any(char::is_control)
+        })
+        && meta
+            .parent_session_id
+            .as_ref()
+            .is_none_or(|parent| parent.len() <= 36 && SessionId::parse_str(parent).is_ok())
         && meta.workspace.to_string_lossy().len() <= MAX_METADATA_WORKSPACE_BYTES
         && meta
             .workspace_identity
@@ -404,6 +774,25 @@ fn metadata_fields_are_bounded(meta: &SessionMeta) -> bool {
             .is_none_or(|fingerprint| fingerprint.len() <= MAX_METADATA_WORKSPACE_BYTES)
         && meta.model.len() <= MAX_METADATA_MODEL_BYTES
         && meta.first_prompt.len() <= MAX_METADATA_PROMPT_BYTES
+}
+
+fn validate_removable_entry(path: &Path, missing_ok: bool) -> std::io::Result<bool> {
+    match open_regular_read(path) {
+        Ok(file) => {
+            drop(file);
+            Ok(true)
+        }
+        Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn path_entry_is_absent(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 fn workspace_fingerprint(workspace: &Path) -> Option<String> {
@@ -444,7 +833,9 @@ fn workspace_fingerprint(workspace: &Path) -> Option<String> {
 pub struct RolloutWriter {
     path: PathBuf,
     file: tokio::fs::File,
-    _lock: SessionLock,
+    lock: SessionLock,
+    /// True only when both canonical files were absent after acquiring this writer's lock.
+    new_session: bool,
 }
 
 struct CappedRolloutLine {
@@ -489,6 +880,48 @@ impl RolloutWriter {
             .map(|(writer, _)| writer)
     }
 
+    /// Create a rollout only when neither canonical file for this session exists. The retained
+    /// lock file is allowed, but a pre-existing rollout or metadata record is never opened,
+    /// repaired, overwritten, or removed by this fresh-session path.
+    async fn create_new(dir: &Path, session: SessionId) -> std::io::Result<Self> {
+        ensure_private_dir(dir).await?;
+        let path = rollout_path(dir, &session.as_uuid().to_string());
+        let lock_path = dir.join(format!("rollout-{}.lock", session.as_uuid()));
+        let session_lock = SessionLock::acquire(lock_path).await?;
+        if !path_entry_is_absent(&path)? || !path_entry_is_absent(&SessionMeta::path(dir, session))?
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "session already has a canonical record",
+            ));
+        }
+        let file = open_rollout_create_new(&path)?;
+        let writer = Self {
+            path,
+            file,
+            lock: session_lock,
+            new_session: true,
+        };
+        #[cfg(unix)]
+        let setup_result = async {
+            set_private_open_file_permissions(&writer.file).await?;
+            sync_directory(dir).await
+        }
+        .await;
+        #[cfg(not(unix))]
+        let setup_result: std::io::Result<()> = Ok(());
+        match setup_result {
+            Ok(()) => Ok(writer),
+            Err(setup_error) => match writer.discard_incomplete(dir, session).await {
+                Ok(()) => Err(setup_error),
+                Err(cleanup_error) => Err(std::io::Error::new(
+                    setup_error.kind(),
+                    format!("{setup_error}; failed to clean incomplete session: {cleanup_error}"),
+                )),
+            },
+        }
+    }
+
     /// Exclusively open a session and read/repair its history while holding the same lifetime
     /// lock the returned writer owns. Resume callers must use this instead of a separate
     /// `read_all` + `create` sequence.
@@ -500,6 +933,8 @@ impl RolloutWriter {
         let path = rollout_path(dir, &session.as_uuid().to_string());
         let lock_path = dir.join(format!("rollout-{}.lock", session.as_uuid()));
         let session_lock = SessionLock::acquire(lock_path).await?;
+        let new_session =
+            path_entry_is_absent(&path)? && path_entry_is_absent(&SessionMeta::path(dir, session))?;
         repair_truncated_tail(&path).await?;
         let mut history = match Self::read_all_raw(&path).await {
             Ok(history) => history,
@@ -517,13 +952,48 @@ impl RolloutWriter {
         let mut writer = Self {
             path,
             file,
-            _lock: session_lock,
+            lock: session_lock,
+            new_session,
         };
         for repair in repairs {
             writer.append(&repair).await?;
             history.push(repair);
         }
         Ok((writer, history))
+    }
+
+    fn is_new_session(&self, dir: &Path, session: SessionId) -> bool {
+        self.new_session && self.path == rollout_path(dir, &session.as_uuid().to_string())
+    }
+
+    async fn discard_incomplete(self, dir: &Path, session: SessionId) -> std::io::Result<()> {
+        if !self.is_new_session(dir, session) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing to discard a pre-existing session",
+            ));
+        }
+        let Self {
+            path,
+            file,
+            lock,
+            new_session: _,
+        } = self;
+        // Keep `lock` alive until every canonical path operation and directory sync completes.
+        // Closing the rollout first also makes removal portable to platforms that forbid unlinking
+        // an open file.
+        drop(file);
+        let metadata_path = SessionMeta::path(dir, session);
+        if validate_removable_entry(&metadata_path, true)? {
+            tokio::fs::remove_file(&metadata_path).await?;
+        }
+        if validate_removable_entry(&path, true)? {
+            tokio::fs::remove_file(&path).await?;
+        }
+        #[cfg(unix)]
+        sync_directory(dir).await?;
+        drop(lock);
+        Ok(())
     }
 
     #[must_use]
@@ -555,6 +1025,100 @@ impl RolloutWriter {
         let repairs = interrupted_tool_results(&items);
         items.extend(repairs);
         Ok(items)
+    }
+
+    /// Stream the physical append-only rollout for session discovery.
+    ///
+    /// Unlike [`Self::read_all`], this deliberately does not replace the preceding prefix when it
+    /// encounters a compaction checkpoint: old turns remain searchable even after they leave the
+    /// model-visible replay window. Memory remains bounded by the per-record cap. A checkpoint's
+    /// embedded visible history is searched as one physical record too, preserving discoverability
+    /// of generated compaction summaries without recursively accepting malformed checkpoints.
+    async fn search_physical_history(
+        path: &Path,
+        terms: &[String],
+        matched: &mut [bool],
+    ) -> std::io::Result<(usize, Option<String>)> {
+        let file = open_regular_read(path)?;
+        let mut reader = BufReader::new(file);
+        let mut matched_items = 0usize;
+        let mut snippet = None;
+        let mut line_number = 0usize;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let complete = read_line_capped(&mut reader, &mut line, MAX_ROLLOUT_LINE_BYTES)
+                .await
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::InvalidData {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "rollout line {} exceeds {MAX_ROLLOUT_LINE_BYTES} bytes",
+                                line_number.saturating_add(1)
+                            ),
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+            if line.is_empty() {
+                break;
+            }
+            line_number = line_number.saturating_add(1);
+            if complete {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+
+            let item = match serde_json::from_slice::<ResponseItem>(&line) {
+                Ok(item) => item,
+                Err(_) if !complete => break,
+                Err(error) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("malformed rollout line {line_number}: {error}"),
+                    ));
+                }
+            };
+            let first_match = match item {
+                ResponseItem::CompactionCheckpoint { history } => {
+                    if history
+                        .iter()
+                        .any(|item| matches!(item, ResponseItem::CompactionCheckpoint { .. }))
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "nested compaction checkpoint in rollout",
+                        ));
+                    }
+                    let mut first_match = None;
+                    for item in &history {
+                        let Some(text) = response_item_search_text(item) else {
+                            continue;
+                        };
+                        if mark_query_terms(&text, terms, matched) && first_match.is_none() {
+                            first_match = Some(text);
+                        }
+                    }
+                    first_match
+                }
+                item => response_item_search_text(&item)
+                    .filter(|text| mark_query_terms(text, terms, matched)),
+            };
+            if let Some(text) = first_match {
+                matched_items = matched_items.saturating_add(1);
+                if snippet.is_none() {
+                    snippet = Some(text);
+                }
+            }
+        }
+        Ok((matched_items, snippet))
     }
 
     async fn read_all_raw(path: &Path) -> std::io::Result<Vec<ResponseItem>> {
@@ -638,7 +1202,17 @@ impl RolloutWriter {
 
 #[derive(Debug)]
 struct SessionLock {
-    _file: std::fs::File,
+    file: std::fs::File,
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        // Do not rely solely on platform close semantics here. In particular, an immediately
+        // following lifecycle operation may otherwise observe a short-lived stale advisory lock
+        // on some BSD-derived hosts. The descriptor is still closed normally after this best-
+        // effort explicit release.
+        let _ = fs4::FileExt::unlock(&self.file);
+    }
 }
 
 impl SessionLock {
@@ -656,7 +1230,7 @@ impl SessionLock {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
         match fs4::FileExt::try_lock(&file) {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => Ok(Self { file }),
             Err(fs4::TryLockError::WouldBlock) => Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "session is already open in another process",
@@ -1006,6 +1580,35 @@ fn open_rollout_append(path: &Path) -> std::io::Result<tokio::fs::File> {
     Ok(tokio::fs::File::from_std(file))
 }
 
+fn open_rollout_create_new(path: &Path) -> std::io::Result<tokio::fs::File> {
+    #[cfg(unix)]
+    let file = open_regular_unix(
+        path,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::APPEND
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::from_bits_truncate(0o600),
+    )?;
+    #[cfg(not(unix))]
+    let file = {
+        if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing symlinked session store entry",
+            ));
+        }
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(path)?;
+        validate_single_link_regular(&file)?;
+        file
+    };
+    Ok(tokio::fs::File::from_std(file))
+}
+
 fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
@@ -1153,6 +1756,72 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         drop(first);
         RolloutWriter::create(dir.path(), id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_new_metadata_removes_only_fresh_canonical_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionId::new();
+        let mismatched = SessionMeta::new(
+            SessionId::new(),
+            PathBuf::from("/tmp"),
+            "model".to_string(),
+            "prompt",
+        );
+
+        let error = mismatched
+            .create_rollout(dir.path(), session)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!rollout_path(dir.path(), &session.as_uuid().to_string()).exists());
+        assert!(!SessionMeta::path(dir.path(), session).exists());
+        assert!(
+            dir.path()
+                .join(format!("rollout-{}.lock", session.as_uuid()))
+                .exists(),
+            "the stable lock inode must be retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_creation_never_opens_or_removes_an_existing_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionId::new();
+        let original = SessionMeta::new(
+            session,
+            PathBuf::from("/tmp"),
+            "original-model".to_string(),
+            "original prompt",
+        );
+        let mut writer = original.create_rollout(dir.path(), session).await.unwrap();
+        writer
+            .append(&ResponseItem::assistant("preserve me"))
+            .await
+            .unwrap();
+        drop(writer);
+
+        let replacement = SessionMeta::new(
+            session,
+            PathBuf::from("/tmp"),
+            "replacement-model".to_string(),
+            "replacement prompt",
+        );
+        let error = replacement
+            .create_rollout(dir.path(), session)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+
+        let saved = SessionMeta::list(dir.path()).await.pop().unwrap();
+        assert_eq!(saved.model, "original-model");
+        assert_eq!(saved.first_prompt, "original prompt");
+        assert_eq!(
+            RolloutWriter::read_all(&saved.rollout(dir.path()))
+                .await
+                .unwrap(),
+            vec![ResponseItem::assistant("preserve me")]
+        );
     }
 
     #[tokio::test]
@@ -1317,6 +1986,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_search_finds_compacted_away_physical_history_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SessionId::new();
+        let meta = SessionMeta::new(
+            id,
+            workspace.path().to_path_buf(),
+            "grok-build-0.1".into(),
+            "initial task",
+        );
+        meta.write(dir.path(), id).await.unwrap();
+
+        let leaked = "xai-ABCDEF0123456789XYZ";
+        let mut writer = RolloutWriter::create(dir.path(), id).await.unwrap();
+        writer
+            .append(&ResponseItem::assistant(format!(
+                "physical-needle {leaked}\u{1b}[31m"
+            )))
+            .await
+            .unwrap();
+        writer
+            .append(&ResponseItem::CompactionCheckpoint {
+                history: vec![
+                    ResponseItem::CompactionSummary {
+                        text: "older context summarized".into(),
+                        redactions: 0,
+                    },
+                    ResponseItem::user("visible tail"),
+                ],
+            })
+            .await
+            .unwrap();
+        drop(writer);
+
+        let visible = RolloutWriter::read_all(&meta.rollout(dir.path()))
+            .await
+            .unwrap();
+        assert!(!visible.iter().any(|item| {
+            response_item_search_text(item).is_some_and(|text| text.contains("physical-needle"))
+        }));
+
+        let matches = SessionMeta::search(dir.path(), "physical-needle")
+            .await
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].matched_items, 1);
+        assert!(matches[0].snippet.contains("physical-needle"));
+        assert!(matches[0].snippet.contains("[REDACTED:xai-key]"));
+        assert!(!matches[0].snippet.contains(leaked));
+        assert!(!matches[0].snippet.chars().any(char::is_control));
+    }
+
     #[test]
     fn metadata_redacts_and_sanitizes_first_prompt() {
         let meta = SessionMeta::new(
@@ -1328,6 +2050,39 @@ mod tests {
         assert!(!meta.first_prompt.contains("very-secret-password-value"));
         assert!(!meta.first_prompt.contains('\n'));
         assert!(!meta.first_prompt.contains('\u{1b}'));
+    }
+
+    #[tokio::test]
+    async fn interactive_first_prompt_is_filled_once_and_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = SessionId::new();
+        SessionMeta::new(id, PathBuf::from("/tmp"), "m".into(), "")
+            .write(dir.path(), id)
+            .await
+            .unwrap();
+
+        let leaked = "xai-ABCDEF0123456789XYZ";
+        assert!(
+            SessionMeta::set_first_prompt_if_empty(
+                dir.path(),
+                id,
+                &format!("first task {leaked}\n\u{1b}[31m")
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !SessionMeta::set_first_prompt_if_empty(dir.path(), id, "replacement task")
+                .await
+                .unwrap()
+        );
+
+        let saved = SessionMeta::list(dir.path()).await.pop().unwrap();
+        assert!(saved.first_prompt.contains("first task"));
+        assert!(saved.first_prompt.contains("[REDACTED:xai-key]"));
+        assert!(!saved.first_prompt.contains(leaked));
+        assert!(!saved.first_prompt.contains("replacement task"));
+        assert!(!saved.first_prompt.chars().any(char::is_control));
     }
 
     #[tokio::test]
@@ -1405,6 +2160,113 @@ mod tests {
         }"#;
         let legacy: SessionMeta = serde_json::from_str(json).unwrap();
         assert_eq!(legacy.effort, None);
+        assert_eq!(legacy.title, None);
+        assert_eq!(legacy.parent_session_id, None);
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_searches_renames_forks_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source_id = SessionId::new();
+        let source = SessionMeta::new(
+            source_id,
+            workspace.path().to_path_buf(),
+            "grok-build-0.1".into(),
+            "initial architecture task",
+        );
+        source.write(dir.path(), source_id).await.unwrap();
+        let mut writer = RolloutWriter::create(dir.path(), source_id).await.unwrap();
+        writer
+            .append(&ResponseItem::user("inspect the persistence layer"))
+            .await
+            .unwrap();
+        writer
+            .append(&ResponseItem::assistant(
+                "the lunar needle is in the transcript",
+            ))
+            .await
+            .unwrap();
+        drop(writer);
+
+        let renamed = SessionMeta::rename(dir.path(), source_id, "Release\nreview")
+            .await
+            .unwrap();
+        assert_eq!(renamed.title.as_deref(), Some("Release review"));
+
+        let matches = SessionMeta::search(dir.path(), "release needle")
+            .await
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].meta.session_id, source.session_id);
+        assert_eq!(matches[0].matched_items, 1);
+        assert!(matches[0].snippet.contains("needle"));
+
+        let forked = SessionMeta::fork(dir.path(), &renamed, Some("Alternative path"))
+            .await
+            .unwrap();
+        assert_ne!(forked.session_id, source.session_id);
+        assert_eq!(
+            forked.parent_session_id.as_deref(),
+            Some(source.session_id.as_str())
+        );
+        assert_eq!(forked.title.as_deref(), Some("Alternative path"));
+        let fork_history = RolloutWriter::read_all(&forked.rollout(dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            fork_history,
+            vec![
+                ResponseItem::user("inspect the persistence layer"),
+                ResponseItem::assistant("the lunar needle is in the transcript")
+            ]
+        );
+
+        let fork_id = SessionId::parse_str(&forked.session_id).unwrap();
+        SessionMeta::delete(dir.path(), fork_id).await.unwrap();
+        assert_eq!(SessionMeta::list(dir.path()).await.len(), 1);
+
+        let active = RolloutWriter::create(dir.path(), source_id).await.unwrap();
+        let error = SessionMeta::delete(dir.path(), source_id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        drop(active);
+        SessionMeta::delete(dir.path(), source_id).await.unwrap();
+        assert!(SessionMeta::list(dir.path()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_titles_and_queries_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionId::new();
+        let meta = SessionMeta::new(session, PathBuf::from("/tmp"), "m".into(), "task");
+        meta.write(dir.path(), session).await.unwrap();
+        assert_eq!(
+            SessionMeta::rename(dir.path(), session, "")
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            SessionMeta::rename(
+                dir.path(),
+                session,
+                &"x".repeat(MAX_SESSION_TITLE_CHARS + 1)
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            SessionMeta::search(dir.path(), "")
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     #[cfg(unix)]

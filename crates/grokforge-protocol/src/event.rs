@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::approval::ApprovalRequest;
 use crate::ids::{SessionId, ToolCallId, TurnId};
 use crate::ledger::LedgerEntry;
+use crate::question::QuestionRequest;
 use crate::sandbox::DenialClass;
 use crate::usage::{StopReason, Usage};
 
@@ -46,6 +47,16 @@ pub enum EventMsg {
     ApprovalResolved {
         summary: String,
         decision: String,
+        auto: bool,
+    },
+    /// The core is waiting for structured user input requested by the model.
+    QuestionRequested(QuestionRequest),
+    /// A structured question request finished. Answers are intentionally omitted from the event
+    /// stream; the model-visible tool result already persists them in the session transcript.
+    QuestionResolved {
+        id: crate::ids::QuestionId,
+        answered: usize,
+        cancelled: bool,
         auto: bool,
     },
     /// A ledger entry was recorded for the request being assembled.

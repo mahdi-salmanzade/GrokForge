@@ -354,9 +354,14 @@ impl SeatbeltRunner {
         }
         // The command itself. Point TMPDIR at the per-command directory rather than granting
         // access to the process-wide macOS temp tree used by other applications.
-        if let Some(temp) = private_temp {
+        if private_temp.is_some() || !command.env.is_empty() {
             args.push("/usr/bin/env".to_string());
+        }
+        if let Some(temp) = private_temp {
             args.push(format!("TMPDIR={}", canonical(temp)));
+        }
+        for (name, value) in &command.env {
+            args.push(format!("{name}={value}"));
         }
         args.push(command.program.clone());
         args.extend(command.args.iter().cloned());
@@ -366,6 +371,10 @@ impl SeatbeltRunner {
             args,
             cwd: command.cwd.clone(),
             timeout: command.timeout,
+            stdin: command.stdin.clone(),
+            stdin_close_delay: command.stdin_close_delay,
+            env: Vec::new(),
+            private_read_roots: Vec::new(),
             cancellation: command.cancellation.clone(),
         })
     }
@@ -502,6 +511,10 @@ mod tests {
             args: args.iter().map(|s| (*s).to_string()).collect(),
             cwd,
             timeout: Duration::from_secs(10),
+            stdin: None,
+            stdin_close_delay: Duration::ZERO,
+            env: Vec::new(),
+            private_read_roots: Vec::new(),
             cancellation: None,
         }
     }
@@ -531,6 +544,23 @@ mod tests {
                 .is_some_and(|(_, path)| path == credentials)
         }));
         assert!(wrapped.args[1].contains("(deny file-read* (subpath (param \"SECRET0\")))"));
+    }
+
+    #[test]
+    fn explicit_environment_is_injected_after_the_seatbelt_wrapper() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let policy = SandboxPolicy::workspace_write(workspace.path());
+        let mut command = spec("/bin/true", &[], workspace.path().to_path_buf());
+        command.env = vec![("CUSTOM_LABEL".into(), "inside".into())];
+        let wrapped =
+            SeatbeltRunner::wrap(&policy, &command, None, &[]).expect("wrap Seatbelt command");
+        assert!(
+            wrapped
+                .args
+                .windows(2)
+                .any(|args| { args[0] == "/usr/bin/env" && args[1] == "CUSTOM_LABEL=inside" })
+        );
+        assert!(wrapped.env.is_empty());
     }
 
     #[tokio::test]

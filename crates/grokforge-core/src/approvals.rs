@@ -107,6 +107,8 @@ pub enum AllowRule {
     Write(PathBuf),
     /// Commands whose program/first token starts with this prefix.
     CmdPrefix(String),
+    /// Any tool call on one explicitly named MCP server.
+    McpServer(String),
 }
 
 /// The headless approver: auto-denies with feedback unless a boundary was pre-granted. This is
@@ -166,6 +168,9 @@ impl AutoApprover {
                     ..
                 },
             ) => true,
+            (AllowRule::McpServer(allowed), ApprovalKind::McpToolCall { server, .. }) => {
+                allowed == server
+            }
             // Write and command-prefix grants never imply permission to escape a sandbox. An
             // explicit `All` grant above is required for filesystem escalation. Network remains
             // represented on ExecCommand for its narrowly-scoped grant.
@@ -235,7 +240,8 @@ impl Approver for AutoApprover {
             Decision::ApproveForSession
         } else {
             Decision::DenyWithFeedback(
-                "auto-denied in non-interactive mode; re-run with --allow <boundary> or --yolo to permit this".to_string(),
+                "auto-denied in non-interactive mode; pre-grant the matching --allow boundary or use an interactive frontend"
+                    .to_string(),
             )
         }
     }
@@ -497,5 +503,27 @@ mod tests {
             .request(request)
             .await;
         assert!(matches!(decision, Decision::DenyWithFeedback(_)));
+    }
+
+    #[tokio::test]
+    async fn mcp_rule_grants_only_the_exact_named_server() {
+        use grokforge_protocol::ApprovalId;
+
+        let request = |server: &str| ApprovalRequest {
+            id: ApprovalId::new(),
+            call_id: None,
+            kind: ApprovalKind::McpToolCall {
+                server: server.to_string(),
+                tool: "search".to_string(),
+            },
+            reason: "test".to_string(),
+        };
+        let approver = AutoApprover::new(vec![AllowRule::McpServer("docs".to_string())]);
+
+        assert!(approver.request(request("docs")).await.is_approved());
+        assert!(matches!(
+            approver.request(request("docs-production")).await,
+            Decision::DenyWithFeedback(_)
+        ));
     }
 }

@@ -1,0 +1,15 @@
+version = 1
+
+[[tool]]
+name = "line_count"
+description = "Count lines in one UTF-8 workspace file."
+command = "/absolute/path/to/GrokForge/examples/custom-tools/line_count.py"
+sha256 = "REPLACE_WITH_OUTPUT_FROM_SHASUM"
+args = []
+input_schema = { type = "object", properties = { path = { type = "string" } }, required = ["path"], additionalProperties = false }
+mutating = false
+parallel_safe = true
+network = false
+env_allowlist = []
+timeout_ms = 5000
+max_output_bytes = 16384

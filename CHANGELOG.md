@@ -6,6 +6,161 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Added hidden `grokforge debug sandbox -- <cmd>` and `grokforge debug repomap [--budget N] [query]`
+  diagnostics. Sandbox runs the command under the default workspace-write policy and reports
+  whether the OS backend actually enforced it, plus exit/timeout/denial and sanitized output.
+  Repomap is local-only; `--budget` clamps rendered bytes to the existing repository-map limits.
+- Expanded `grokforge doctor` with host/rustc, owner and project code-intelligence and custom-tool
+  manifest presence, a parsed project MCP server list (name and transport only), a loopback-only
+  `serve` reminder, and a privacy paragraph that matches the real ledger scope.
+- Added TUI `/ledger` and `/status`. `/ledger` shows session totals, a newest-source window from a
+  128-entry ring, and an honesty footer; `/status` reports model, preset, effort, sandbox, usage,
+  ledger totals, isolated-worktree, and trusted MCP. This is a transcript card, not the fullscreen
+  Ctrl+O overlay.
+- Added a plain-text `exec` ledger summary on stderr and `grokforge exec --ledger <path>` for an
+  owner-private JSON export. The export creates a new regular file only and refuses symlinks,
+  hard links, and overwrites.
+- Added `examples/` walkthroughs for custom tools, `serve`, `repo_map`, and local code
+  intelligence, plus a nightly workflow that reruns the lint/test/deny gates and greps for
+  telemetry SDK dependencies.
+- Added a workspace source audit (`cargo test -p grokforge --test privacy_audit`) that fails if a
+  telemetry crate, SDK import, or product-analytics ingest URL appears in committed Rust/Cargo
+  files.
+
+- Added language-neutral custom executable tools from the owner-controlled
+  `~/.grokforge/tools.toml` and, only after `--trust-project-tools`, the reviewed project
+  `.grokforge/tools.toml`. Commands use exact argv rather than a shell, a bounded JSON protocol,
+  the normal approval and secret-redaction paths, and the active OS sandbox. Executables are
+  owner/root-controlled and SHA-256 pinned; GrokForge reopens, rehashes, and runs a private copy on
+  every call so a path swap cannot change the program after verification. This provides a small,
+  auditable extension seam without loading third-party code into the GrokForge process.
+- Extended trusted project MCP beyond local stdio processes with bounded Streamable HTTP clients.
+  Remote URLs and environment-expanded headers are validated, redirects and oversized messages
+  are rejected, remote JSON-RPC request bytes are ledgered, and registered MCP tools remain
+  approval-gated. Remote servers may also use a pre-registered OAuth client. Running
+  `grokforge login --mcp <name>` performs protected-resource and authorization-server discovery,
+  Authorization Code with PKCE S256 and state, resource indicators, loopback callbacks,
+  refresh-token rotation, and issuer/resource/client binding. MCP access and refresh tokens are
+  stored only inside the existing password-encrypted `credentials.enc`; Dynamic Client
+  Registration and Client ID Metadata Documents are deliberately not claimed or implemented.
+  Non-interactive calls can grant one reviewed server explicitly with `--allow mcp:<server>`;
+  trusting its configuration alone never auto-approves model-selected calls.
+- Added secure, one-shot local code intelligence. `lsp_diagnostics` collects bounded diagnostics,
+  while `lsp_query` supports hover, definition, references, document symbols, workspace symbols,
+  and implementation. Each query launches a freshly verified language server in a read-only,
+  networkless sandbox, validates UTF-16 positions and returned workspace locations, then shuts it
+  down; there is no long-lived index, completion, rename, code-action, or call-hierarchy support
+  yet. GrokForge proactively sends only the requested document, while the locally installed server
+  can inspect read-only paths visible inside its sandbox. `format_file` similarly formats a private
+  copy, rechecks the expected source immediately before atomic installation, and refuses detected
+  conflicts without claiming a portable cross-process compare-and-swap.
+- Added `repo_map`, a deterministic, bounded, read-only inventory with lexical declaration
+  extraction for common source languages. It respects workspace `.gitignore` and `.ignore` files
+  plus active `secrets.deny` rules, but deliberately ignores machine-global, parent, and clone-local
+  `.git/info/exclude` state so non-workspace ignore configuration cannot silently change results. It
+  never follows links or makes network requests while scanning, and it marks truncated results. It is
+  intentionally a lexical, on-demand map rather than a tree-sitter index or automatic
+  semantic-context engine; any
+  result later placed in model context still follows the normal redaction and request-ledger path.
+- Added the structured `ask_user` tool and append-only question protocol events. The TUI presents
+  one-to-three bounded questions in a branded, keyboard-friendly modal, supports fixed choices and
+  bounded custom answers, queues concurrent subagent questions in FIFO order, and cancels pending
+  prompts cleanly. ACP maps fixed choices to its permission-request surface; frontends that cannot
+  ask interactively fail explicitly instead of inventing an answer.
+- Added `grokforge serve`, an authenticated, loopback-only HTTP API over the real agent loop with
+  bounded prompt/event queues, SSE protocol events, durable session metadata, disconnect
+  cancellation, and a checked-in OpenAPI document. Only the project-data-free health and OpenAPI
+  endpoints are unauthenticated; every session and prompt route requires the bearer token. Plan
+  requests may run together, while execute requests take a workspace write gate from trusted setup
+  through turn completion; this preserves a single writer and prevents a plan from observing a
+  half-applied execute turn even when HTTP admission concurrency is greater than one. API plan
+  requests validate and use the configured plan model, its catalog context window, and high effort;
+  their session metadata records those effective plan settings rather than the execute defaults.
+- Expanded session management with streaming, per-record memory-bounded transcript search,
+  Markdown or JSON export, history
+  forks, title rename, and confirmed deletion in addition to list and resume. Exports use private
+  file creation and refuse unsafe overwrite targets, and JSON remains the lossless format for
+  protocol items that Markdown can only summarize.
+- Added native PNG and JPEG `@` attachments with signature validation and bounded per-file size,
+  file counts, and aggregate bytes. Image inputs use the provider's native multimodal request
+  shape rather than text/base64 pasted into the prompt. Images are not OCR-scanned or
+  content-redacted, and their base64 bytes remain in the plaintext session rollout (created
+  owner-only on Unix); PDF, SVG, ACP-native image blocks, and private-file uploads are not included
+  in this first cut.
+- Added runtime `update_plan` and `read_plan` tools with bounded steps, explicit statuses, and at
+  most one in-progress item. Plan state is isolated by workspace so a subagent lane cannot overwrite
+  another lane's plan, but it remains in-process state and is not restored by session resume.
+- Added `apply_patch` as a bounded, single-existing-file unified-diff tool. It validates exact file
+  headers and hunks, confines the target through the descriptor-safe workspace path, honors
+  `secrets.deny`, uses the normal approval/touched-path flow, and rejects file creation, deletion,
+  multi-file patches, stale content, malformed input, and no-op patches. The narrow scope makes
+  patch failures and approvals attributable without pretending to be a general patch shell.
+
+### Changed
+- Project slash-command discovery now reserves additional built-in names (`ledger`, `status`,
+  `sessions`, `compact`, `diff`, `map`, `sandbox`, `agents`, `theme`, `commit`, `new`, `resume`)
+  so a `.grokforge/commands/*.md` file cannot shadow them.
+- Compaction's mechanical path extraction now preserves `apply_patch` and `format_file` targets in
+  addition to `write_file` and `edit`, so those files survive a summary verbatim.
+
+- `/tools` and the `/` Forge Deck now derive their local-tool names and count from the exact agent
+  registry after built-in, trusted custom, and MCP registration. Unknown extensions remain visible
+  under their registered names instead of disappearing behind a hard-coded capability list.
+- Plan turns now advertise only non-mutating GrokForge built-ins. Headless and local-API plan
+  requests do not load trusted custom or MCP executable surfaces at all; the TUI hides their tools
+  and warns that an explicitly started MCP process remains an external process while `/plan` runs.
+- Password setup now accepts any non-empty password instead of imposing a 12-character minimum.
+  GrokForge still warns below 12 characters because a longer password better resists offline
+  guessing, but the owner decides the local credential policy.
+- Refined the branded launch and authentication handoff: the bundled ASCII forge mark remains
+  visible until the first real prompt, and the responsive xAI subscription callback page
+  distinguishes waiting, denial, and successful token exchange while directing the user back to
+  the terminal for the authoritative encrypted-save result. The separate MCP OAuth callback is a
+  minimal protocol page today.
+- Foreground/shared-worktree `/undo` and `/redo` are deliberately disabled, and redo is no longer
+  advertised in the Forge Deck. A process-wide file journal cannot prove whether bytes written
+  during a turn belong to GrokForge, the user, or an editor, so replaying it could erase unrelated
+  work. The commit-attributed isolated-worktree undo primitive remains internal; the ordinary TUI
+  does not currently expose a parent action for it and therefore does not advertise `/undo`.
+
+### Fixed
+- Custom executable tools now fail closed when executable ownership/permissions cannot be verified,
+  restore only the staged private executable directory read-only when Bubblewrap hides host runtime
+  trees, and under Bubblewrap inject explicitly allowed environment values inside the namespace
+  rather than into the outer security wrapper. Sandbox denials for capabilities forbidden by the
+  manifest no longer advertise an impossible escalation, while denials for declared capabilities
+  remain retryable.
+- Isolated-subagent commit ownership now survives awaited, workspace-safe built-ins such as
+  `apply_patch`, Git reads, `repo_map`, code-intelligence/formatting, plans, and questions. Shell,
+  custom, and MCP tools still disable automatic commit attribution because an external descendant
+  could outlive the awaited call on a backend without a PID namespace.
+- Session search now streams the physical append-only rollout, so original turns remain searchable
+  after compaction removes them from the model-visible replay window. Search snippets are redacted
+  again and stripped of terminal controls before display; resume and export retain checkpoint replay
+  semantics.
+- Fresh interactive TUI sessions now persist their first non-empty prompt once, after redaction and
+  control-character sanitization, so list and search output no longer leave those sessions labeled
+  as `(interactive)` indefinitely.
+- Local-API admission permits now remain held until the background turn exits after cooperative
+  cancellation or timeout cleanup, even when the client disconnects or exhausts its event stream.
+  The configured concurrency limit therefore bounds running prompt tasks, not just attached HTTP
+  response bodies.
+- Fresh session creation now publishes the rollout and metadata under one per-session lifecycle.
+  If metadata publication or fork copying fails, GrokForge removes only the unpublished fresh
+  canonical files and never opens, overwrites, or deletes an existing session with the same ID.
+- A retry approved only for a sandbox-classified network denial no longer widens filesystem write
+  access. Network and filesystem capabilities now stay independent across the approval retry.
+- Session rename validates the requested title before acquiring its metadata lock, so rejected
+  titles do not create lock side effects or make otherwise independent session tests flaky.
+- File replacement for edit/patch paths now reopens the bound target and checks its exact expected
+  content immediately before the atomic rename. A detected intervening change fails as stale
+  instead of silently overwriting it. This narrows the race substantially but is not described as
+  a portable cross-process compare-and-swap, which POSIX filesystems do not provide here.
+- The local server now holds its workspace read/write permit across trusted project configuration,
+  MCP startup, and the complete turn. Configured prompt concurrency can therefore no longer start
+  overlapping mutations or let a plan read setup/state from the middle of an execute request.
+
 ## [1.0.1] - 2026-07-15
 
 ### Changed

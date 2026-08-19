@@ -10,10 +10,21 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use base64::Engine as _;
+use grokforge_protocol::ImageAttachment;
+
 /// Per-file attachment cap.
 const MAX_ATTACH_FILE_BYTES: usize = 96 * 1024;
 /// Total inlined bytes across every `@`-mention in one message.
 const MAX_TOTAL_ATTACH_BYTES: usize = 384 * 1024;
+/// Per-image binary cap. xAI accepts larger images, but this keeps the durable JSONL record and
+/// stateless replay comfortably below GrokForge's own request/record safety limits.
+const MAX_IMAGE_FILE_BYTES: usize = 4 * 1024 * 1024;
+/// Aggregate image bytes in one prompt before base64 expansion.
+const MAX_TOTAL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Bound the number of persisted image parts even though the provider itself currently has no
+/// count limit.
+const MAX_IMAGES: usize = 8;
 /// Files listed in a single `@folder` manifest (further files are summarized as a count).
 const MAX_MANIFEST_FILES: usize = 500;
 /// Directory entries scanned before a walk gives up (bounds worst-case cost).
@@ -21,37 +32,168 @@ const MAX_WALK_ENTRIES: usize = 20_000;
 /// Candidates returned to the picker before ranking.
 const MAX_SEARCH_CANDIDATES: usize = 8_000;
 
+/// A prompt after safe local attachment expansion. Text files/folder manifests are inlined in
+/// `text`; native image parts remain separate so the Responses API receives `input_image` rather
+/// than an enormous block of base64-looking text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpandedPrompt {
+    pub text: String,
+    pub images: Vec<ImageAttachment>,
+}
+
 /// Expand `@path` mentions in `text` by inlining the referenced file/folder content as bounded
 /// `<attachment>` blocks appended to the message. Mentions that do not resolve to a workspace file
 /// or folder are left untouched (so `user@host` and literal `@` usage pass through). The original
 /// text is always preserved; attachments are added after it.
 #[must_use]
 pub fn expand(workspace_root: &Path, text: &str) -> String {
+    expand_multimodal(workspace_root, text).text
+}
+
+/// Expand text, folder, and supported image mentions into a native multimodal prompt. Only PNG
+/// and JPEG files are accepted (matching xAI's documented image-understanding input formats),
+/// and their signatures are verified instead of trusting the filename extension.
+#[must_use]
+pub fn expand_multimodal(workspace_root: &Path, text: &str) -> ExpandedPrompt {
     let mentions = parse_mentions(text);
     if mentions.is_empty() {
-        return text.to_string();
+        return ExpandedPrompt {
+            text: text.to_string(),
+            images: Vec::new(),
+        };
     }
     let mut attachments = String::new();
-    let mut used = 0usize;
+    let mut images = Vec::new();
+    let mut used_text = 0usize;
+    let mut used_image_bytes = 0usize;
     let mut seen = HashSet::new();
     for mention in mentions {
-        if used >= MAX_TOTAL_ATTACH_BYTES {
-            break;
-        }
         if !seen.insert(mention.clone()) {
             continue;
         }
+
+        if let Some(image) = read_image_attachment(
+            workspace_root,
+            &mention,
+            MAX_TOTAL_IMAGE_BYTES.saturating_sub(used_image_bytes),
+            images.len(),
+        ) {
+            attachments.push_str(&image.marker);
+            if let Some(attachment) = image.attachment {
+                used_image_bytes = used_image_bytes.saturating_add(image.raw_bytes);
+                images.push(attachment);
+            }
+            continue;
+        }
+
+        if used_text >= MAX_TOTAL_ATTACH_BYTES {
+            continue;
+        }
         if let Some(block) =
-            read_attachment(workspace_root, &mention, MAX_TOTAL_ATTACH_BYTES - used)
+            read_attachment(workspace_root, &mention, MAX_TOTAL_ATTACH_BYTES - used_text)
         {
-            used = used.saturating_add(block.len());
+            used_text = used_text.saturating_add(block.len());
             attachments.push_str(&block);
         }
     }
     if attachments.is_empty() {
-        return text.to_string();
+        return ExpandedPrompt {
+            text: text.to_string(),
+            images,
+        };
     }
-    format!("{text}\n\n[Attached from the message]\n{attachments}")
+    ExpandedPrompt {
+        text: format!("{text}\n\n[Attached from the message]\n{attachments}"),
+        images,
+    }
+}
+
+struct ImageRead {
+    marker: String,
+    attachment: Option<ImageAttachment>,
+    raw_bytes: usize,
+}
+
+/// Return `None` when this mention is not image-shaped, so ordinary text/folder expansion can
+/// continue. An image-shaped but invalid/oversized file returns a visible skipped marker and no
+/// bytes; it is never retried as text and never becomes a remote URL.
+fn read_image_attachment(
+    workspace_root: &Path,
+    mention: &str,
+    remaining_bytes: usize,
+    image_count: usize,
+) -> Option<ImageRead> {
+    let trimmed = mention.trim_end_matches('/');
+    let extension = Path::new(trimmed)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_ascii_lowercase)?;
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
+        return None;
+    }
+    let marker = |note: &str| {
+        format!(
+            "<image path=\"{}\" note=\"{}\" />\n",
+            sanitize_attr(trimmed),
+            note
+        )
+    };
+    if trimmed.is_empty() || is_probably_secret(trimmed) {
+        return Some(ImageRead {
+            marker: marker("skipped by attachment policy"),
+            attachment: None,
+            raw_bytes: 0,
+        });
+    }
+    if image_count >= MAX_IMAGES || remaining_bytes == 0 {
+        return Some(ImageRead {
+            marker: marker("skipped: prompt image limit reached"),
+            attachment: None,
+            raw_bytes: 0,
+        });
+    }
+    let cap = remaining_bytes.min(MAX_IMAGE_FILE_BYTES);
+    let absolute = workspace_root.join(trimmed);
+    let Ok((bytes, truncated)) =
+        crate::path_safety::read_workspace_context_bytes(workspace_root, &absolute, cap)
+    else {
+        return Some(ImageRead {
+            marker: marker("skipped: file is not a safe workspace image"),
+            attachment: None,
+            raw_bytes: 0,
+        });
+    };
+    if truncated {
+        return Some(ImageRead {
+            marker: marker("skipped: image exceeds GrokForge's local size limit"),
+            attachment: None,
+            raw_bytes: 0,
+        });
+    }
+    let mime_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else {
+        return Some(ImageRead {
+            marker: marker("skipped: extension and image signature do not match"),
+            attachment: None,
+            raw_bytes: 0,
+        });
+    };
+    let raw_bytes = bytes.len();
+    let attachment = ImageAttachment {
+        mime_type: mime_type.to_string(),
+        base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    };
+    Some(ImageRead {
+        marker: format!(
+            "<image path=\"{}\" mime_type=\"{mime_type}\" bytes=\"{raw_bytes}\" />\n",
+            sanitize_attr(trimmed)
+        ),
+        attachment: Some(attachment),
+        raw_bytes,
+    })
 }
 
 /// Fuzzy-ranked workspace path candidates for the `@` picker. Returns relative paths
@@ -490,6 +632,53 @@ mod tests {
             expand(dir.path(), "just a normal message"),
             "just a normal message"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn png_and_jpeg_mentions_become_native_bounded_image_parts() {
+        let dir = ws();
+        std::fs::write(
+            dir.path().join("screen.png"),
+            b"\x89PNG\r\n\x1a\nsmall-test-image",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("photo.jpg"),
+            b"\xff\xd8\xffsmall-test-image",
+        )
+        .unwrap();
+
+        let expanded = expand_multimodal(dir.path(), "inspect @screen.png and @photo.jpg");
+        assert_eq!(expanded.images.len(), 2);
+        assert_eq!(expanded.images[0].mime_type, "image/png");
+        assert_eq!(expanded.images[1].mime_type, "image/jpeg");
+        assert!(expanded.text.contains("<image path=\"screen.png\""));
+        assert!(expanded.text.contains("<image path=\"photo.jpg\""));
+        assert!(!expanded.text.contains(&expanded.images[0].base64));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_extension_is_not_trusted_without_a_matching_signature() {
+        let dir = ws();
+        std::fs::write(dir.path().join("fake.png"), b"not actually an image").unwrap();
+
+        let expanded = expand_multimodal(dir.path(), "inspect @fake.png");
+        assert!(expanded.images.is_empty());
+        assert!(expanded.text.contains("signature do not match"));
+        assert!(!expanded.text.contains("not actually an image"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_image_mentions_are_attached_once() {
+        let dir = ws();
+        std::fs::write(dir.path().join("same.png"), b"\x89PNG\r\n\x1a\nimage").unwrap();
+
+        let expanded = expand_multimodal(dir.path(), "@same.png then @same.png");
+        assert_eq!(expanded.images.len(), 1);
+        assert_eq!(expanded.text.matches("<image path=").count(), 1);
     }
 
     #[test]

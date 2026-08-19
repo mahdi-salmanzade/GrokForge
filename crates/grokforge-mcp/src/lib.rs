@@ -1,9 +1,11 @@
-//! `grokforge-mcp` — a minimal Model Context Protocol client over the stdio transport, behind an
-//! internal [`McpConnection`] trait so the rest of GrokForge never depends on the wire details.
+//! `grokforge-mcp` — a bounded Model Context Protocol client over stdio and Streamable HTTP,
+//! behind an internal [`McpConnection`] trait so the rest of GrokForge never depends on the wire
+//! details.
 //!
-//! We hand-roll a small JSON-RPC 2.0 client (newline-delimited) rather than pin an unverified
-//! `rmcp` version; the trait is the seam where a fuller SDK could slot in later. Requests are
-//! serialized (one in flight at a time), which is plenty for tool discovery and calls.
+//! We hand-roll small JSON-RPC 2.0 transports (newline-delimited stdio plus bounded HTTP/JSON or
+//! SSE responses) rather than pin an unverified `rmcp` version; the trait is the seam where a
+//! fuller SDK could slot in later. Requests are serialized (one in flight at a time), which is
+//! plenty for tool discovery and calls.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -15,6 +17,11 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
+
+mod http;
+pub mod oauth;
+
+pub use http::{RemoteEgress, RemoteEgressObserver, StreamableHttpClient, validate_remote_url};
 
 /// Errors from talking to an MCP server.
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +38,10 @@ pub enum McpError {
     Tool(String),
     #[error("MCP request `{method}` timed out after {timeout:?}")]
     Timeout { method: String, timeout: Duration },
+    #[error("MCP HTTP transport failed: {0}")]
+    Http(&'static str),
+    #[error("MCP HTTP server returned status {0}")]
+    HttpStatus(u16),
     #[error("decode error: {0}")]
     Decode(#[from] serde_json::Error),
 }
@@ -68,6 +79,16 @@ pub trait McpConnection: Send + Sync + std::fmt::Debug {
     async fn list_tools(&self) -> Result<Vec<McpTool>, McpError>;
     /// Call a tool and return its textual result.
     async fn call_tool(&self, name: &str, args: Value) -> Result<String, McpError>;
+}
+
+/// The JSON-RPC seam shared by concrete MCP transports. Keeping discovery and tool-result
+/// handling above this layer makes the stdio and Streamable HTTP clients enforce identical
+/// protocol and size limits.
+#[async_trait]
+trait JsonRpcTransport: Send + Sync {
+    async fn rpc_request(&self, method: &str, params: Value) -> Result<Value, McpError>;
+    fn supports_tools(&self) -> bool;
+    fn request_timeout(&self) -> Duration;
 }
 
 struct Io {
@@ -448,71 +469,100 @@ fn serialize_line(msg: &Value) -> Result<Vec<u8>, McpError> {
 #[async_trait]
 impl McpConnection for StdioClient {
     async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
-        if !self.supports_tools {
-            return Ok(Vec::new());
-        }
-        let operation = async {
-            let mut tools = Vec::new();
-            let mut cursor: Option<String> = None;
-            let mut metadata_bytes = 0_usize;
-            for _page in 0..MAX_TOOL_LIST_PAGES {
-                let params = cursor
-                    .as_ref()
-                    .map_or_else(|| json!({}), |cursor| json!({ "cursor": cursor }));
-                let result = self.request("tools/list", params).await?;
-                let parsed: ToolsResult = serde_json::from_value(result)?;
-                if tools.len().saturating_add(parsed.tools.len()) > MAX_DISCOVERED_TOOLS {
-                    return Err(McpError::Protocol(format!(
-                        "tools/list exceeded the {MAX_DISCOVERED_TOOLS}-tool discovery cap"
-                    )));
-                }
-                let mut page_tools = Vec::with_capacity(parsed.tools.len());
-                for tool in parsed.tools {
-                    if let Some(tool) = validate_discovered_tool(tool, &mut metadata_bytes)? {
-                        page_tools.push(tool);
-                    }
-                }
-                if tools.len().saturating_add(page_tools.len()) > MAX_DISCOVERED_TOOLS {
-                    return Err(McpError::Protocol(format!(
-                        "tools/list exceeded the {MAX_DISCOVERED_TOOLS}-tool discovery cap"
-                    )));
-                }
-                tools.extend(page_tools);
-                match parsed.next_cursor {
-                    Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
-                    Some(_) => {
-                        return Err(McpError::Protocol(
-                            "tools/list returned the same pagination cursor repeatedly".into(),
-                        ));
-                    }
-                    None => return Ok(tools),
-                }
-            }
-            Err(McpError::Protocol(format!(
-                "tools/list exceeded the {MAX_TOOL_LIST_PAGES}-page discovery cap"
-            )))
-        };
-        tokio::time::timeout(self.request_timeout, operation)
-            .await
-            .map_err(|_| McpError::Timeout {
-                method: "tools/list pagination".to_string(),
-                timeout: self.request_timeout,
-            })?
+        list_tools_via(self).await
     }
 
     async fn call_tool(&self, name: &str, args: Value) -> Result<String, McpError> {
-        let result = self
-            .request("tools/call", json!({ "name": name, "arguments": args }))
-            .await?;
-        let mut out = content_text(&result);
-        if out.is_empty() {
-            out = bounded_text(&result.to_string(), MAX_TOOL_OUTPUT_BYTES);
+        call_tool_via(self, name, args).await
+    }
+}
+
+#[async_trait]
+impl JsonRpcTransport for StdioClient {
+    async fn rpc_request(&self, method: &str, params: Value) -> Result<Value, McpError> {
+        self.request(method, params).await
+    }
+
+    fn supports_tools(&self) -> bool {
+        self.supports_tools
+    }
+
+    fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+}
+
+async fn list_tools_via<T: JsonRpcTransport + ?Sized>(
+    transport: &T,
+) -> Result<Vec<McpTool>, McpError> {
+    if !transport.supports_tools() {
+        return Ok(Vec::new());
+    }
+    let operation = async {
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut metadata_bytes = 0_usize;
+        for _page in 0..MAX_TOOL_LIST_PAGES {
+            let params = cursor
+                .as_ref()
+                .map_or_else(|| json!({}), |cursor| json!({ "cursor": cursor }));
+            let result = transport.rpc_request("tools/list", params).await?;
+            let parsed: ToolsResult = serde_json::from_value(result)?;
+            if tools.len().saturating_add(parsed.tools.len()) > MAX_DISCOVERED_TOOLS {
+                return Err(McpError::Protocol(format!(
+                    "tools/list exceeded the {MAX_DISCOVERED_TOOLS}-tool discovery cap"
+                )));
+            }
+            let mut page_tools = Vec::with_capacity(parsed.tools.len());
+            for tool in parsed.tools {
+                if let Some(tool) = validate_discovered_tool(tool, &mut metadata_bytes)? {
+                    page_tools.push(tool);
+                }
+            }
+            if tools.len().saturating_add(page_tools.len()) > MAX_DISCOVERED_TOOLS {
+                return Err(McpError::Protocol(format!(
+                    "tools/list exceeded the {MAX_DISCOVERED_TOOLS}-tool discovery cap"
+                )));
+            }
+            tools.extend(page_tools);
+            match parsed.next_cursor {
+                Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
+                Some(_) => {
+                    return Err(McpError::Protocol(
+                        "tools/list returned the same pagination cursor repeatedly".into(),
+                    ));
+                }
+                None => return Ok(tools),
+            }
         }
-        if result.get("isError").and_then(Value::as_bool) == Some(true) {
-            Err(McpError::Tool(out))
-        } else {
-            Ok(out)
-        }
+        Err(McpError::Protocol(format!(
+            "tools/list exceeded the {MAX_TOOL_LIST_PAGES}-page discovery cap"
+        )))
+    };
+    tokio::time::timeout(transport.request_timeout(), operation)
+        .await
+        .map_err(|_| McpError::Timeout {
+            method: "tools/list pagination".to_string(),
+            timeout: transport.request_timeout(),
+        })?
+}
+
+async fn call_tool_via<T: JsonRpcTransport + ?Sized>(
+    transport: &T,
+    name: &str,
+    args: Value,
+) -> Result<String, McpError> {
+    let result = transport
+        .rpc_request("tools/call", json!({ "name": name, "arguments": args }))
+        .await?;
+    let mut out = content_text(&result);
+    if out.is_empty() {
+        out = bounded_text(&result.to_string(), MAX_TOOL_OUTPUT_BYTES);
+    }
+    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        Err(McpError::Tool(out))
+    } else {
+        Ok(out)
     }
 }
 

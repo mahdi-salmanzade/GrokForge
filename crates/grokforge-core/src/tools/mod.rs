@@ -2,7 +2,12 @@
 //! so the agent loop treats them identically and the approval engine gates them uniformly.
 
 pub mod builtins;
+mod code_intelligence;
+pub mod custom;
 pub mod mcp;
+mod patch;
+mod planning;
+mod repo_map;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -185,6 +190,18 @@ impl ToolRegistry {
         for tool in builtins::all() {
             tools.insert(tool.spec().name, tool);
         }
+        for tool in code_intelligence::all() {
+            tools.insert(tool.spec().name, tool);
+        }
+        for tool in planning::all() {
+            tools.insert(tool.spec().name, tool);
+        }
+        let patch_tool = patch::tool();
+        tools.insert(patch_tool.spec().name, patch_tool);
+        let repo_map = repo_map::tool();
+        tools.insert(repo_map.spec().name, repo_map);
+        let question_tool = crate::questions::tool();
+        tools.insert(question_tool.spec().name, question_tool);
         Self { tools }
     }
 
@@ -225,10 +242,15 @@ impl ToolRegistry {
         self.defs_where(|_| true)
     }
 
-    /// Only the non-mutating (read-only) tools — used in plan mode.
+    /// Only non-mutating GrokForge built-ins — used in plan mode.
+    ///
+    /// A custom executable can truthfully declare the filesystem read-only while still causing an
+    /// external side effect (for example through a permitted network). MCP processes are likewise
+    /// outside the command sandbox. Plan mode therefore excludes every dynamically registered
+    /// executable surface rather than trusting its self-declared mutation bit.
     #[must_use]
     pub fn readonly_tool_defs(&self) -> Vec<ToolDef> {
-        self.defs_where(|s| !s.mutating)
+        self.defs_where(|spec| builtins::is_builtin(&spec.name) && !spec.mutating)
     }
 
     fn defs_where(&self, keep: impl Fn(&ToolSpec) -> bool) -> Vec<ToolDef> {
@@ -310,6 +332,15 @@ mod tests {
             "grep",
             "git_status",
             "git_diff",
+            "lsp_diagnostics",
+            "lsp_query",
+            "format_file",
+            "apply_patch",
+            "repo_map",
+            "update_plan",
+            "read_plan",
+            "remember",
+            crate::questions::ASK_USER,
             builtins::SPAWN_TASK,
         ] {
             assert!(names.contains(&builtin), "missing built-in {builtin}");
@@ -323,5 +354,20 @@ mod tests {
         let write = registry.get("write_file").unwrap().spec();
         assert_ne!(write.description, "test");
         assert!(write.mutating);
+    }
+
+    #[test]
+    fn plan_surface_excludes_dynamic_executables_even_when_declared_read_only() {
+        let mut registry = ToolRegistry::with_builtins();
+        registry.register(Arc::new(ExtraTool("external_read_only".into())));
+
+        let defs = registry.readonly_tool_defs();
+        let names = defs
+            .iter()
+            .filter_map(ToolDef::function_name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"read_file"));
+        assert!(!names.contains(&"external_read_only"));
     }
 }

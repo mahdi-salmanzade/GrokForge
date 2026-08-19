@@ -22,7 +22,9 @@ would be false.
   shows a static privacy statement — there is no telemetry opt-in prompt to build.
 - **`web_fetch` is cut from v0.1** to keep the egress surface minimal (server-side
   `web_search` covers the need).
-- MCP servers are external processes; the ledger panel flags "egress not audited" for them.
+- Local stdio MCP servers are external processes, so their own egress remains unaudited. For a
+  configured Streamable HTTP server, GrokForge records the exact serialized JSON-RPC body byte
+  count and server/method label; the remote service's subsequent behavior remains out of scope.
 
 ## Consequences
 

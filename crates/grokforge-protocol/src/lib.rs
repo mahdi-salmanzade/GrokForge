@@ -10,14 +10,18 @@ pub mod ids;
 pub mod items;
 pub mod ledger;
 pub mod op;
+pub mod question;
 pub mod sandbox;
 pub mod usage;
 
 pub use approval::{ApprovalKind, ApprovalPolicy, ApprovalRequest, Decision};
 pub use event::EventMsg;
-pub use ids::{ApprovalId, SessionId, SubId, ToolCallId, TurnId};
-pub use items::ResponseItem;
+pub use ids::{ApprovalId, QuestionId, SessionId, SubId, ToolCallId, TurnId};
+pub use items::{ImageAttachment, ResponseItem};
 pub use ledger::{LedgerEntry, RequestLedger};
 pub use op::{Op, Submission, TurnMode};
+pub use question::{
+    QuestionAnswer, QuestionOption, QuestionRequest, QuestionResponse, UserQuestion,
+};
 pub use sandbox::{DenialClass, NetworkMode, SandboxMode, SandboxPolicy, default_secret_globs};
 pub use usage::{StopReason, Usage};

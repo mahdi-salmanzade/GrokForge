@@ -5,6 +5,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::ToolCallId;
 
+/// One user-supplied image persisted with a prompt for stateless multimodal continuation.
+///
+/// The bytes are stored as standard base64 rather than as a URL so replay can never make the
+/// provider fetch an arbitrary remote resource. Frontends are responsible for accepting only
+/// bounded, explicitly attached images; the context assembler validates the MIME type again
+/// before egress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    pub mime_type: String,
+    pub base64: String,
+}
+
 /// One entry in the conversation history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -16,6 +28,10 @@ pub enum ResponseItem {
         /// wire so transcripts written before this field was introduced remain readable.
         #[serde(default, skip_serializing_if = "is_zero")]
         redactions: usize,
+        /// Native image inputs explicitly attached to this message. Optional on the wire so
+        /// transcripts written before multimodal input remain readable.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageAttachment>,
     },
     /// An assistant text message.
     AssistantMessage { text: String },
@@ -65,6 +81,7 @@ impl ResponseItem {
         ResponseItem::UserMessage {
             text: text.into(),
             redactions: 0,
+            images: Vec::new(),
         }
     }
 
@@ -73,6 +90,20 @@ impl ResponseItem {
         ResponseItem::UserMessage {
             text: text.into(),
             redactions,
+            images: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn user_with_images_redacted(
+        text: impl Into<String>,
+        redactions: usize,
+        images: Vec<ImageAttachment>,
+    ) -> Self {
+        ResponseItem::UserMessage {
+            text: text.into(),
+            redactions,
+            images,
         }
     }
 
@@ -105,12 +136,31 @@ mod tests {
     }
 
     #[test]
+    fn multimodal_user_message_round_trips_and_remains_backward_compatible() {
+        let item = ResponseItem::user_with_images_redacted(
+            "inspect this",
+            1,
+            vec![ImageAttachment {
+                mime_type: "image/png".into(),
+                base64: "iVBORw0KGgo=".into(),
+            }],
+        );
+        let wire = serde_json::to_vec(&item).unwrap();
+        let decoded: ResponseItem = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(decoded, item);
+    }
+
+    #[test]
     fn legacy_redacted_item_fields_default_to_zero() {
         let user: ResponseItem =
             serde_json::from_str(r#"{"kind":"user_message","text":"legacy"}"#).unwrap();
         assert!(matches!(
             user,
-            ResponseItem::UserMessage { redactions: 0, .. }
+            ResponseItem::UserMessage {
+                redactions: 0,
+                images,
+                ..
+            } if images.is_empty()
         ));
 
         let result: ResponseItem = serde_json::from_str(

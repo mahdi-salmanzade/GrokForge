@@ -19,6 +19,7 @@ pub mod context;
 pub mod mcp_config;
 pub mod memory;
 mod path_safety;
+pub mod questions;
 pub mod redaction;
 pub mod session;
 pub mod skills;
@@ -28,10 +29,11 @@ pub mod turn;
 
 pub use approvals::{AllowRule, ApprovalNeed, Approver, AutoApprover, Gate, gate};
 pub use cancellation::TurnCancellation;
+pub use questions::{AutoQuestioner, Questioner};
 pub use redaction::{Redacted, Redactor};
 pub use session::{DEFAULT_SYSTEM_PROMPT, Session, SessionConfig};
 pub use store::{
     LogRotation, PersistedEffort, RolloutWriter, SessionMeta, rollout_path, sessions_dir,
 };
 pub use tools::{Tool, ToolInvocation, ToolOutput, ToolRegistry, ToolSpec, TurnContext};
-pub use turn::Agent;
+pub use turn::{Agent, BoundedEventQueueStatus};

@@ -221,6 +221,39 @@ pub(crate) fn read_workspace_context_text(
     if cfg!(not(unix)) {
         return Err(PathSafetyError::Denied);
     }
+    let file = open_workspace_context_target(workspace, target)?;
+    read_text_file(file, max_bytes)
+}
+
+/// Read bounded opaque bytes for an explicitly attached local image. The same descriptor-relative
+/// no-follow and hard-link checks as automatic text context apply, but UTF-8 is not required.
+pub(crate) fn read_workspace_context_bytes(
+    workspace: &Path,
+    target: &Path,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, bool), PathSafetyError> {
+    if cfg!(not(unix)) {
+        return Err(PathSafetyError::Denied);
+    }
+    let mut file = open_workspace_context_target(workspace, target)?;
+    if !file.metadata()?.is_file() {
+        return Err(PathSafetyError::InvalidTarget);
+    }
+    #[cfg(unix)]
+    reject_hard_link(&file)?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    (&mut file)
+        .take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > max_bytes;
+    bytes.truncate(max_bytes);
+    Ok((bytes, truncated))
+}
+
+fn open_workspace_context_target(
+    workspace: &Path,
+    target: &Path,
+) -> Result<std::fs::File, PathSafetyError> {
     #[cfg(unix)]
     let file = {
         use rustix::fs::{Mode, OFlags, openat};
@@ -258,7 +291,7 @@ pub(crate) fn read_workspace_context_text(
         }
         open_workspace_target(workspace, target, false)?
     };
-    read_text_file(file, max_bytes)
+    Ok(file)
 }
 
 fn read_text_file(
@@ -518,6 +551,7 @@ fn atomic_replace(
     target: &Path,
     approved_target: Option<&Path>,
     expected_identity: Option<FileIdentity>,
+    expected_content: Option<&[u8]>,
     content: &[u8],
 ) -> Result<(), PathSafetyError> {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -570,7 +604,7 @@ fn atomic_replace(
         temp_file.flush()?;
         temp_file.sync_all()?;
 
-        let current = open_at_if_exists(&parent, &name)?;
+        let mut current = open_at_if_exists(&parent, &name)?;
         match (
             expected_identity,
             current.as_ref().map(|(_, identity)| *identity),
@@ -579,6 +613,21 @@ fn atomic_replace(
                 if before.device == now.device && before.inode == now.inode => {}
             (None, None) => {}
             _ => return Err(PathSafetyError::ConcurrentModification),
+        }
+        // Re-read through the freshly opened, identity-checked descriptor immediately before the
+        // atomic rename. This narrows the uncooperative in-place-writer window substantially; the
+        // public contract remains conflict detection rather than an impossible portable CAS.
+        if let Some(expected_content) = expected_content {
+            let Some((current_file, _)) = current.as_mut() else {
+                return Err(PathSafetyError::ConcurrentModification);
+            };
+            let mut observed = Vec::with_capacity(expected_content.len().min(64 * 1024));
+            current_file
+                .take((MAX_MUTATING_FILE_BYTES + 1) as u64)
+                .read_to_end(&mut observed)?;
+            if observed != expected_content {
+                return Err(PathSafetyError::ConcurrentModification);
+            }
         }
         renameat(&parent, temp_name.as_str(), &parent, &name).map_err(std::io::Error::from)?;
         rustix::fs::fsync(&parent).map_err(std::io::Error::from)?;
@@ -604,7 +653,7 @@ pub(crate) fn write_file_bound(
     }
     #[cfg(unix)]
     {
-        atomic_replace(policy, target, approved_target, None, content)
+        atomic_replace(policy, target, approved_target, None, None, content)
     }
     #[cfg(not(unix))]
     {
@@ -620,6 +669,61 @@ pub(crate) fn write_file_bound(
         file.write_all(content)?;
         file.flush()?;
         Ok(())
+    }
+}
+
+/// Replace an existing file after checking that its contents and physical identity still match
+/// the version observed by the caller. Long-running host workflows (such as formatting a private
+/// copy) use this to reject stale input. The final rename is atomic, but POSIX filesystems do not
+/// provide a portable content-compare-and-swap; an uncooperative in-place writer can still race
+/// the last identity check. This is conflict detection, not a cross-process lock.
+pub(crate) fn replace_file_if_unchanged_bound(
+    policy: &SandboxPolicy,
+    target: &Path,
+    approved_target: Option<&Path>,
+    expected: &[u8],
+    content: &[u8],
+) -> Result<(), PathSafetyError> {
+    if cfg!(not(unix)) {
+        return Err(PathSafetyError::Denied);
+    }
+    if expected.len() > MAX_MUTATING_FILE_BYTES || content.len() > MAX_MUTATING_FILE_BYTES {
+        return Err(PathSafetyError::TooLarge);
+    }
+    #[cfg(unix)]
+    {
+        let (mut file, identity) = open_existing_for_edit(policy, target, approved_target)?;
+        reject_hard_link(&file)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(PathSafetyError::InvalidTarget);
+        }
+        if metadata.len() > MAX_MUTATING_FILE_BYTES as u64 {
+            return Err(PathSafetyError::TooLarge);
+        }
+        let mut observed = Vec::with_capacity(expected.len().min(64 * 1024));
+        (&mut file)
+            .take((MAX_MUTATING_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut observed)?;
+        if observed.len() > MAX_MUTATING_FILE_BYTES {
+            return Err(PathSafetyError::TooLarge);
+        }
+        if observed != expected {
+            return Err(PathSafetyError::ConcurrentModification);
+        }
+        atomic_replace(
+            policy,
+            target,
+            approved_target,
+            Some(identity),
+            Some(expected),
+            content,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (policy, target, approved_target, expected, content);
+        Err(PathSafetyError::Denied)
     }
 }
 
@@ -701,6 +805,7 @@ pub(crate) fn edit_file_bound(
         target,
         approved_target,
         Some(identity),
+        Some(original.as_bytes()),
         updated.as_bytes(),
     )?;
     #[cfg(not(unix))]
@@ -757,6 +862,45 @@ mod tests {
         let error = write_file_bound(&policy, &target, Some(&approved), b"escape").unwrap_err();
         assert!(matches!(error, PathSafetyError::ConcurrentModification));
         assert!(!outside.path().join("file.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compare_and_replace_refuses_a_concurrent_content_change() {
+        let workspace = tempfile::tempdir().unwrap();
+        let target = workspace.path().join("source.rs");
+        std::fs::write(&target, b"original").unwrap();
+        let approved = canonicalize_allow_missing(&target).unwrap();
+        let policy = SandboxPolicy::workspace_write(workspace.path());
+
+        // Simulate an editor changing bytes without replacing the inode while a formatter runs.
+        std::fs::write(&target, b"newer edit").unwrap();
+        let error = replace_file_if_unchanged_bound(
+            &policy,
+            &target,
+            Some(&approved),
+            b"original",
+            b"formatted",
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PathSafetyError::ConcurrentModification));
+        assert_eq!(std::fs::read(&target).unwrap(), b"newer edit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compare_and_replace_supports_an_unchanged_empty_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let target = workspace.path().join("source.rs");
+        std::fs::write(&target, b"").unwrap();
+        let approved = canonicalize_allow_missing(&target).unwrap();
+        let policy = SandboxPolicy::workspace_write(workspace.path());
+
+        replace_file_if_unchanged_bound(&policy, &target, Some(&approved), b"", b"formatted\n")
+            .unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"formatted\n");
     }
 
     #[cfg(unix)]

@@ -6,7 +6,10 @@
 mod app;
 mod approver;
 mod brand;
+mod ledger;
+mod questioner;
 
+use std::collections::BTreeMap;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 
@@ -26,6 +29,7 @@ use tokio::sync::mpsc;
 
 pub use app::App;
 pub use approver::{ChannelApprover, PendingApproval};
+pub use questioner::{ChannelQuestioner, PendingQuestion};
 
 /// Launch the interactive TUI for a fresh session.
 pub async fn run(
@@ -33,12 +37,35 @@ pub async fn run(
     config: SessionConfig,
     status_preset: String,
     trust_project_mcp: bool,
+    trust_project_tools: bool,
 ) -> io::Result<()> {
-    run_session(
+    run_with_mcp_oauth(
+        client,
+        config,
+        status_preset,
+        trust_project_mcp,
+        trust_project_tools,
+        BTreeMap::new(),
+    )
+    .await
+}
+
+/// Launch a fresh session with host-unlocked OAuth tokens for trusted remote MCP servers.
+pub async fn run_with_mcp_oauth(
+    client: XaiClient,
+    config: SessionConfig,
+    status_preset: String,
+    trust_project_mcp: bool,
+    trust_project_tools: bool,
+    mcp_oauth_tokens: BTreeMap<String, String>,
+) -> io::Result<()> {
+    run_session_with_mcp_oauth(
         client,
         Session::new(config),
         status_preset,
         trust_project_mcp,
+        trust_project_tools,
+        mcp_oauth_tokens,
     )
     .await
 }
@@ -47,38 +74,75 @@ pub async fn run(
 /// records session metadata so the session appears in `grokforge sessions`.
 pub async fn run_session(
     client: XaiClient,
+    session: Session,
+    status_preset: String,
+    trust_project_mcp: bool,
+    trust_project_tools: bool,
+) -> io::Result<()> {
+    run_session_with_mcp_oauth(
+        client,
+        session,
+        status_preset,
+        trust_project_mcp,
+        trust_project_tools,
+        BTreeMap::new(),
+    )
+    .await
+}
+
+/// Resume-capable session entry point with host-unlocked remote MCP OAuth tokens.
+pub async fn run_session_with_mcp_oauth(
+    client: XaiClient,
     mut session: Session,
     status_preset: String,
     trust_project_mcp: bool,
+    trust_project_tools: bool,
+    mcp_oauth_tokens: BTreeMap<String, String>,
 ) -> io::Result<()> {
     // Acquire the session's lifetime lock and refresh persisted history before repository checks,
     // MCP process startup, or any other preflight side effect. A second resume fails here.
     let dir = sessions_dir()?;
     let metadata_path = dir.join(format!("rollout-{}.meta.json", session.id.as_uuid()));
     let metadata_exists = tokio::fs::try_exists(&metadata_path).await.unwrap_or(false);
-    let rollout = match RolloutWriter::open_and_read(&dir, session.id).await {
-        Ok((rollout, persisted_history)) => {
-            if metadata_exists {
+    let rollout = if metadata_exists {
+        match RolloutWriter::open_and_read(&dir, session.id).await {
+            Ok((rollout, persisted_history)) => {
                 session.history = persisted_history;
+                rollout
             }
-            Some(rollout)
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("could not open durable session transcript: {error}"),
+                ));
+            }
         }
-        Err(error) => {
-            return Err(io::Error::new(
-                error.kind(),
-                format!("could not open durable session transcript: {error}"),
-            ));
-        }
+    } else {
+        let meta = SessionMeta::new(
+            session.id,
+            session.config.workspace_root.clone(),
+            session.config.model.clone(),
+            "",
+        )
+        .with_effort(session.config.effort);
+        meta.create_rollout(&dir, session.id)
+            .await
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("could not create durable session record: {error}"),
+                )
+            })?
     };
 
     run_session_ready(
         client,
         session,
-        rollout,
+        Some(rollout),
         status_preset,
-        metadata_exists,
-        dir,
         trust_project_mcp,
+        trust_project_tools,
+        mcp_oauth_tokens,
     )
     .await
 }
@@ -91,58 +155,107 @@ pub async fn run_locked_session(
     rollout: RolloutWriter,
     status_preset: String,
     trust_project_mcp: bool,
+    trust_project_tools: bool,
+) -> io::Result<()> {
+    run_locked_session_with_mcp_oauth(
+        client,
+        session,
+        rollout,
+        status_preset,
+        trust_project_mcp,
+        trust_project_tools,
+        BTreeMap::new(),
+    )
+    .await
+}
+
+/// Locked-session entry point with host-unlocked remote MCP OAuth tokens.
+pub async fn run_locked_session_with_mcp_oauth(
+    client: XaiClient,
+    session: Session,
+    rollout: RolloutWriter,
+    status_preset: String,
+    trust_project_mcp: bool,
+    trust_project_tools: bool,
+    mcp_oauth_tokens: BTreeMap<String, String>,
 ) -> io::Result<()> {
     let dir = sessions_dir()?;
     let metadata_path = dir.join(format!("rollout-{}.meta.json", session.id.as_uuid()));
     let metadata_exists = tokio::fs::try_exists(&metadata_path).await.unwrap_or(false);
+    let rollout = if metadata_exists {
+        rollout
+    } else {
+        let meta = SessionMeta::new(
+            session.id,
+            session.config.workspace_root.clone(),
+            session.config.model.clone(),
+            "",
+        )
+        .with_effort(session.config.effort);
+        meta.write_new_with_rollout(&dir, session.id, rollout)
+            .await
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("could not create durable session record: {error}"),
+                )
+            })?
+    };
     run_session_ready(
         client,
         session,
         Some(rollout),
         status_preset,
-        metadata_exists,
-        dir,
         trust_project_mcp,
+        trust_project_tools,
+        mcp_oauth_tokens,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // One internal funnel keeps session locking and trust flags in one audited setup path.
 async fn run_session_ready(
     client: XaiClient,
     mut session: Session,
     rollout: Option<RolloutWriter>,
     status_preset: String,
-    metadata_exists: bool,
-    dir: std::path::PathBuf,
     trust_project_mcp: bool,
+    trust_project_tools: bool,
+    mcp_oauth_tokens: BTreeMap<String, String>,
 ) -> io::Result<()> {
     let model = session.config.model.clone();
     let workspace = session.config.workspace_root.clone();
 
-    // Metadata and rollout are the canonical recovery record. Finish both before Git inspection,
-    // MCP process startup, or the first model request.
-    if !metadata_exists {
-        let meta = SessionMeta::new(session.id, workspace.clone(), model.clone(), "")
-            .with_effort(session.config.effort);
-        meta.write(&dir, session.id).await.map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("could not persist session metadata: {error}"),
-            )
-        })?;
-    }
-
     let auto_commit_warning = protect_user_changes(&mut session);
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (approver, approvals_rx) = ChannelApprover::new();
+    let (questioner, questions_rx) = ChannelQuestioner::new();
 
     let mut registry = ToolRegistry::with_builtins();
-    if trust_project_mcp {
-        eprintln!("{}", grokforge_core::mcp_config::PROJECT_MCP_TRUST_WARNING);
-        grokforge_core::mcp_config::connect_and_register_trusted(&workspace, &mut registry).await;
-    } else {
-        grokforge_core::mcp_config::connect_and_register(&workspace, &mut registry).await;
+    let custom_tools = grokforge_core::tools::custom::register_custom_tools(
+        &workspace,
+        trust_project_tools,
+        &mut registry,
+    );
+    if !custom_tools.registered.is_empty() || !custom_tools.warnings.is_empty() {
+        eprintln!(
+            "custom tools: {} loaded, {} warning(s)",
+            custom_tools.registered.len(),
+            custom_tools.warnings.len()
+        );
     }
+    let connected_mcp = if trust_project_mcp {
+        eprintln!("{}", grokforge_core::mcp_config::PROJECT_MCP_TRUST_WARNING);
+        grokforge_core::mcp_config::connect_and_register_trusted_with_events_and_oauth(
+            &workspace,
+            &mut registry,
+            Some(events_tx.clone()),
+            &mcp_oauth_tokens,
+        )
+        .await
+    } else {
+        grokforge_core::mcp_config::connect_and_register(&workspace, &mut registry).await
+    };
 
     let agent = Arc::new(
         Agent::new(
@@ -152,21 +265,24 @@ async fn run_session_ready(
             Arc::new(approver),
             events_tx,
         )
-        .interactive(),
+        .interactive()
+        .with_questioner(Arc::new(questioner)),
     );
 
-    let mut app = App::new(
+    let mut app = App::new_with_questions(
         agent,
         session,
         rollout,
         events_rx,
         approvals_rx,
+        questions_rx,
         model,
         status_preset,
     );
     if let Some(warning) = auto_commit_warning {
         app.set_startup_notice(warning);
     }
+    app.set_trusted_project_mcp_active(!connected_mcp.is_empty());
 
     let mut terminal = TerminalGuard::new(setup_terminal()?);
     let result = app.run(terminal.get_mut()).await;

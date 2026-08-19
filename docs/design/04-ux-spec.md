@@ -115,7 +115,7 @@ Alt-screen overlay; per-request audit of exactly what left the machine. Data cap
 │ ▸ #14 14:33  grok-4.3 · commit-msg                 0.9 KB   0 files    │
 │────────────────────────────────────────────────────────────────────────│
 │ server-side tools: web_search ×1 ($0.01) · x_search ×0                 │
-│ mcp servers: 2 local processes — external egress not audited (see /mcp)│
+│ mcp: remote request bodies ledgered; local process egress not audited     │
 │ ↑↓ select · Enter expand · s save audit JSON · q close                 │
 └────────────────────────────────────────────────────────────────────────┘
 ```
@@ -126,7 +126,9 @@ Semantics:
 - **Blocked files:** `secrets.deny` globs (default `.env*`, `*.pem`, `id_rsa*`, `*.key`, `*.p12`) are never sent — content replaced by a placeholder telling the model the file is blocked; overridable only via an explicit approval prompt.
 - **Pre-flight guardrail:** `ledger.confirm_over_kb` (default 1024) — a request exceeding it pauses with `About to send 1.4 MB (34 files) — [y] send · [v] view ledger · [d] cancel`.
 - `s` writes `ledger-<session>.json` (same schema as headless `--ledger`).
-- Honesty note surfaced in-panel: MCP servers are external processes; their own egress is out of audit scope and they are flagged as such in `/mcp`.
+- Honesty note surfaced in-panel: local stdio MCP processes own their egress and remain outside the
+  audit scope; direct Streamable HTTP JSON-RPC bodies are byte-accounted, while the service's own
+  downstream behavior remains outside GrokForge's audit scope.
 
 ---
 
@@ -154,7 +156,7 @@ Semantics:
 | `/map` | Show the tree-sitter repo map being sent (symbols, token cost); `refresh`, `on/off` subcommands. |
 | `/sandbox [preset]` | Show sandbox backend, mode, RulesetStatus, writable roots; switch preset (`readonly/auto/strict`); `grokforge debug sandbox -- <cmd>` is the CLI sibling. |
 | `/yolo` | Session-only toggle to `danger-full-access + never`; type-`yolo`-to-confirm; never persisted (§4.5). |
-| `/mcp` | List MCP servers (stdio/HTTP), health, tool counts, "egress not audited" flag; enable/disable; includes optional built-in xAI Docs server (`https://docs.x.ai/api/mcp`). |
+| `/mcp` | List MCP servers (stdio/HTTP), health, tool counts, and transport-specific egress scope; enable/disable; includes optional built-in xAI Docs server (`https://docs.x.ai/api/mcp`). |
 | `/skills` | List discovered skills/AGENTS.md-adjacent conventions (`.grokforge/skills/`, project + user scope); inspect one. |
 | `/init` | Scan repo (repo map, manifests, README) → generate `AGENTS.md` via structured outputs → present as diff → approve to write. |
 | `/login` | Create or unlock the password-encrypted credential file, then replace the API key or subscription OAuth tokens. |

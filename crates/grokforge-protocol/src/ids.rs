@@ -83,6 +83,10 @@ id_newtype!(
     /// Identifies a pending approval request.
     ApprovalId, "appr_"
 );
+id_newtype!(
+    /// Identifies one interactive question request.
+    QuestionId, "ques_"
+);
 
 /// Identifies one tool call within a turn.
 ///

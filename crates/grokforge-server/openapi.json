@@ -1,0 +1,90 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "GrokForge Local API",
+    "version": "1.0.1",
+    "description": "A bounded, authenticated, local-first API for GrokForge."
+  },
+  "servers": [{ "url": "http://127.0.0.1:4096" }],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": { "type": "http", "scheme": "bearer" }
+    },
+    "schemas": {
+      "PromptRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["prompt"],
+        "properties": {
+          "prompt": { "type": "string", "minLength": 1, "maxLength": 32768 },
+          "plan": { "type": "boolean", "default": false }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "responses": { "200": { "description": "Service is running." } }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "responses": { "200": { "description": "This OpenAPI document." } }
+      }
+    },
+    "/v1/sessions": {
+      "get": {
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Newest local session metadata, capped at 100 records." },
+          "401": { "description": "Missing or invalid bearer token." }
+        }
+      }
+    },
+    "/v1/sessions/{session_id}": {
+      "get": {
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{
+          "name": "session_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string", "format": "uuid" }
+        }],
+        "responses": {
+          "200": { "description": "Local session metadata." },
+          "401": { "description": "Missing or invalid bearer token." },
+          "404": { "description": "Session not found." }
+        }
+      }
+    },
+    "/v1/prompts": {
+      "post": {
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PromptRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "GrokForge protocol events as Server-Sent Events.",
+            "headers": {
+              "x-grokforge-session-id": {
+                "schema": { "type": "string", "format": "uuid" }
+              }
+            },
+            "content": { "text/event-stream": {} }
+          },
+          "400": { "description": "Invalid prompt." },
+          "401": { "description": "Missing or invalid bearer token." },
+          "413": { "description": "Request body exceeds the configured cap." },
+          "429": { "description": "All bounded prompt slots are occupied." }
+        }
+      }
+    }
+  }
+}

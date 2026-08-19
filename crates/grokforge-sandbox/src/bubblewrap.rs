@@ -201,6 +201,22 @@ impl BubblewrapRunner {
             args.push("TMPDIR".into());
             args.push("/tmp".into());
         }
+        // Caller-created verified artifacts may themselves live below a host runtime tree that we
+        // just replaced. Restore only their explicitly declared private directories, read-only;
+        // never re-expose `/tmp` or `/run` as a whole.
+        let mut private_read_roots = command
+            .private_read_roots
+            .iter()
+            .map(|root| canonical(root))
+            .collect::<Vec<_>>();
+        private_read_roots.sort();
+        private_read_roots.dedup();
+        for root in private_read_roots {
+            let root = root.to_string_lossy().into_owned();
+            args.push("--ro-bind".into());
+            args.push(root.clone());
+            args.push(root);
+        }
         // Workspace roots writable.
         for root in &writable {
             let r = root.to_string_lossy().into_owned();
@@ -263,6 +279,13 @@ impl BubblewrapRunner {
         if !matches!(policy.network, NetworkMode::Full) {
             args.push("--unshare-net".into());
         }
+        // Inject caller-approved variables inside the namespace. Passing them to the outer
+        // bubblewrap process would let loader/runtime variables influence the security wrapper.
+        for (name, value) in &command.env {
+            args.push("--setenv".into());
+            args.push(name.clone());
+            args.push(value.clone());
+        }
         args.push("--chdir".into());
         args.push(command.cwd.to_string_lossy().into_owned());
         args.push("--".into());
@@ -274,6 +297,10 @@ impl BubblewrapRunner {
             args,
             cwd: command.cwd.clone(),
             timeout: command.timeout,
+            stdin: command.stdin.clone(),
+            stdin_close_delay: command.stdin_close_delay,
+            env: Vec::new(),
+            private_read_roots: Vec::new(),
             cancellation: command.cancellation.clone(),
         }
     }
@@ -821,6 +848,10 @@ mod tests {
             args: Vec::new(),
             cwd,
             timeout: Duration::from_secs(1),
+            stdin: None,
+            stdin_close_delay: Duration::ZERO,
+            env: Vec::new(),
+            private_read_roots: Vec::new(),
             cancellation: None,
         }
     }
@@ -859,6 +890,48 @@ mod tests {
         policy.network = NetworkMode::ProxyRouted;
         let wrapped = wrap(&policy, &spec(dir.path().to_path_buf()));
         assert!(wrapped.args.iter().any(|a| a == "--unshare-net"));
+    }
+
+    #[test]
+    fn explicit_environment_is_injected_inside_the_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let policy = SandboxPolicy::workspace_write(dir.path());
+        let mut command = spec(dir.path().to_path_buf());
+        command.env = vec![("CUSTOM_LABEL".into(), "inside".into())];
+        let wrapped = wrap(&policy, &command);
+        assert!(
+            wrapped
+                .args
+                .windows(3)
+                .any(|args| args == ["--setenv", "CUSTOM_LABEL", "inside"])
+        );
+        assert!(wrapped.env.is_empty());
+    }
+
+    #[test]
+    fn private_verified_artifact_root_is_restored_read_only_without_parent_temp_tree() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outer = tempfile::tempdir().expect("outer temporary directory");
+        let staging = outer.path().join("verified-stage");
+        std::fs::create_dir(&staging).expect("staging directory");
+        let mut command = spec(workspace.path().to_path_buf());
+        command.program = staging.join("tool").to_string_lossy().into_owned();
+        command.private_read_roots = vec![staging.clone()];
+
+        let wrapped = wrap(&SandboxPolicy::workspace_write(workspace.path()), &command);
+        let staging = canonical(&staging).to_string_lossy().into_owned();
+        let outer = canonical(outer.path()).to_string_lossy().into_owned();
+        assert!(
+            wrapped
+                .args
+                .windows(3)
+                .any(|args| args == ["--ro-bind", staging.as_str(), staging.as_str()])
+        );
+        assert!(!wrapped.args.windows(3).any(|args| {
+            args == ["--ro-bind", outer.as_str(), outer.as_str()]
+                || args == ["--ro-bind", "/tmp", "/tmp"]
+                || args == ["--ro-bind", "/run", "/run"]
+        }));
     }
 
     #[test]

@@ -31,6 +31,15 @@ pub(crate) fn is_builtin(name: &str) -> bool {
             | "grep"
             | "git_status"
             | "git_diff"
+            | "lsp_diagnostics"
+            | "lsp_query"
+            | "format_file"
+            | "apply_patch"
+            | "repo_map"
+            | "update_plan"
+            | "read_plan"
+            | "remember"
+            | crate::questions::ASK_USER
             | SPAWN_TASK
     )
 }
@@ -64,7 +73,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
 }
 
 /// True if `path` matches any of the policy's never-read globs (secrets).
-fn is_blocked(ctx: &TurnContext, path: &Path) -> bool {
+pub(crate) fn is_blocked(ctx: &TurnContext, path: &Path) -> bool {
     let mut builder = GlobSetBuilder::new();
     for g in &ctx.policy.unreadable_globs {
         if let Ok(glob) = GlobBuilder::new(g).case_insensitive(true).build() {
@@ -77,7 +86,10 @@ fn is_blocked(ctx: &TurnContext, path: &Path) -> bool {
     set.is_match(path)
 }
 
-fn canonical_read_path(ctx: &TurnContext, path: &Path) -> Result<PathBuf, std::io::Error> {
+pub(crate) fn canonical_read_path(
+    ctx: &TurnContext,
+    path: &Path,
+) -> Result<PathBuf, std::io::Error> {
     let (_workspace, canonical) =
         path_safety::canonical_workspace_target(&ctx.workspace_root, path)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
@@ -107,7 +119,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn truncate_utf8_bytes(mut text: String, max_bytes: usize, marker: &str) -> String {
+pub(crate) fn truncate_utf8_bytes(mut text: String, max_bytes: usize, marker: &str) -> String {
     if text.len() <= max_bytes {
         return text;
     }

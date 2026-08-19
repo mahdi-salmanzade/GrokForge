@@ -24,9 +24,13 @@ use grokforge_core::mcp_config::{
     MAX_EDITOR_MCP_SERVERS,
 };
 use grokforge_core::{
-    Agent, Approver, RolloutWriter, Session, SessionConfig, ToolRegistry, TurnCancellation,
+    Agent, Approver, Questioner, RolloutWriter, Session, SessionConfig, ToolRegistry,
+    TurnCancellation,
 };
-use grokforge_protocol::{ApprovalRequest, Decision, EventMsg, StopReason};
+use grokforge_protocol::{
+    ApprovalRequest, Decision, EventMsg, QuestionAnswer, QuestionRequest, QuestionResponse,
+    StopReason,
+};
 use grokforge_xai::{Effort, XaiClient, model_supports_effort};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -50,6 +54,7 @@ const PERMISSION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 pub async fn run(
     trust_project_mcp: bool,
     trust_project_config: bool,
+    trust_project_tools: bool,
     model_override: Option<String>,
     effort_override: Option<String>,
 ) -> ExitCode {
@@ -126,6 +131,7 @@ pub async fn run(
         effort_override,
         trust_project_mcp,
         trust_project_config,
+        trust_project_tools,
     });
 
     let stdin = tokio::io::stdin();
@@ -299,6 +305,7 @@ struct Connection {
     effort_override: Option<String>,
     trust_project_mcp: bool,
     trust_project_config: bool,
+    trust_project_tools: bool,
 }
 
 /// Per-session prompt serialization plus separately lockable cancellation state. A queued prompt
@@ -384,6 +391,7 @@ impl Connection {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // ACP startup keeps validation before every trusted side effect in one ordered path.
     async fn new_session(&self, message: &Value) -> Result<Value, (i64, String)> {
         let cwd = message
             .pointer("/params/cwd")
@@ -433,8 +441,29 @@ impl Connection {
             shared: Arc::clone(&self.shared),
             session_id: session_id.clone(),
         });
+        let questioner = Arc::new(AcpQuestioner {
+            shared: Arc::clone(&self.shared),
+            session_id: session_id.clone(),
+        });
 
         let mut registry = ToolRegistry::with_builtins();
+        let custom_tools = grokforge_core::tools::custom::register_custom_tools(
+            &workspace,
+            self.trust_project_tools,
+            &mut registry,
+        );
+        if !custom_tools.registered.is_empty() {
+            eprintln!(
+                "grokforge acp: custom tools loaded: {}",
+                crate::sanitize_terminal_line(&custom_tools.registered.join(", "))
+            );
+        }
+        for warning in custom_tools.warnings {
+            eprintln!(
+                "grokforge acp: custom tools: {}",
+                crate::sanitize_terminal_line(&warning)
+            );
+        }
         if let Err(error) = grokforge_core::mcp_config::connect_and_register_editor(
             &workspace,
             editor_mcp,
@@ -450,14 +479,21 @@ impl Connection {
             return Err((code, error.to_string()));
         }
         if self.trust_project_mcp {
-            grokforge_core::mcp_config::connect_and_register_trusted(&workspace, &mut registry)
-                .await;
+            let mcp_oauth_tokens = crate::credentials::mcp_access_tokens(&workspace).await;
+            grokforge_core::mcp_config::connect_and_register_trusted_with_events_and_oauth(
+                &workspace,
+                &mut registry,
+                Some(events_tx.clone()),
+                &mcp_oauth_tokens,
+            )
+            .await;
         }
         let sandbox = grokforge_sandbox::default_runner();
-        // `interactive()` routes approvals to our approver, which forwards to the ACP client via
-        // `session/request_permission`, so the editor gates boundary-crossing actions.
-        let agent =
-            Agent::new(self.client.clone(), registry, sandbox, approver, events_tx).interactive();
+        // ACP v1 uses `session/request_permission` for safety approvals and fixed-choice model
+        // questions. (Its protocol has no arbitrary text-input request.)
+        let agent = Agent::new(self.client.clone(), registry, sandbox, approver, events_tx)
+            .interactive()
+            .with_questioner(questioner);
 
         let mut config = SessionConfig::new(workspace, active_model);
         config.plan_model = settings.agent.plan_model;
@@ -691,6 +727,96 @@ impl Approver for AcpApprover {
             Some("cancelled") => Decision::Abort,
             _ => Decision::Deny,
         }
+    }
+}
+
+/// ACP v1 has no general text-input request, but its permission request supports a list of fixed
+/// choices. Map each question to one such request. TUI-only custom answers are intentionally not
+/// advertised here; an ACP user can still send free-form direction in their next editor prompt.
+struct AcpQuestioner {
+    shared: Arc<Shared>,
+    session_id: String,
+}
+
+#[async_trait]
+impl Questioner for AcpQuestioner {
+    async fn ask(&self, request: QuestionRequest) -> QuestionResponse {
+        let mut answers = Vec::with_capacity(request.questions.len());
+        for (question_index, question) in request.questions.iter().enumerate() {
+            let options = question
+                .options
+                .iter()
+                .enumerate()
+                .map(|(option_index, option)| {
+                    let name = if option.description.is_empty() {
+                        option.label.clone()
+                    } else {
+                        format!("{} — {}", option.label, option.description)
+                    };
+                    json!({
+                        "optionId": format!("q{question_index}_o{option_index}"),
+                        "name": name,
+                        "kind": "allow_once",
+                    })
+                })
+                .collect::<Vec<_>>();
+            let params = json!({
+                "sessionId": self.session_id,
+                "toolCall": {
+                    "toolCallId": request.call_id.to_string(),
+                    "title": question.prompt,
+                    "kind": "other",
+                },
+                "options": options,
+            });
+            let Some(response) = self
+                .shared
+                .request("session/request_permission", params)
+                .await
+            else {
+                return QuestionResponse::Unavailable {
+                    reason: "ACP client did not answer the structured question".to_string(),
+                };
+            };
+            let outcome = response.pointer("/result/outcome");
+            match outcome
+                .and_then(|value| value.get("outcome"))
+                .and_then(Value::as_str)
+            {
+                Some("selected") => {
+                    let Some(option_id) = outcome
+                        .and_then(|value| value.get("optionId"))
+                        .and_then(Value::as_str)
+                    else {
+                        return QuestionResponse::Unavailable {
+                            reason: "ACP client returned a choice without an option id".to_string(),
+                        };
+                    };
+                    let prefix = format!("q{question_index}_o");
+                    let Some(selected) = option_id
+                        .strip_prefix(&prefix)
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .filter(|selected| *selected < question.options.len())
+                    else {
+                        return QuestionResponse::Unavailable {
+                            reason: "ACP client returned an unknown question option".to_string(),
+                        };
+                    };
+                    answers.push(QuestionAnswer {
+                        question: question_index,
+                        selected: Some(selected),
+                        custom: None,
+                    });
+                }
+                Some("cancelled") => return QuestionResponse::Cancelled,
+                _ => {
+                    return QuestionResponse::Unavailable {
+                        reason: "ACP client returned an invalid question outcome".to_string(),
+                    };
+                }
+            }
+        }
+        QuestionResponse::Answered { answers }
     }
 }
 
@@ -1219,6 +1345,75 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(25)).await;
         assert!(!shared.pending.lock().await.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn acp_questioner_maps_fixed_choices_to_permission_options() {
+        use grokforge_protocol::{QuestionId, QuestionOption, ToolCallId, UserQuestion};
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared {
+            out_tx,
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicI64::new(1),
+        });
+        let questioner = AcpQuestioner {
+            shared: Arc::clone(&shared),
+            session_id: "session-1".into(),
+        };
+        let request = QuestionRequest {
+            id: QuestionId::new(),
+            call_id: ToolCallId::from_raw("call-question"),
+            questions: vec![UserQuestion {
+                header: "Scope".into(),
+                prompt: "Which scope?".into(),
+                options: vec![
+                    QuestionOption {
+                        label: "Focused".into(),
+                        description: "Small change".into(),
+                    },
+                    QuestionOption {
+                        label: "Broad".into(),
+                        description: "Larger change".into(),
+                    },
+                ],
+                allow_custom: true,
+            }],
+        };
+        let task = tokio::spawn(async move { questioner.ask(request).await });
+        let sent = out_rx.recv().await.expect("question request");
+        assert_eq!(
+            sent.pointer("/params/toolCall/title")
+                .and_then(Value::as_str),
+            Some("Which scope?")
+        );
+        assert_eq!(
+            sent.pointer("/params/options/1/optionId")
+                .and_then(Value::as_str),
+            Some("q0_o1")
+        );
+        let id = sent.get("id").and_then(Value::as_i64).expect("request id");
+        shared
+            .resolve(
+                id,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {"outcome": {"outcome": "selected", "optionId": "q0_o1"}}
+                }),
+            )
+            .await;
+        let response = task.await.expect("question task");
+        assert_eq!(
+            response,
+            QuestionResponse::Answered {
+                answers: vec![QuestionAnswer {
+                    question: 0,
+                    selected: Some(1),
+                    custom: None,
+                }]
+            }
+        );
     }
 
     #[test]

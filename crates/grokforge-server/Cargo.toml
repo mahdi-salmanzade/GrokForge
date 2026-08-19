@@ -1,0 +1,36 @@
+[package]
+name = "grokforge-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Authenticated local HTTP API for GrokForge."
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+futures = { workspace = true }
+getrandom = { workspace = true }
+grokforge-core = { workspace = true }
+grokforge-protocol = { workspace = true }
+grokforge-sandbox = { workspace = true }
+grokforge-xai = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+grokforge-test-support = { workspace = true }
+reqwest = { workspace = true }
+tempfile = { workspace = true }

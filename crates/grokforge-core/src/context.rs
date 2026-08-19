@@ -138,12 +138,42 @@ pub fn assemble(
     let mut calls = std::collections::BTreeMap::<String, String>::new();
     for item in &session.history {
         match item {
-            ResponseItem::UserMessage { text, redactions } => {
+            ResponseItem::UserMessage {
+                text,
+                redactions,
+                images,
+            } => {
                 ledger.push(
                     LedgerEntry::new("history:user", text.len(), "history")
                         .with_redactions(*redactions),
                 );
-                input.push(InputItem::text(Role::User, text));
+                let mut content = Vec::with_capacity(images.len().saturating_add(1));
+                // Reconstruct data URLs locally from typed persisted parts. A hand-edited rollout
+                // therefore cannot turn image replay into an arbitrary provider-side URL fetch.
+                for image in images.iter().take(8) {
+                    let prefix = match image.mime_type.as_str() {
+                        "image/png" => "data:image/png;base64,",
+                        "image/jpeg" => "data:image/jpeg;base64,",
+                        _ => continue,
+                    };
+                    // The attachment reader caps raw images at 4 MiB. Keep replay defensive when
+                    // reading a manually modified legacy transcript as well.
+                    if image.base64.len() > 6 * 1024 * 1024 {
+                        continue;
+                    }
+                    let image_url = format!("{prefix}{}", image.base64);
+                    ledger.push(LedgerEntry::new(
+                        "history:user_image",
+                        image_url.len(),
+                        "explicit image attachment",
+                    ));
+                    content.push(ContentPart::InputImage { image_url });
+                }
+                content.push(ContentPart::InputText { text: text.clone() });
+                input.push(InputItem::Message {
+                    role: Role::User,
+                    content,
+                });
             }
             ResponseItem::AssistantMessage { text } => {
                 ledger.push(LedgerEntry::new("history:assistant", text.len(), "history"));
@@ -367,6 +397,7 @@ fn reconcile(request: ResponsesRequest, mut ledger: RequestLedger) -> Result<Ass
 mod tests {
     use super::*;
     use crate::session::{Session, SessionConfig};
+    use grokforge_protocol::ImageAttachment;
     use std::path::PathBuf;
 
     #[test]
@@ -374,6 +405,53 @@ mod tests {
         let mut session = Session::new(SessionConfig::new(PathBuf::from("/tmp"), "grok-build-0.1"));
         session.history.push(ResponseItem::user("hello world"));
         let assembled = assemble(&session, &[], &[], &[], vec![]).unwrap();
+        assert_eq!(assembled.ledger.total_bytes(), assembled.body_len);
+    }
+
+    #[test]
+    fn native_images_are_replayed_as_local_data_urls_and_ledgered() {
+        let mut session = Session::new(SessionConfig::new(PathBuf::from("/tmp"), "grok-4.5"));
+        session
+            .history
+            .push(ResponseItem::user_with_images_redacted(
+                "describe the screenshot",
+                0,
+                vec![ImageAttachment {
+                    mime_type: "image/png".to_string(),
+                    base64: "iVBORw0KGgo=".to_string(),
+                }],
+            ));
+
+        let assembled = assemble(&session, &[], &[], &[], vec![]).unwrap();
+        let (body, _) = XaiClient::serialize_request(&assembled.request).unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("data:image/png;base64,iVBORw0KGgo="));
+        assert!(body.contains("describe the screenshot"));
+        assert!(assembled.ledger.entries.iter().any(|entry| {
+            entry.source == "history:user_image" && entry.reason == "explicit image attachment"
+        }));
+        assert_eq!(assembled.ledger.total_bytes(), assembled.body_len);
+    }
+
+    #[test]
+    fn hand_edited_image_mime_cannot_become_a_remote_fetch() {
+        let mut session = Session::new(SessionConfig::new(PathBuf::from("/tmp"), "grok-4.5"));
+        session
+            .history
+            .push(ResponseItem::user_with_images_redacted(
+                "question",
+                0,
+                vec![ImageAttachment {
+                    mime_type: "https://attacker.invalid/image".to_string(),
+                    base64: "payload".to_string(),
+                }],
+            ));
+
+        let assembled = assemble(&session, &[], &[], &[], vec![]).unwrap();
+        let (body, _) = XaiClient::serialize_request(&assembled.request).unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("attacker.invalid"));
+        assert!(!body.contains("input_image"));
         assert_eq!(assembled.ledger.total_bytes(), assembled.body_len);
     }
 

@@ -12,9 +12,12 @@ const MAX_TOTAL_COMMAND_BYTES: usize = 512 * 1024;
 // See the corresponding skill cap: never let filesystem enumeration order choose which commands
 // survive a limit.
 const MAX_COMMAND_DIRECTORY_ENTRIES: usize = 1_024;
+// Reserved so discovery cannot override built-in slash actions. "?" is omitted because
+// `valid_command_name` already rejects it (only ascii alphanumeric, `-`, and `_`).
 const RESERVED_COMMAND_NAMES: &[&str] = &[
-    "clear", "effort", "exit", "help", "memory", "model", "plan", "q", "quit", "skills", "tools",
-    "undo",
+    "agents", "clear", "commit", "compact", "diff", "effort", "exit", "help", "ledger", "map",
+    "memory", "model", "new", "plan", "q", "quit", "redo", "resume", "sandbox", "sessions",
+    "skills", "status", "theme", "tools", "undo",
 ];
 
 /// A project prompt command.
@@ -160,6 +163,25 @@ mod tests {
             expand(&commands[1], "src/lib.rs"),
             "[project command /review]\n\nReview the current diff.\n\n[arguments]\nsrc/lib.rs"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reserved_builtin_command_files_are_not_discovered() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join(".grokforge/commands");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("ledger.md"), "Show the context ledger.").unwrap();
+        std::fs::write(root.join("status.md"), "Show session status.").unwrap();
+        std::fs::write(root.join("sessions.md"), "List saved sessions.").unwrap();
+        std::fs::write(root.join("review.md"), "Review the current diff.").unwrap();
+
+        let commands = discover(workspace.path());
+        let names: Vec<&str> = commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(names, ["review"]);
     }
 
     #[cfg(unix)]

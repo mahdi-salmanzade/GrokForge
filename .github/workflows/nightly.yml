@@ -1,0 +1,98 @@
+# Nightly honesty pass. This is not the full roadmap matrix in docs/design/03-roadmap.md.
+#
+# Jobs here:
+#   lint-test         — fmt, clippy -D warnings, workspace tests, cargo-deny (ubuntu-latest)
+#   telemetry-audit   — Cargo.toml keys + Rust use/extern/crate paths for analytics SDKs
+#
+# Deliberately not claimed (no secrets, runners, or tests for these exist here):
+#   - live-API smoke: grokforge-xai has no #[ignore]d live network tests. The only
+#     #[ignore] items in the workspace are sandbox helper processes. Do not invent a
+#     billed/flaky request. If ignored live tests are added later, gate a job with
+#     `if: ${{ secrets.XAI_API_KEY != '' }}` so a missing secret skips (does not fail)
+#     and the value is never printed.
+#   - full multiplexer / terminal-matrix (tmux, Zellij, screen, SSH-loopback)
+#   - encrypted-credential unlock job
+#   - sandbox bubblewrap install (owned by ci.yml's sandbox job)
+#   - OS matrix (PR CI already covers Ubuntu/macOS/Windows)
+#   - cargo-dist, installers, notarization, Homebrew tap, self-hosted runners
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint-test:
+    name: fmt + clippy + test + deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --locked --workspace
+        env:
+          INSTA_UPDATE: "no"
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  telemetry-audit:
+    name: no telemetry SDKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fail on telemetry crate names and use-paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Executable references only: Cargo.toml dependency keys and Rust use /
+          # extern-crate / crate-path prefixes. Do not scan markdown or comments
+          # that forbid telemetry (SECURITY.md, ADR 0004, "Telemetry: off.").
+          # git grep stays in tracked files; still exclude target/, graphify-out/, .git.
+          excludes=(':!target' ':!graphify-out' ':!.git')
+          toml_keys='sentry|sentry-[A-Za-z0-9_-]+|opentelemetry|opentelemetry[-_][A-Za-z0-9_-]+|tracing-opentelemetry|mixpanel|posthog|posthog-[A-Za-z0-9_-]+|amplitude|segment|analytics|dogstatsd|cadence|statsd|datadog|datadog-[A-Za-z0-9_-]+|telemetry'
+          rust_ids='sentry|opentelemetry|tracing_opentelemetry|mixpanel|posthog|amplitude|segment|analytics|dogstatsd|cadence|statsd|datadog|telemetry'
+
+          hits="$(mktemp)"
+          trap 'rm -f "$hits"' EXIT
+
+          collect() {
+            local rc=0
+            git grep -n -E "$@" || rc=$?
+            if [ "$rc" -gt 1 ]; then
+              exit "$rc"
+            fi
+            return 0
+          }
+
+          collect -e "^[[:space:]]*(${toml_keys})[[:space:]]*=" \
+            -e "^\\[[^]]*\\.(${toml_keys})\\]" \
+            -- "${excludes[@]}" 'Cargo.toml' >>"$hits"
+
+          collect -e "^[[:space:]]*(pub[[:space:]]+)?use[[:space:]]+.*\\b(${rust_ids})(\\b|_[A-Za-z0-9_]+)" \
+            -e "^[[:space:]]*extern[[:space:]]+crate[[:space:]]+(${rust_ids})(\\b|_[A-Za-z0-9_]+)" \
+            -e "\\b(${rust_ids})(_[A-Za-z0-9_]+)?::" \
+            -- "${excludes[@]}" '*.rs' >>"$hits"
+
+          if [ -s "$hits" ]; then
+            echo "Forbidden telemetry SDK references:"
+            cat "$hits"
+            exit 1
+          fi
+          echo "No telemetry crate names or use-paths found."

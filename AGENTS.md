@@ -27,10 +27,11 @@ cargo deny check                       # license / advisory gate
 | `grokforge-core` | Agent loop, tools, approval engine, attachments/memory, context assembler + redaction, compaction, sessions store, subagents. |
 | `grokforge-sandbox` | `SandboxPolicy` compilation, per-OS backends, denial classifier, process exec. |
 | `grokforge-git` | gix reads; git-CLI mutations from the host process only. |
-| `grokforge-context` | Reserved seam for the planned tree-sitter repo map and file search; currently minimal. |
-| `grokforge-mcp` | Bounded stdio MCP client behind an internal trait. |
+| `grokforge-context` | Bounded repo map, file search, and secure local LSP/formatter configuration. |
+| `grokforge-mcp` | Bounded stdio and Streamable HTTP MCP clients behind an internal trait. |
 | `grokforge-render` | Pure-function streaming markdown/diff render pipeline. |
 | `grokforge-tui` | ratatui frontend. |
+| `grokforge-server` | Authenticated loopback HTTP API, bounded SSE protocol stream, session metadata, OpenAPI. |
 | `grokforge` | Binary: TUI + `exec` headless + subcommands. |
 | `grokforge-test-support` | Mock xAI SSE server, fixture repos, PTY harness. |
 
