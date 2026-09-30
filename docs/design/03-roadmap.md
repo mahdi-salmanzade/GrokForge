@@ -235,6 +235,10 @@ GrokForge/
 
 ## 3. CI/CD
 
+**Current status:** GitHub Actions CI, nightly checks, and release publishing are disabled.
+The YAML definitions are archived in [`.github/disabled-workflows/`](../../.github/disabled-workflows/README.md).
+The plans below are historical; contributors run verification locally.
+
 **`ci.yml` (per PR)**
 - Matrix: `ubuntu-22.04` (kernel 5.15, Landlock ABI≈V1–V2), `ubuntu-24.04` (6.8, ABI V4), `macos-14` + `macos-15` (arm64; SBPL drift coverage across OS versions — risk #4), `windows-latest`. Swatinem/rust-cache.
 - Steps: fmt check → `clippy --all-targets -- -D warnings` → `cargo nextest run --workspace` → `cargo deny check` → insta with `INSTA_UPDATE=no` (fails on pending snapshots).

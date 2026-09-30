@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Added `docs/architecture.md` with the implemented crate boundaries, turn flow, persistence,
+  trust controls, and differences from the original design record.
 - Added hidden `grokforge debug sandbox -- <cmd>` and `grokforge debug repomap [--budget N] [query]`
   diagnostics. Sandbox runs the command under the default workspace-write policy and reports
   whether the OS backend actually enforced it, plus exit/timeout/denial and sanitized output.
@@ -98,6 +100,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   patch failures and approvals attributable without pretending to be a general patch shell.
 
 ### Changed
+- Disabled GitHub Actions CI, nightly checks, and release publishing. Preserved their
+  definitions outside the active workflow directory in `.github/disabled-workflows/` and
+  documented the local verification gates and restoration steps.
 - Project slash-command discovery now reserves additional built-in names (`ledger`, `status`,
   `sessions`, `compact`, `diff`, `map`, `sandbox`, `agents`, `theme`, `commit`, `new`, `resume`)
   so a `.grokforge/commands/*.md` file cannot shadow them.
@@ -125,6 +130,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   does not currently expose a parent action for it and therefore does not advertise `/undo`.
 
 ### Fixed
+- Confined folder attachment inventories to descriptor-validated workspace paths, rejecting
+  parent traversal, symlink ancestors, linked files, and special entries before including
+  filenames or sizes in model context. File and folder attachment envelopes now fit their
+  remaining aggregate byte budget.
+- Feed Git subprocess input while concurrently draining stdout/stderr under one deadline,
+  preventing large-patch backpressure deadlocks and timing out commands that never read stdin.
+  Early input rejection preserves the command's exit status and diagnostics.
+- Preserve bounded partial Markdown output when byte/span limits stop rendering, and report
+  truncation when a UTF-8 boundary prevents a complete character from fitting.
+- Keep memory-index reads and writes on the same 64 KiB limit so a successful note cannot
+  hide the auto-loaded index. Reject topic slugs that alias `MEMORY.md` on case-insensitive
+  filesystems before writing; topic files retain their separate 128 KiB limit.
+- Updated the locked Rustls dependency to 0.23.45 (and rustls-webpki to 0.103.15) to address
+  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html).
 - Custom executable tools now fail closed when executable ownership/permissions cannot be verified,
   restore only the staged private executable directory read-only when Bubblewrap hides host runtime
   trees, and under Bubblewrap inject explicitly allowed environment values inside the namespace

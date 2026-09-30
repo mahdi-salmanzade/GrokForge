@@ -250,13 +250,34 @@ pub(crate) fn read_workspace_context_bytes(
     Ok((bytes, truncated))
 }
 
+/// Inspect an attachment candidate through the same no-follow descriptors used for its bytes.
+/// Directory inventories must not use path-based metadata: a linked ancestor or `..` could
+/// disclose filenames and sizes from outside the workspace even without reading file content.
+pub(crate) fn workspace_context_metadata(
+    workspace: &Path,
+    target: &Path,
+) -> Result<std::fs::Metadata, PathSafetyError> {
+    if cfg!(not(unix)) {
+        return Err(PathSafetyError::Denied);
+    }
+    let file = open_workspace_context_target(workspace, target)?;
+    let metadata = file.metadata()?;
+    if metadata.is_file() {
+        #[cfg(unix)]
+        reject_hard_link(&file)?;
+    } else if !metadata.is_dir() {
+        return Err(PathSafetyError::InvalidTarget);
+    }
+    Ok(metadata)
+}
+
 fn open_workspace_context_target(
     workspace: &Path,
     target: &Path,
 ) -> Result<std::fs::File, PathSafetyError> {
     #[cfg(unix)]
     let file = {
-        use rustix::fs::{Mode, OFlags, openat};
+        use rustix::fs::{Mode, OFlags, open, openat};
         use rustix::io::Errno;
 
         let lexical_root = absolute(workspace);
@@ -264,14 +285,22 @@ fn open_workspace_context_target(
         let relative = lexical_target
             .strip_prefix(&lexical_root)
             .map_err(|_| PathSafetyError::Denied)?;
-        if relative.as_os_str().is_empty()
-            || relative
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
         {
             return Err(PathSafetyError::InvalidTarget);
         }
         let root = std::fs::canonicalize(&lexical_root)?;
+        if relative.as_os_str().is_empty() {
+            return open(
+                &root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map(std::fs::File::from)
+            .map_err(|error| std::io::Error::from(error).into());
+        }
         let (parent, name) = open_parent(&root, relative, false)?;
         match openat(
             &parent,

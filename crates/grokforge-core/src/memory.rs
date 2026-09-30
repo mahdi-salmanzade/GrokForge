@@ -85,8 +85,8 @@ fn slug(topic: &str) -> Option<String> {
 /// time that topic appears. Returns a short human-readable confirmation.
 ///
 /// # Errors
-/// Returns an error string when the note is empty or too large, the topic is unusable, or the
-/// write fails.
+/// Returns an error string when the note is empty or too large, the topic is unusable or aliases
+/// the reserved index, or the write fails.
 pub fn remember(workspace_root: &Path, note: &str, topic: Option<&str>) -> Result<String, String> {
     let note = note.trim();
     if note.is_empty() {
@@ -108,6 +108,14 @@ pub fn remember(workspace_root: &Path, note: &str, topic: Option<&str>) -> Resul
             let slug = slug(topic)
                 .ok_or_else(|| "topic must contain at least one letter or digit".to_string())?;
             let file = format!("{slug}.md");
+            // The index and a `memory` topic alias on common case-insensitive filesystems.
+            // Reject the topic before writing either file, with the same behavior on every OS.
+            if file.eq_ignore_ascii_case(MEMORY_INDEX) {
+                return Err(
+                    "topic `memory` is reserved for MEMORY.md; omit `topic` to write to the index"
+                        .to_string(),
+                );
+            }
             append_section(workspace_root, &dir.join(&file), Some(topic), note)?;
             ensure_index_link(workspace_root, &dir.join(MEMORY_INDEX), topic, &file)?;
             Ok(format!("noted in memory/{file}"))
@@ -169,15 +177,25 @@ fn ensure_index_link(
     write_bounded(workspace_root, index, &content)
 }
 
+fn memory_file_limit(path: &Path) -> usize {
+    if path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case(MEMORY_INDEX))
+    {
+        // Every successful index write must remain discoverable by the auto-context reader.
+        MAX_MEMORY_INDEX_BYTES
+    } else {
+        MAX_MEMORY_FILE_BYTES
+    }
+}
+
 fn read_existing(workspace_root: &Path, path: &Path) -> Result<String, String> {
-    match crate::path_safety::read_workspace_context_text(
-        workspace_root,
-        path,
-        MAX_MEMORY_FILE_BYTES,
-    ) {
+    let limit = memory_file_limit(path);
+    match crate::path_safety::read_workspace_context_text(workspace_root, path, limit) {
         Ok((content, false)) => Ok(content),
         Ok((_, true)) => Err(format!(
-            "existing memory file exceeds the {MAX_MEMORY_FILE_BYTES}-byte limit; prune older notes"
+            "existing memory file exceeds the {limit}-byte limit; prune older notes"
         )),
         Err(crate::path_safety::PathSafetyError::Io(error))
             if error.kind() == std::io::ErrorKind::NotFound =>
@@ -189,9 +207,10 @@ fn read_existing(workspace_root: &Path, path: &Path) -> Result<String, String> {
 }
 
 fn write_bounded(workspace_root: &Path, path: &Path, content: &str) -> Result<(), String> {
-    if content.len() > MAX_MEMORY_FILE_BYTES {
+    let limit = memory_file_limit(path);
+    if content.len() > limit {
         return Err(format!(
-            "memory file would exceed the {MAX_MEMORY_FILE_BYTES}-byte limit; prune older notes"
+            "memory file would exceed the {limit}-byte limit; prune older notes"
         ));
     }
     // `remember` deliberately needs no approval, so its host write must have the same confinement
@@ -218,6 +237,51 @@ mod tests {
         let docs = discover(ws.path());
         assert_eq!(docs.len(), 1);
         assert!(docs[0].content.contains("source ~/.cargo/env"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_writes_remain_discoverable_at_the_size_limit() {
+        let ws = tempfile::tempdir().unwrap();
+        let index = ws.path().join(MEMORY_DIR).join(MEMORY_INDEX);
+        std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+        let before = format!("{}\n", "x".repeat(MAX_MEMORY_INDEX_BYTES - 5));
+        std::fs::write(&index, &before).unwrap();
+
+        remember(ws.path(), "x", None).unwrap();
+        let docs = discover(ws.path());
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].content.len(), MAX_MEMORY_INDEX_BYTES);
+        let saved = docs[0].content.clone();
+
+        let error = remember(ws.path(), "y", None).unwrap_err();
+        assert!(error.contains(&MAX_MEMORY_INDEX_BYTES.to_string()));
+        assert_eq!(std::fs::read_to_string(&index).unwrap(), saved);
+        assert_eq!(discover(ws.path())[0].content, saved);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn topic_files_keep_their_larger_size_limit() {
+        let ws = tempfile::tempdir().unwrap();
+        remember(ws.path(), "first note", Some("build")).unwrap();
+        let topic = ws.path().join(MEMORY_DIR).join("build.md");
+        std::fs::write(&topic, "x".repeat(MAX_MEMORY_INDEX_BYTES + 1)).unwrap();
+
+        remember(ws.path(), "another note", Some("build")).unwrap();
+        assert!(std::fs::metadata(topic).unwrap().len() > MAX_MEMORY_INDEX_BYTES as u64);
+        assert_eq!(discover(ws.path()).len(), 1);
+    }
+
+    #[test]
+    fn topic_cannot_alias_the_reserved_index() {
+        let ws = tempfile::tempdir().unwrap();
+        for topic in ["memory", "MEMORY", "MeMoRy", "Memory!"] {
+            let error = remember(ws.path(), "must not write", Some(topic)).unwrap_err();
+            assert!(error.contains("reserved for MEMORY.md"), "{error}");
+            assert!(error.contains("omit `topic`"), "{error}");
+        }
+        assert!(!ws.path().join(MEMORY_DIR).exists());
     }
 
     #[cfg(unix)]

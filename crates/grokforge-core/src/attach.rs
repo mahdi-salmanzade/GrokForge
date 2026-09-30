@@ -358,11 +358,7 @@ fn read_attachment(workspace_root: &Path, mention: &str, budget: usize) -> Optio
         return None;
     }
     let absolute = workspace_root.join(trimmed);
-    let meta = std::fs::symlink_metadata(&absolute).ok()?;
-    // Never follow a symlink mention out of the workspace; the reader is also no-follow.
-    if meta.file_type().is_symlink() {
-        return None;
-    }
+    let meta = crate::path_safety::workspace_context_metadata(workspace_root, &absolute).ok()?;
     if meta.is_file() {
         return read_one_file(workspace_root, &absolute, trimmed, budget);
     }
@@ -372,17 +368,28 @@ fn read_attachment(workspace_root: &Path, mention: &str, budget: usize) -> Optio
     // A folder becomes a *manifest* (paths + sizes), not inlined content: dumping a large folder
     // would blow the context budget. The agent gets a map of what's there and reads the files that
     // matter with `read_file` (cheap to revisit thanks to the provider's prompt cache).
-    Some(folder_manifest(workspace_root, &absolute, trimmed))
+    folder_manifest(workspace_root, &absolute, trimmed, budget)
 }
 
 /// Build a `<folder>` listing of the files under `absolute` (relative paths + sizes),
 /// `.gitignore`-aware and skipping common secret files, bounded to [`MAX_MANIFEST_FILES`].
-fn folder_manifest(workspace_root: &Path, absolute: &Path, rel: &str) -> String {
+fn folder_manifest(
+    workspace_root: &Path,
+    absolute: &Path,
+    rel: &str,
+    budget: usize,
+) -> Option<String> {
     use std::fmt::Write as _;
     let mut entries: Vec<(String, u64)> = Vec::new();
     let mut total_files = 0usize;
     let mut total_bytes = 0u64;
+    let filter_root = workspace_root.to_path_buf();
     for entry in ignore::WalkBuilder::new(absolute)
+        // Recheck every candidate before descent and before rendering it. The ignore walker
+        // uses paths, so a directory replaced after the initial check must still fail closed.
+        .filter_entry(move |entry| {
+            crate::path_safety::workspace_context_metadata(&filter_root, entry.path()).is_ok()
+        })
         .build()
         .flatten()
         .take(MAX_WALK_ENTRIES)
@@ -394,10 +401,18 @@ fn folder_manifest(workspace_root: &Path, absolute: &Path, rel: &str) -> String 
             continue;
         };
         let relative = relative.to_string_lossy().replace('\\', "/");
-        if is_probably_secret(&relative) {
+        if is_probably_secret(&relative) || relative.chars().any(char::is_control) {
             continue;
         }
-        let size = entry.metadata().map_or(0, |meta| meta.len());
+        let Ok(metadata) =
+            crate::path_safety::workspace_context_metadata(workspace_root, entry.path())
+        else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let size = metadata.len();
         total_files += 1;
         total_bytes = total_bytes.saturating_add(size);
         if entries.len() < MAX_MANIFEST_FILES {
@@ -409,27 +424,31 @@ fn folder_manifest(workspace_root: &Path, absolute: &Path, rel: &str) -> String 
     out.push_str("<folder path=\"");
     out.push_str(&sanitize_attr(rel));
     out.push_str("\" note=\"Listing only — read the files you need with read_file.\">\n");
-    for (path, size) in &entries {
-        out.push_str("  ");
-        out.push_str(path);
-        out.push_str(" (");
-        out.push_str(&human_size(*size));
-        out.push_str(")\n");
-    }
-    if total_files > entries.len() {
-        let _ = writeln!(
-            out,
-            "  … {} more file(s) not listed",
-            total_files - entries.len()
-        );
-    }
-    let _ = writeln!(
-        out,
-        "[{total_files} file(s), {} total]",
+    let summary = format!(
+        "[{total_files} file(s), {} total]\n</folder>\n",
         human_size(total_bytes)
     );
-    out.push_str("</folder>\n");
-    out
+    // Reserving the largest possible omission notice lets every row fit without splitting a
+    // UTF-8 filename or leaving an unterminated block when the aggregate budget is nearly full.
+    let omitted = format!("  … {total_files} more file(s) not listed\n");
+    let reserved = summary.len().saturating_add(omitted.len());
+    if out.len().saturating_add(reserved) > budget {
+        return None;
+    }
+    let mut listed = 0usize;
+    for (path, size) in &entries {
+        let row = format!("  {path} ({})\n", human_size(*size));
+        if out.len().saturating_add(row.len()).saturating_add(reserved) > budget {
+            break;
+        }
+        out.push_str(&row);
+        listed += 1;
+    }
+    if total_files > listed {
+        let _ = writeln!(out, "  … {} more file(s) not listed", total_files - listed);
+    }
+    out.push_str(&summary);
+    Some(out)
 }
 
 /// Compact human-readable byte size (integer math, no float precision casts).
@@ -451,21 +470,26 @@ fn read_one_file(
     relative: &str,
     budget: usize,
 ) -> Option<String> {
-    let cap = budget.min(MAX_ATTACH_FILE_BYTES);
+    const TRUNCATED: &str = "\n… [attachment truncated]";
+    const FOOTER: &str = "\n</attachment>\n";
+    let header = format!("<attachment path=\"{}\">\n", sanitize_attr(relative));
+    let overhead = header
+        .len()
+        .saturating_add(FOOTER.len())
+        .saturating_add(TRUNCATED.len());
+    let cap = budget.saturating_sub(overhead).min(MAX_ATTACH_FILE_BYTES);
     if cap == 0 {
         return None;
     }
     let (content, truncated) =
         crate::path_safety::read_workspace_context_text(workspace_root, absolute, cap).ok()?;
-    let mut block = String::with_capacity(content.len() + relative.len() + 48);
-    block.push_str("<attachment path=\"");
-    block.push_str(&sanitize_attr(relative));
-    block.push_str("\">\n");
+    let mut block = String::with_capacity(content.len().saturating_add(overhead));
+    block.push_str(&header);
     block.push_str(&content);
     if truncated {
-        block.push_str("\n… [attachment truncated]");
+        block.push_str(TRUNCATED);
     }
-    block.push_str("\n</attachment>\n");
+    block.push_str(FOOTER);
     Some(block)
 }
 
@@ -681,6 +705,7 @@ mod tests {
         assert_eq!(expanded.text.matches("<image path=").count(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn folder_mention_lists_files_without_inlining_content() {
         let dir = ws();
@@ -692,6 +717,96 @@ mod tests {
             !out.contains("fn main() {}"),
             "folder content must not be inlined: {out}"
         );
+    }
+
+    #[test]
+    fn folder_mention_cannot_inventory_a_parent_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        let outside = parent.path().join("private");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("private-file.txt"), "private data").unwrap();
+
+        let prompt = "inspect @../private/";
+        assert_eq!(expand(&workspace, prompt), prompt);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_mention_cannot_inventory_through_a_symlinked_parent() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("nested")).unwrap();
+        std::fs::write(
+            outside.path().join("nested/private-file.txt"),
+            "private data",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("linked")).unwrap();
+
+        let prompt = "inspect @linked/nested/";
+        assert_eq!(expand(workspace.path(), prompt), prompt);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn text_attachment_blocks_include_their_envelopes_in_the_byte_budget() {
+        let workspace = ws();
+        std::fs::write(workspace.path().join("large.txt"), "x".repeat(1_024)).unwrap();
+        let budget = 256;
+        let file = read_attachment(workspace.path(), "large.txt", budget).unwrap();
+        assert!(file.len() <= budget, "{} bytes exceed {budget}", file.len());
+        assert!(file.ends_with("</attachment>\n"));
+
+        for index in 0..30 {
+            std::fs::write(workspace.path().join(format!("src/file-{index}.txt")), "x").unwrap();
+        }
+        let folder = read_attachment(workspace.path(), "src", budget).unwrap();
+        assert!(
+            folder.len() <= budget,
+            "{} bytes exceed {budget}",
+            folder.len()
+        );
+        assert!(folder.ends_with("</folder>\n"));
+        assert!(folder.contains("more file(s) not listed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_inventory_preserves_ignore_and_private_file_policy() {
+        let workspace = ws();
+        std::fs::create_dir(workspace.path().join(".git")).unwrap();
+        std::fs::write(workspace.path().join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::create_dir(workspace.path().join("ignored")).unwrap();
+        std::fs::write(workspace.path().join("ignored/hidden.txt"), "ignored data").unwrap();
+        std::fs::write(workspace.path().join("private.key"), "private key").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let private_file = outside.path().join("private.txt");
+        std::fs::write(&private_file, "private data").unwrap();
+        std::fs::hard_link(&private_file, workspace.path().join("hardlinked.txt")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("linked")).unwrap();
+
+        let folder = read_attachment(workspace.path(), ".", MAX_TOTAL_ATTACH_BYTES).unwrap();
+        assert!(folder.contains("src/lib.rs"), "{folder}");
+        for excluded in [
+            ".git",
+            ".env",
+            "ignored/",
+            "private.key",
+            "hardlinked.txt",
+            "linked/",
+        ] {
+            assert!(!folder.contains(excluded), "listed {excluded}: {folder}");
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn folder_mentions_fail_closed_without_descriptor_safe_metadata() {
+        let workspace = ws();
+        let prompt = "inspect @src/";
+        assert_eq!(expand(workspace.path(), prompt), prompt);
     }
 
     #[test]

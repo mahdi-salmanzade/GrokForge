@@ -14,10 +14,14 @@ Third-party libraries should remain dependencies with their own licenses and not
 
 ## Before you open a PR
 
+GitHub Actions CI, nightly checks, and release publishing are disabled. Contributors
+run the gates locally; archived workflow definitions and restoration instructions
+are in [`.github/disabled-workflows/`](.github/disabled-workflows/README.md).
+
 ```sh
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+INSTA_UPDATE=no cargo test --locked --workspace
 cargo deny check
 ```
 

@@ -745,6 +745,7 @@ impl Renderer {
             self.mark_stopped();
             return;
         }
+        let span_truncated = span.text.len() < original_len;
 
         line.bytes = line.bytes.saturating_add(span.text.len());
         let can_merge = line.spans.last().is_some_and(|last| {
@@ -762,7 +763,7 @@ impl Renderer {
             return;
         }
 
-        if line.bytes >= self.limits.max_line_bytes && original_len > available {
+        if span_truncated {
             self.mark_stopped();
         }
     }
@@ -867,9 +868,9 @@ impl Renderer {
     }
 
     fn finish(mut self) -> RenderedMarkdown {
-        if !self.stopped {
-            self.finish_current();
-        }
+        // Output limits stop parsing, but the current line already contains a safe bounded
+        // prefix. Preserve it before the truncation marker claims any remaining output budget.
+        self.finish_current();
         while self
             .lines
             .last()
@@ -1203,6 +1204,99 @@ mod tests {
             rendered.lines.last().map(|line| &line.kind),
             Some(&LineKind::Truncation)
         );
+    }
+
+    #[test]
+    fn line_byte_limit_keeps_the_fitting_prefix_and_reports_utf8_truncation() {
+        for (source, max_line_bytes, prefix) in [("abcdef", 4, "abcd"), ("ééé", 5, "éé")] {
+            let rendered = render_markdown_with_limits(
+                source,
+                RenderLimits {
+                    max_line_bytes,
+                    ..RenderLimits::default()
+                },
+            );
+
+            assert!(rendered.truncated);
+            assert_eq!(rendered.lines[0].plain_text(), prefix);
+            assert_eq!(
+                rendered.lines.last().map(|line| &line.kind),
+                Some(&LineKind::Truncation)
+            );
+            assert!(
+                rendered
+                    .lines
+                    .iter()
+                    .all(|line| line.plain_text().len() <= max_line_bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn span_limit_keeps_the_fitting_styled_prefix_without_exceeding_marker_budget() {
+        let rendered = render_markdown_with_limits(
+            "plain **bold** tail",
+            RenderLimits {
+                max_spans: 2,
+                ..RenderLimits::default()
+            },
+        );
+
+        assert!(rendered.truncated);
+        assert_eq!(rendered.lines[0].plain_text(), "plain bold");
+        assert!(rendered.lines[0].spans[1].style.strong);
+        assert_eq!(
+            rendered.lines.last().map(|line| &line.kind),
+            Some(&LineKind::Truncation)
+        );
+        assert_eq!(
+            rendered
+                .lines
+                .iter()
+                .map(|line| line.spans.len())
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    #[test]
+    fn partial_prefix_and_truncation_marker_respect_exhausted_line_and_span_limits() {
+        for max_lines in 0..=3 {
+            for max_spans in 0..=3 {
+                let rendered = render_markdown_with_limits(
+                    "one **two** three",
+                    RenderLimits {
+                        max_lines,
+                        max_line_bytes: 9,
+                        max_spans,
+                        ..RenderLimits::default()
+                    },
+                );
+
+                assert!(rendered.truncated);
+                assert!(rendered.lines.len() <= max_lines);
+                assert!(
+                    rendered
+                        .lines
+                        .iter()
+                        .map(|line| line.spans.len())
+                        .sum::<usize>()
+                        <= max_spans
+                );
+                assert!(
+                    rendered
+                        .lines
+                        .iter()
+                        .all(|line| line.plain_text().len() <= 9)
+                );
+                if max_lines > 0 {
+                    assert_eq!(
+                        rendered.lines.last().map(|line| &line.kind),
+                        Some(&LineKind::Truncation)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

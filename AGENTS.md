@@ -4,9 +4,12 @@ GrokForge dogfoods this convention: the agent reads this file for project contex
 
 ## What this is
 
-A Rust workspace implementing GrokForge, an open-source terminal coding agent for xAI Grok. Full design record lives in `docs/design/`; architecture decisions in `docs/decisions/`.
+A Rust workspace implementing GrokForge, an open-source terminal coding agent for xAI Grok. Current implementation map: `docs/architecture.md`. Full design record lives in `docs/design/`; architecture decisions in `docs/decisions/`.
 
 ## Build / test / lint
+
+GitHub Actions CI, nightly checks, and release publishing are disabled. Run these
+checks locally. Workflow definitions are archived in `.github/disabled-workflows/`.
 
 ```sh
 cargo build --workspace
@@ -26,14 +29,14 @@ cargo deny check                       # license / advisory gate
 | `grokforge-xai` | In-house Grok client (`/v1/responses`), SSE streaming, model validation, request byte-accounting. |
 | `grokforge-core` | Agent loop, tools, approval engine, attachments/memory, context assembler + redaction, compaction, sessions store, subagents. |
 | `grokforge-sandbox` | `SandboxPolicy` compilation, per-OS backends, denial classifier, process exec. |
-| `grokforge-git` | gix reads; git-CLI mutations from the host process only. |
+| `grokforge-git` | Bounded git-CLI reads and mutations from the trusted host process. gix-backed reads are deferred. |
 | `grokforge-context` | Bounded repo map, file search, and secure local LSP/formatter configuration. |
 | `grokforge-mcp` | Bounded stdio and Streamable HTTP MCP clients behind an internal trait. |
-| `grokforge-render` | Pure-function streaming markdown/diff render pipeline. |
+| `grokforge-render` | Pure-function bounded semantic Markdown rendering and terminal-text sanitization. |
 | `grokforge-tui` | ratatui frontend. |
 | `grokforge-server` | Authenticated loopback HTTP API, bounded SSE protocol stream, session metadata, OpenAPI. |
 | `grokforge` | Binary: TUI + `exec` headless + subcommands. |
-| `grokforge-test-support` | Mock xAI SSE server, fixture repos, PTY harness. |
+| `grokforge-test-support` | Bounded mock xAI HTTP/SSE server with captured requests and controllable TCP fragmentation. |
 
 ## Conventions
 

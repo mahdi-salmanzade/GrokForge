@@ -882,63 +882,7 @@ fn execute_git_command_with_input(
     command: &mut Command,
     input: &[u8],
 ) -> Result<GitCommandOutput, GitError> {
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
-    }
-    let mut child = command.spawn()?;
-    #[cfg(unix)]
-    let child_id = child.id();
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| GitError::Command("git stdin pipe was unavailable".to_string()))?;
-    stdin.write_all(input)?;
-    drop(stdin);
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| GitError::Command("git stdout pipe was unavailable".to_string()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| GitError::Command("git stderr pipe was unavailable".to_string()))?;
-    let stdout_reader = std::thread::spawn(move || read_capped(stdout, GIT_OUTPUT_CAP));
-    let stderr_reader = std::thread::spawn(move || read_capped(stderr, GIT_OUTPUT_CAP));
-    let deadline = Instant::now() + GIT_TIMEOUT;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            #[cfg(unix)]
-            kill_git_process_group(child_id);
-            break status;
-        }
-        if Instant::now() >= deadline {
-            #[cfg(unix)]
-            kill_git_process_group(child_id);
-            let _ = child.kill();
-            let _ = child.wait();
-            drop(stdout_reader);
-            drop(stderr_reader);
-            return Err(GitError::Timeout(GIT_TIMEOUT));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let (stdout, stdout_truncated) = join_reader_until(stdout_reader, deadline, GIT_TIMEOUT)?;
-    let (stderr, stderr_truncated) = join_reader_until(stderr_reader, deadline, GIT_TIMEOUT)?;
-    if stdout_truncated || stderr_truncated {
-        return Err(GitError::OutputLimit(GIT_OUTPUT_CAP));
-    }
-    Ok(GitCommandOutput {
-        status,
-        stdout,
-        stderr,
-    })
+    execute_command_with_input(command, Some(input), GIT_TIMEOUT, GIT_OUTPUT_CAP)
 }
 
 fn ensure_git_success(output: &GitCommandOutput) -> Result<(), GitError> {
@@ -963,8 +907,21 @@ fn execute_command(
     timeout: Duration,
     output_cap: usize,
 ) -> Result<GitCommandOutput, GitError> {
+    execute_command_with_input(command, None, timeout, output_cap)
+}
+
+fn execute_command_with_input(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    output_cap: usize,
+) -> Result<GitCommandOutput, GitError> {
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -972,6 +929,7 @@ fn execute_command(
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
+    let deadline = Instant::now() + timeout;
     let mut child = command.spawn()?;
     #[cfg(unix)]
     let child_id = child.id();
@@ -985,12 +943,25 @@ fn execute_command(
         .ok_or_else(|| GitError::Command("git stderr pipe was unavailable".to_string()))?;
     let stdout_reader = std::thread::spawn(move || read_capped(stdout, output_cap));
     let stderr_reader = std::thread::spawn(move || read_capped(stderr, output_cap));
+    // Feed input concurrently with both output readers. Writing a large patch synchronously
+    // before draining stdout can deadlock when the child emits output before consuming stdin.
+    // The writer also shares the command deadline, including when a child never reads input.
+    let stdin_writer = match (input, child.stdin.take()) {
+        (Some(input), Some(mut stdin)) => {
+            let input = input.to_vec();
+            Some(std::thread::spawn(move || match stdin.write_all(&input) {
+                // Preserve the command's status and diagnostics when it rejects input early.
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                result => result,
+            }))
+        }
+        _ => None,
+    };
 
-    let deadline = Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             // A repository-controlled helper must not outlive the trusted Git operation or keep
-            // an inherited output pipe open forever after the Git leader exits.
+            // an inherited pipe open forever after the Git leader exits.
             #[cfg(unix)]
             kill_git_process_group(child_id);
             break status;
@@ -1000,9 +971,9 @@ fn execute_command(
             kill_git_process_group(child_id);
             let _ = child.kill();
             let _ = child.wait();
-            // Reader threads may still be blocked on pipes inherited by a descendant that
-            // escaped the process group. Detach them rather than turning a bounded timeout into
-            // an unbounded host-process hang.
+            // IO threads may still be blocked on pipes inherited by a descendant that escaped
+            // the process group. Detach them rather than making timeout reporting unbounded.
+            drop(stdin_writer);
             drop(stdout_reader);
             drop(stderr_reader);
             return Err(GitError::Timeout(timeout));
@@ -1010,8 +981,13 @@ fn execute_command(
         std::thread::sleep(Duration::from_millis(10));
     };
 
-    let (stdout, stdout_truncated) = join_reader_until(stdout_reader, deadline, timeout)?;
-    let (stderr, stderr_truncated) = join_reader_until(stderr_reader, deadline, timeout)?;
+    if let Some(writer) = stdin_writer {
+        join_io_until(writer, deadline, timeout, "stdin writer")?;
+    }
+    let (stdout, stdout_truncated) =
+        join_io_until(stdout_reader, deadline, timeout, "stdout reader")?;
+    let (stderr, stderr_truncated) =
+        join_io_until(stderr_reader, deadline, timeout, "stderr reader")?;
     if stdout_truncated || stderr_truncated {
         return Err(GitError::OutputLimit(output_cap));
     }
@@ -1038,23 +1014,24 @@ fn read_capped<R: Read>(mut reader: R, cap: usize) -> std::io::Result<(Vec<u8>, 
     }
 }
 
-fn join_reader_until(
-    reader: std::thread::JoinHandle<std::io::Result<(Vec<u8>, bool)>>,
+fn join_io_until<T>(
+    worker: std::thread::JoinHandle<std::io::Result<T>>,
     deadline: Instant,
     timeout: Duration,
-) -> Result<(Vec<u8>, bool), GitError> {
-    while !reader.is_finished() {
+    role: &str,
+) -> Result<T, GitError> {
+    while !worker.is_finished() {
         if Instant::now() >= deadline {
-            // Dropping a JoinHandle detaches the bounded-memory reader. This can happen only if
-            // a descendant retained the pipe after the trusted Git leader was reaped.
-            drop(reader);
+            // Dropping a JoinHandle detaches the worker. This can happen only if a descendant
+            // retained the pipe after the trusted Git leader was reaped.
+            drop(worker);
             return Err(GitError::Timeout(timeout));
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    reader
+    worker
         .join()
-        .map_err(|_| GitError::Command("git output reader panicked".to_string()))?
+        .map_err(|_| GitError::Command(format!("git {role} panicked")))?
         .map_err(GitError::Io)
 }
 
@@ -1750,6 +1727,51 @@ mod tests {
         let error = execute_command(&mut slow, Duration::from_millis(50), 128)
             .expect_err("slow command must time out");
         assert!(matches!(error, GitError::Timeout(_)));
+    }
+
+    #[test]
+    fn command_runner_drains_output_while_feeding_large_input() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "dd if=/dev/zero bs=65536 count=8 2>/dev/null; cat >/dev/null; printf complete",
+        ]);
+        let input = vec![b'x'; 1024 * 1024];
+        let output = execute_command_with_input(
+            &mut command,
+            Some(&input),
+            Duration::from_secs(2),
+            1024 * 1024,
+        )
+        .expect("stdin and stdout backpressure must not deadlock");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 512 * 1024 + "complete".len());
+        assert!(output.stdout.ends_with(b"complete"));
+    }
+
+    #[test]
+    fn command_runner_times_out_when_large_input_is_never_read() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let input = vec![b'x'; 1024 * 1024];
+        let started = Instant::now();
+        let error =
+            execute_command_with_input(&mut command, Some(&input), Duration::from_millis(100), 128)
+                .expect_err("blocked stdin writes must share the command timeout");
+        assert!(matches!(error, GitError::Timeout(_)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn command_runner_preserves_diagnostics_when_input_is_rejected_early() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'invalid patch' >&2; exit 1"]);
+        let input = vec![b'x'; 1024 * 1024];
+        let output =
+            execute_command_with_input(&mut command, Some(&input), Duration::from_secs(2), 128)
+                .expect("broken stdin pipe must preserve the command result");
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.stderr, b"invalid patch");
     }
 
     #[cfg(unix)]

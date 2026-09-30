@@ -346,14 +346,20 @@ every competitor feature box.
 
 ## Work on GrokForge
 
+GitHub Actions CI, nightly checks, and automated release publishing are disabled.
+Run the checks locally before pushing; the workflow definitions are archived in
+[`.github/disabled-workflows/`](.github/disabled-workflows/README.md).
+
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
+INSTA_UPDATE=no cargo test --locked --workspace
 cargo deny check
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the project rules and [docs/design](docs/design) for the design record.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the project rules,
+[the implementation map](docs/architecture.md) for the current architecture, and
+[docs/design](docs/design) for the design record.
 
 ## License
 

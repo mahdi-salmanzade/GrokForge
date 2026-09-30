@@ -1,5 +1,9 @@
 # GrokForge v0.1 — System Architecture
 
+This is the original design record. The shipped crate layout and several implementation
+choices have evolved; see [the current implementation map](../architecture.md) before
+using the proposed modules, dependencies, or signatures below as code references.
+
 Greenfield Rust workspace. The settled direction is a Grok-only client, OS-native sandboxing in v0.1, the MIT License, and the `grokforge` binary.
 
 **License consequence (applies throughout):** project code must be original or compatible with MIT. External implementations may inform public behavior and interfaces, but incompatible source code is not copied into the project.
